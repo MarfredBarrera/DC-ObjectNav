@@ -1,0 +1,3 @@
+# Ignore embedded git repositories
+gsplat/
+habitat-lab/
