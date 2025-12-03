@@ -74,6 +74,27 @@ RUN git clone --branch stable https://github.com/facebookresearch/habitat-lab.gi
 RUN pip install gsplat || \
     pip install git+https://github.com/nerfstudio-project/gsplat.git
 
+
+# X11 forwarding fixes
+RUN apt-get update && apt-get install -y \
+    libsm6 \
+    libice6 \
+    libxkbcommon-x11-0 \
+    libxcb-xinerama0 \
+    libx11-xcb1 \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-randr0 \
+    libxcb-render-util0 \
+    libxcb-shape0 \
+    libxcb-shm0 \
+    libxcb-sync1 \
+    libxcb-xfixes0 \
+    libxcb-dri3-0 \
+    libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /workspace
 
 # EGL / GL environment

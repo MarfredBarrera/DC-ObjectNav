@@ -3,7 +3,7 @@ import os
 os.environ['GLOG_minloglevel'] = '2'  # Suppress INFO and WARNING logs
 os.environ['MAGNUM_LOG'] = 'quiet'     # Silence Magnum engine logs
 os.environ['HABITAT_SIM_LOG'] = 'quiet'
-os.environ['CUDA_VISIBLE_DEVICES'] = '4'  # Force CPU mode for habitat-sim
+os.environ['CUDA_VISIBLE_DEVICES'] = '4' 
 
 import habitat_sim
 import habitat_sim.utils.common as utils
