@@ -74,6 +74,19 @@ RUN git clone --branch stable https://github.com/facebookresearch/habitat-lab.gi
 RUN pip install gsplat || \
     pip install git+https://github.com/nerfstudio-project/gsplat.git
 
+# Nerfstudio
+# -----------------------------------------------------------------------------
+RUN pip install nerfstudio
+
+# -----------------------------------------------------------------------------
+# Nerfstudio installs 'opencv-python-headless' and often 'numpy>=2.0'.
+# - We swap OpenCV to the GUI version for the viewer.
+# - We downgrade NumPy to <2.0 because Habitat-Sim crashes with NumPy 2.0.
+# -----------------------------------------------------------------------------
+RUN pip uninstall -y opencv-python-headless opencv-python && \
+    pip install opencv-python && \
+    pip install "numpy<2.0"
+
 
 # X11 forwarding fixes
 RUN apt-get update && apt-get install -y \
