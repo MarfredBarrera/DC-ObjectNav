@@ -3,3 +3,7 @@ gsplat/
 habitat-lab/
 .vscode/
 .ckpt
+
+# Ignore output directories
+output/
+outputs/
