@@ -15,7 +15,7 @@ from gsplat.strategy import DefaultStrategy
 # Configuration
 # -----------------------------------------------------------------------------
 SCENE_DIR = "/workspace/DCON/output/current_scene"
-ITERATIONS = 10000 
+ITERATIONS = 15000 
 DEVICE = "cuda"
 
 def rgb_to_sh(rgb):
@@ -242,6 +242,6 @@ def main():
     print("Done.")
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "4,5"
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
     main()

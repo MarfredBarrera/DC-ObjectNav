@@ -70,9 +70,9 @@ RUN git clone --branch stable https://github.com/facebookresearch/habitat-lab.gi
     pip install -e /workspace/habitat-lab/habitat-lab && \
     pip install -e /workspace/habitat-lab/habitat-baselines
 
-# Gsplat
-RUN pip install gsplat || \
-    pip install git+https://github.com/nerfstudio-project/gsplat.git
+# # Gsplat
+# RUN pip install gsplat || \
+#     pip install git+https://github.com/nerfstudio-project/gsplat.git
 
 # Nerfstudio
 # -----------------------------------------------------------------------------
@@ -87,6 +87,7 @@ RUN pip uninstall -y opencv-python-headless opencv-python && \
     pip install opencv-python && \
     pip install "numpy<2.0"
 
+RUN pip install nerfview
 
 # X11 forwarding fixes
 RUN apt-get update && apt-get install -y \
