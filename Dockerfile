@@ -89,6 +89,11 @@ RUN pip uninstall -y opencv-python-headless opencv-python && \
 
 RUN pip install nerfview
 
+
+# CLIP
+RUN pip install ftfy regex 
+RUN pip install git+https://github.com/openai/CLIP.git
+
 # X11 forwarding fixes
 RUN apt-get update && apt-get install -y \
     libsm6 \

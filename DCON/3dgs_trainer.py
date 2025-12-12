@@ -34,6 +34,7 @@ def load_scene_data(data_dir, device="cuda"):
     img_0 = imageio.imread(os.path.join(data_dir, frames[0]['file_path']))
     H, W = img_0.shape[:2]
     
+    # TODO: put all camera intrinsics into config file and get parameters directly instead of computing from fov
     fov_x = meta['camera_angle_x']
     fx = 0.5 * W / math.tan(0.5 * fov_x)
     fy = fx
@@ -78,7 +79,7 @@ def load_scene_data(data_dir, device="cuda"):
 
     return torch.stack(gt_images), torch.stack(gt_depths), torch.stack(c2w_matrices), (fx, fy, cx, cy, H, W)
 
-def init_point_cloud_from_depth(gt_images, gt_depths, c2ws, intrinsics, num_init_frames=8):
+def init_point_cloud_from_depth(gt_images, gt_depths, c2ws, intrinsics, num_init_frames=10):
     fx, fy, cx, cy, H, W = intrinsics
     points_list = []
     colors_list = []
@@ -115,9 +116,9 @@ def init_point_cloud_from_depth(gt_images, gt_depths, c2ws, intrinsics, num_init
         full_points = full_points[indices]
         full_colors = full_colors[indices]
 
-    # Add noise to force gradients
-    noise = (torch.rand_like(full_points) * 0.04) - 0.02
-    full_points = full_points + noise
+    # # Add noise to force gradients
+    # noise = (torch.rand_like(full_points) * 0.04) - 0.02
+    # full_points = full_points + noise
 
     return full_points, full_colors
 
@@ -130,10 +131,11 @@ def main():
     num_cameras = len(gt_images)
 
     init_means, init_colors = init_point_cloud_from_depth(
-        gt_images, gt_depths, c2ws, intrinsics, num_init_frames=len(gt_images)
+        gt_images, gt_depths, c2ws, intrinsics
     )
 
     N = len(init_means)
+    print(f"Initialized point cloud with {N} points.")
     
     # Init Parameters (Safe values)
     params = {
