@@ -116,10 +116,6 @@ def init_point_cloud_from_depth(gt_images, gt_depths, c2ws, intrinsics, num_init
         full_points = full_points[indices]
         full_colors = full_colors[indices]
 
-    # # Add noise to force gradients
-    # noise = (torch.rand_like(full_points) * 0.04) - 0.02
-    # full_points = full_points + noise
-
     return full_points, full_colors
 
 # -----------------------------------------------------------------------------
