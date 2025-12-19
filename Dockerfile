@@ -90,9 +90,12 @@ RUN pip uninstall -y opencv-python-headless opencv-python && \
 RUN pip install nerfview
 
 
-# CLIP
+# # CLIP
 RUN pip install ftfy regex 
-RUN pip install git+https://github.com/openai/CLIP.git
+# RUN pip install git+https://github.com/openai/CLIP.git
+
+# Huggingface Transformers
+RUN pip install transformers
 
 # X11 forwarding fixes
 RUN apt-get update && apt-get install -y \

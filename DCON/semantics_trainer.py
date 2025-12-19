@@ -12,6 +12,7 @@ import clip
 import torchvision.transforms as T
 import matplotlib.cm as cm
 import tinycudann as tcnn
+from transformers import CLIPProcessor, CLIPModel
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -26,62 +27,51 @@ QUERY_TEXT = "kitchen"
 # 1. Semantic Components (CLIP & TCNN HashGrid)
 # -----------------------------------------------------------------------------
 
-class DenseCLIPExtractor(nn.Module):
-    def __init__(self, model_name='ViT-B/16', device='cuda'):
-        super().__init__()
-        self.device = device
-        self.model, _ = clip.load(model_name, device=device, jit=False)
-        self.model.eval()
-        self.visual_features = None
-        
-        # Hook into the last transformer layer
-        self.model.visual.transformer.resblocks[-1].register_forward_hook(self._hook_fn)
-        
-        # FORCE SQUARE INPUT [224, 224]
-        # This prevents aspect ratio mismatches between the image shape 
-        # and the resulting feature grid.
-        self.preprocess = T.Compose([
-            T.Resize((224, 224), interpolation=T.InterpolationMode.BICUBIC),
-            T.Normalize((0.48145466, 0.4578275, 0.40821073), 
-                        (0.26862954, 0.26130258, 0.27577711))
-        ])
+from transformers import CLIPProcessor, CLIPModel
 
-    def _hook_fn(self, module, input, output):
-        # ViT output: [Seq_Len, Batch, Dim] -> [Batch, Seq_Len, Dim]
-        self.visual_features = output.permute(1, 0, 2) 
+class DenseCLIPExtractor(nn.Module):
+    def __init__(self, model_name='openai/clip-vit-base-patch16', device='cuda'):
+            super().__init__()
+            self.device = device
+            self.model = CLIPModel.from_pretrained(model_name).to(device)
+            self.processor = CLIPProcessor.from_pretrained(model_name)
+            self.model.eval()
+
 
     @torch.no_grad()
     def get_dense_features(self, images):
+        """
+        images: [B, 3, H, W] tensor (0-1 range) or list of numpy images
+        """
         B, C, H_orig, W_orig = images.shape
         
-        # 1. Resize/Norm
-        clip_input = self.preprocess(images).to(self.device)
+        # 1. Process Inputs (Auto-Resizing & Normalization)
+        # We must convert tensor [0-1] to list of images or handle inputs carefully.
+        # HF Processor expects 0-255 inputs usually, but handles tensors if configured.
+        # Simplest way: Convert tensor back to 0-255 uint8 for the processor
+        images_uint8 = (images * 255).clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()
         
-        # 2. Run Inference (triggers the hook)
-        _ = self.model.encode_image(clip_input)
+        # This handles resizing to (224, 224) automatically
+        inputs = self.processor(images=list(images_uint8), return_tensors="pt").to(self.device)
         
-        # 3. Define Grid Size (Forced to 14x14 for ViT-B/16 @ 224px)
-        # 224 / 16 = 14
-        grid_h = 14
-        grid_w = 14
+        # 2. Forward Pass (Get Vision Transformer Outputs)
+        vision_outputs = self.model.vision_model(**inputs)
+        last_hidden = vision_outputs.last_hidden_state  # [B, 197, 768]
         
-        # 4. Process Features
-        # self.visual_features: [B, Seq_Len, 512]
-        # Remove CLS token (index 0) -> [B, N_patches, 512]
-        patch_tokens = self.visual_features[:, 1:, :] 
+        # 3. Project to Shared Latent Space (768 -> 512)
+        # We must project so it matches the text embeddings!
+        projected_tokens = self.model.visual_projection(last_hidden) # [B, 197, 512]
         
-        # Safety Check
-        expected_tokens = grid_h * grid_w
-        if patch_tokens.shape[1] != expected_tokens:
-            print(f"CRITICAL SHAPE ERROR: Got {patch_tokens.shape[1]} tokens, expected {expected_tokens}")
-            # If this hits, the model is seeing a different resolution than we think.
-            # But with Resize((224,224)), this should be impossible.
-            return torch.zeros(B, H_orig, W_orig, 512, device=self.device)
-
-        # Reshape: [B, 512, 14, 14]
-        feat_map = patch_tokens.permute(0, 2, 1).view(B, 512, grid_h, grid_w)
+        # 4. Remove CLS Token & Reshape
+        patch_tokens = projected_tokens[:, 1:, :] # [B, 196, 512]
         
-        # 5. Upsample back to original image resolution
+        # Calculate grid size (14x14 for ViT-B/16)
+        n_patches = patch_tokens.shape[1]
+        grid_size = int(math.sqrt(n_patches)) # Should be 14
+        
+        feat_map = patch_tokens.permute(0, 2, 1).view(B, 512, grid_size, grid_size)
+        
+        # 5. Upsample to Original Resolution
         feat_map_up = F.interpolate(
             feat_map, 
             size=(H_orig, W_orig), 
@@ -89,10 +79,24 @@ class DenseCLIPExtractor(nn.Module):
             align_corners=False
         )
         
-        # Normalize
+        # Normalize vectors (crucial for Cosine Similarity)
         feat_map_up = feat_map_up / feat_map_up.norm(dim=1, keepdim=True)
         
         return feat_map_up.permute(0, 2, 3, 1) # [B, H, W, 512]
+    
+    @torch.no_grad()
+    def encode_text(self, text_list):
+        """
+        Encodes a list of text strings into 512-dim normalized vectors.
+        """
+        if isinstance(text_list, str):
+            text_list = [text_list]
+            
+        inputs = self.processor(text=text_list, return_tensors="pt", padding=True).to(self.device)
+        
+        text_features = self.model.get_text_features(**inputs)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        return text_features
 
 class TCNNSemanticField(nn.Module):
     def __init__(self, output_dim=512, aabb_min=None, aabb_max=None):
@@ -249,12 +253,18 @@ def unprojection(depth, c2w, intrinsics):
 # -----------------------------------------------------------------------------
 # 3. Visualization Helpers
 # -----------------------------------------------------------------------------
-def get_text_embedding(text_query, clip_model, device):
-    text_token = clip.tokenize([text_query]).to(device)
-    with torch.no_grad():
-        text_emb = clip_model.encode_text(text_token)
-        text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
-    return text_emb
+# def get_text_embedding(text_query, clip_extractor, device):
+#     # Use the processor and model from the extractor we just built
+#     processor = clip_extractor.processor
+#     model = clip_extractor.model
+    
+#     inputs = processor(text=[text_query], return_tensors="pt", padding=True).to(device)
+    
+#     with torch.no_grad():
+#         text_features = model.get_text_features(**inputs)
+#         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        
+#     return text_features
 
 def apply_colormap(scores, cmap_name='turbo'):
     scores = torch.clamp(scores, 0.0, 1.0)
@@ -320,8 +330,9 @@ def main():
     
     # 4. Prepare Text Query
     print(f"--- Encoding Query: '{QUERY_TEXT}' ---")
-    target_emb = get_text_embedding(QUERY_TEXT, clip_extractor.model, DEVICE)
-
+    # target_emb = get_text_embedding(QUERY_TEXT, clip_extractor.model, DEVICE)
+#
+    target_emb = clip_extractor.encode_text(QUERY_TEXT)
     start_time = time.time()
     
     for step in range(ITERATIONS):
