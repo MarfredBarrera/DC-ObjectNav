@@ -33,12 +33,12 @@ class Runner:
         # 2. Init Sub-Modules
         self.clip_labels = semantics.SemanticFeatureExtractor(device=self.device)
         
-        # # Prepare data for Model Initialization
-        # init_points, init_colors = self._create_initial_point_cloud()
+        # Prepare data for Model Initialization
+        init_points, init_colors = self._create_initial_point_cloud()
         
-        # # Create GSplat Model
-        # intrinsics_dict = {'fx': self.fx, 'fy': self.fy, 'cx': self.cx, 'cy': self.cy, 'H': self.H, 'W': self.W}
-        # self.gs_model = GaussianSplatting(self.cfg, init_points, init_colors, intrinsics_dict)
+        # Create GSplat Model
+        intrinsics_dict = {'fx': self.fx, 'fy': self.fy, 'cx': self.cx, 'cy': self.cy, 'H': self.H, 'W': self.W}
+        self.gs_model = GaussianSplatting(self.cfg, init_points, init_colors, intrinsics_dict)
 
     def _load_scene_data(self):
         json_path = os.path.join(self.cfg.scene_dir, "transforms.json")
@@ -241,8 +241,11 @@ if __name__ == "__main__":
     #     method="segmentation"
     # )
 
-    text_query="a stool"
-    img_index=104
+    runner.run_training()
+    runner.save_results()
+
+    text_query="a couch"
+    img_index=321
 
     
     # Method 2: Semantic Similarity (normal)
