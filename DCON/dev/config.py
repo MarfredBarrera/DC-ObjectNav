@@ -5,6 +5,19 @@ class Config:
     # Paths
     scene_dir: str = "/workspace/DCON/output/current_scene"
     output_name: str = "model.pt"
+    SAM_checkpoint_path: str = "/workspace/DCON/SAM_models/sam_vit_b_01ec64.pth"
+
+    # Semantics Settings
+    SAM_model_type = "vit_b"
+    CLIP_model_name = "openai/clip-vit-base-patch32"
+    CLIP_label_batch_size: int = 32
+
+    points_per_side: int = 16
+    pred_iou_thresh: float = 0.86
+    stability_score_thresh: float = 0.92
+    crop_n_layers: int = 1
+    crop_n_points_downscale_factor: int = 2
+    min_mask_region_area: int = 100  # Filter very small noise
     
     # Training Settings
     iterations: int = 10000

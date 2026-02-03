@@ -31,14 +31,14 @@ class Runner:
         self.num_cameras = len(self.gt_images)
 
         # 2. Init Sub-Modules
-        self.clip_labels = semantics.SemanticFeatureExtractor(device=self.device)
+        self.clip_labels = semantics.SAM_CLIP_Semantics(self.cfg, device=self.device)
         
-        # # Prepare data for Model Initialization
-        # init_points, init_colors = self._create_initial_point_cloud()
+        # Prepare data for Model Initialization
+        init_points, init_colors = self._create_initial_point_cloud()
         
-        # # Create GSplat Model
-        # intrinsics_dict = {'fx': self.fx, 'fy': self.fy, 'cx': self.cx, 'cy': self.cy, 'H': self.H, 'W': self.W}
-        # self.gs_model = GaussianSplatting(self.cfg, init_points, init_colors, intrinsics_dict)
+        # Create GSplat Model
+        intrinsics_dict = {'fx': self.fx, 'fy': self.fy, 'cx': self.cx, 'cy': self.cy, 'H': self.H, 'W': self.W}
+        self.gs_model = GaussianSplatting(self.cfg, init_points, init_colors, intrinsics_dict)
 
     def _load_scene_data(self):
         json_path = os.path.join(self.cfg.scene_dir, "transforms.json")
@@ -94,14 +94,6 @@ class Runner:
             c2w = self.c2ws[idx]
             mask = (depth > 0.1) & (depth < 10.0)
 
-            # x_c, y_c, z_c = unprojection(depth, self.intrinsics_tuple, self.device)
-            # x_c, y_c, z_c = x_c[mask], y_c[mask], z_c[mask]
-
-            # cam_points = torch.stack([x_c, y_c, z_c, torch.ones_like(z_c)], dim=1)
-            # world_points = (c2w @ cam_points.T).T
-            
-            # points_list.append(world_points[:, :3])
-
             world_points = unprojection(depth, self.intrinsics_tuple, c2w, self.device)
             points_list.append(world_points)
             colors_list.append(color[mask])
@@ -135,127 +127,76 @@ class Runner:
         save_path = os.path.join(self.cfg.scene_dir, self.cfg.output_name)
         print(f"Saving model to {save_path}...")
         self.gs_model.save(save_path)
-    def compute_similarity_and_visualize(self, img_index, text_query, method="similarity", invert_similarity=False, save_path=None):
-        """
-        Extracts dense features for a text query and visualizes the heatmap.
+
+
+def visualize_similarity(runner, feature_map, text_query, img_index):
+    """
+    Visualizes the similarity map with better diagnostics.
+    """
+    # Get similarity with debug info
+    sim_map = runner.clip_labels.query(feature_map, text_query)
+    sim_np = sim_map.cpu().numpy()
+    
+    print(f"\n[VISUALIZATION] After normalization to [0,1]:")
+    print(f"  Range: [{sim_np.min():.4f}, {sim_np.max():.4f}]")
+    print(f"  Mean: {sim_np.mean():.4f}, Std: {sim_np.std():.4f}")
+    
+    # Get original image
+    rgb_image = runner.gt_images[img_index].cpu().numpy()
+
+    vis_data = (sim_np - sim_np.min()) / (sim_np.max() - sim_np.min() + 1e-8)
+    
+    # Create visualization
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # Original image
+    axes[0].imshow(rgb_image)
+    axes[0].set_title("Original Image")
+    axes[0].axis('off')
+    
+    # Heatmap overlay
+    axes[1].imshow(rgb_image)
+    # Mask values below 0.1 to make them transparent
+    # vis_data_masked = np.ma.masked_where(vis_data < 0.05, vis_data)
+
+    hm = axes[1].imshow(vis_data, cmap='jet', alpha=0.6, vmin=0.5, vmax=1)
+    axes[1].set_title(f"Similarity Overlay\n'{text_query}'")
+    axes[1].axis('off')
+    plt.colorbar(hm, ax=axes[1], fraction=0.046, pad=0.04)
+    
+    # Pure heatmap
+    hm_pure = axes[2].imshow(vis_data, cmap='jet', vmin=0.5, vmax=1)
+    axes[2].set_title("Pure Heatmap")
+    axes[2].axis('off')
+    plt.colorbar(hm_pure, ax=axes[2], fraction=0.046, pad=0.04)
+    
+    plt.tight_layout()
+    save_path = f"sam_clip_{img_index}_{text_query.replace(' ', '_')}.png"
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved to: {save_path}")
+    plt.show()
+
         
-        Args:
-            img_index: Index of the frame to process
-            text_query: Text query string (e.g., "a pillow")
-            method: "similarity" (cosine similarity, related objects get high scores) or 
-                    "segmentation" (binary mask, only exact object gets high scores)
-            invert_similarity: If True, invert similarity scores (1 - score). Use this if 
-                              target objects are showing up as blue/low instead of red/high.
-            save_path: Optional path to save the visualization
-        Returns:
-            similarity_map: torch.Tensor (H, W) with scores
-        """
-        print(f"\n=== Processing Frame {img_index} with query: '{text_query}' (method: {method}) ===")
-        
-        rgb_image = self.gt_images[img_index]
-        
-        # Choose extraction method
-        if method == "segmentation":
-            similarity_map = self.clip_labels.extract_dense_features_segmentation(rgb_image, text_query)
-            title_suffix = "(Segmentation)"
-        elif method == "similarity":
-            similarity_map = self.clip_labels.extract_dense_features_similarity(rgb_image, text_query)
-            title_suffix = "(Semantic Similarity)"
-            
-            # Option to invert if consistently backwards
-            if invert_similarity:
-                similarity_map = 1.0 - similarity_map
-                title_suffix += " [INVERTED]"
-                print("Applied inversion: 1 - score")
-        else:
-            raise ValueError(f"Unknown method: {method}. Use 'similarity' or 'segmentation'")
-        
-        # Convert to numpy for statistics and visualization
-        similarity_np = similarity_map.cpu().numpy()
-        
-        # Print statistics to diagnose
-        print(f"Raw score range: [{similarity_np.min():.4f}, {similarity_np.max():.4f}]")
-        print(f"Mean: {similarity_np.mean():.4f}, Std: {similarity_np.std():.4f}")
-        
-        # DEBUG: Check a sample of high and low scoring pixels
-        flat = similarity_np.flatten()
-        high_idx = np.argmax(flat)
-        low_idx = np.argmin(flat)
-        high_y, high_x = np.unravel_index(high_idx, similarity_np.shape)
-        low_y, low_x = np.unravel_index(low_idx, similarity_np.shape)
-        print(f"Highest score pixel at ({high_y}, {high_x}): {flat[high_idx]:.4f}")
-        print(f"Lowest score pixel at ({low_y}, {low_x}): {flat[low_idx]:.4f}")
-        
-        # For similarity method with low variance, apply adaptive contrast stretching
-        if method == "similarity" and similarity_np.std() < 0.05:
-            print("Warning: Low variance detected. Applying adaptive contrast stretching.")
-            # Stretch the narrow range to full [0, 1] for visualization
-            vis_data = (similarity_np - similarity_np.min()) / (similarity_np.max() - similarity_np.min() + 1e-8)
-            vmin, vmax = 0, 1
-        else:
-            vis_data = similarity_np
-            vmin, vmax = 0, 1
-        
-        # Create visualization
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        
-        # Original image
-        axes[0].imshow(rgb_image.cpu().numpy())
-        axes[0].set_title("Original RGB Image")
-        axes[0].axis('off')
-        
-        # Heatmap overlay
-        axes[1].imshow(rgb_image.cpu().numpy())
-        heatmap = axes[1].imshow(vis_data, cmap='jet', alpha=0.6, vmin=vmin, vmax=vmax)
-        axes[1].set_title(f"'{text_query}'\n{title_suffix}")
-        axes[1].axis('off')
-        plt.colorbar(heatmap, ax=axes[1], fraction=0.046, pad=0.04)
-        
-        # Pure heatmap
-        heatmap_pure = axes[2].imshow(vis_data, cmap='jet', vmin=vmin, vmax=vmax)
-        axes[2].set_title(f"Heatmap")
-        axes[2].axis('off')
-        plt.colorbar(heatmap_pure, ax=axes[2], fraction=0.046, pad=0.04)
-        
-        plt.tight_layout()
-        
-        if save_path is None:
-            suffix = "_inverted" if invert_similarity else ""
-            save_path = f"{method}_{img_index}_{text_query.replace(' ', '_')}{suffix}.png"
-        
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved visualization to: {save_path}")
-        plt.close()
-        
-        return similarity_map
 
 
 if __name__ == "__main__":
     config = Config()
     runner = Runner(config)
-    
-    # # Method 1: Segmentation (works perfectly)
-    # seg_map = runner.compute_similarity_and_visualize(
-    #     img_index=20, 
-    #     text_query="a stool",
-    #     method="segmentation"
-    # )
 
-    text_query="a stool"
-    img_index=104
+    # runner.run_training()
+    # runner.save_results()
 
-    
-    # Method 2: Semantic Similarity (normal)
-    sim_map = runner.compute_similarity_and_visualize(
-        img_index=img_index, 
-        text_query=text_query,
-        method="similarity"
-    )
-    
-    # Method 3: Semantic Similarity (INVERTED - try this if target is blue)
-    sim_map_inverted = runner.compute_similarity_and_visualize(
-        img_index=img_index, 
-        text_query=text_query,
-        method="similarity",
-        invert_similarity=True
-    )
+    text_query="a microwave"
+    img_index=283
+
+    image = runner.gt_images[img_index].cpu().numpy()
+
+
+    time_start = time.time()
+    feature_map = runner.clip_labels.extract_dense_features(image)
+    time_end = time.time()
+    print(f"Feature extraction time: {time_end - time_start:.2f} seconds")
+    sim_map = runner.clip_labels.query(feature_map, text_query)
+    print(f"Similarity time: {time.time() - time_end:.2f} seconds")
+
+    visualize_similarity(runner, feature_map, text_query, img_index)
