@@ -34,13 +34,17 @@ class SAM_CLIP_Semantics:
         self.clip_model = CLIPModel.from_pretrained(self.cfg.CLIP_model_name).to(self.device)
         self.clip_processor = CLIPProcessor.from_pretrained(self.cfg.CLIP_model_name, use_fast=True)
         
-    def _pad_and_crop(self, image, bbox, expand_ratio=1.25):
+    def _pad_and_crop(self, image, bbox, expand_ratio=1.25, min_size=10):
         """
         "Each region is padded, cropped, and resized..."
         This function handles the padding and cropping logic.
         """
         x, y, w, h = [int(v) for v in bbox]
         H, W, _ = image.shape
+        
+        # Skip invalid bounding boxes
+        if w <= 0 or h <= 0:
+            return None
         
         # Calculate padding to expand context slightly
         pad_w = int(w * (expand_ratio - 1) / 2)
@@ -51,6 +55,12 @@ class SAM_CLIP_Semantics:
         y1 = max(0, y - pad_h)
         x2 = min(W, x + w + pad_w)
         y2 = min(H, y + h + pad_h)
+        
+        # Check if crop is valid and large enough to avoid ambiguous dimensions
+        crop_w = x2 - x1
+        crop_h = y2 - y1
+        if crop_w <= 0 or crop_h <= 0 or crop_w < min_size or crop_h < min_size:
+            return None
         
         crop = image[y1:y2, x1:x2]
         
@@ -80,43 +90,48 @@ class SAM_CLIP_Semantics:
         # 2. Prepare Crops: "Padded, cropped, and resized to 224x224"
         # Note: The CLIPProcessor handles the resizing to 224x224 internally
         crop_images = []
+        valid_masks = []  # Keep track of masks with valid crops
         for mask_data in masks:
             crop = self._pad_and_crop(image_rgb, mask_data['bbox'])
-            crop_images.append(crop)
+            if crop is not None:  # Skip invalid crops
+                crop_images.append(crop)
+                valid_masks.append(mask_data)
+        
+        # Check if we have any valid crops
+        if len(crop_images) == 0:
+            print("Warning: No valid crops generated from masks")
+            return None
             
         # 3. Batch CLIP Encoding
         all_embeddings = []
         
-        # Process in chunks to avoid OOM
+        # Process in batches for efficiency
         for i in range(0, len(crop_images), self.cfg.CLIP_label_batch_size):
             batch_crops = crop_images[i : i + self.cfg.CLIP_label_batch_size]
             
             # Processor handles resizing and normalization
             inputs = self.clip_processor(
                 images=batch_crops, 
-                return_tensors="pt", 
-                padding=True
+                return_tensors="pt"
             ).to(self.device)
             
             with torch.no_grad():
                 # Get embeddings
                 batch_embeds = self.clip_model.get_image_features(**inputs)
                 # Normalize (important for cosine similarity)
-                batch_embeds /= batch_embeds.norm(dim=-1, keepdim=True)
+                batch_embeds = batch_embeds / batch_embeds.norm(dim=-1, keepdim=True)
                 all_embeddings.append(batch_embeds)
                 
         # Concatenate all batches
-        all_embeddings = torch.cat(all_embeddings, dim=0) # (Num_Masks, Dim)
+        all_embeddings = torch.cat(all_embeddings, dim=0) # (Num_Valid_Masks, Dim)
         
         # 4. Pixel-wise Assignment
-        # "The semantic embeddings are assigned to all pixels within each proposed region."
-        print("Constructing dense feature map...")
         embed_dim = all_embeddings.shape[1]
         feature_map = torch.zeros((orig_H, orig_W, embed_dim), device=self.device)
         
         # We iterate and paint. Since we sorted Largest -> Smallest, 
         # the smaller masks will be painted LAST, overwriting the larger ones.
-        for i, mask_data in enumerate(masks):
+        for i, mask_data in enumerate(valid_masks):  # Use valid_masks instead of masks
             # Get the binary mask
             binary_mask = torch.from_numpy(mask_data['segmentation']).to(self.device)
             

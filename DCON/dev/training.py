@@ -14,6 +14,7 @@ from config import Config
 from gaussians import GaussianSplatting
 import semantics
 from utils import unprojection
+from hashgrid import HashGrid
 
 class Runner:
     def __init__(self, cfg: Config):
@@ -30,15 +31,18 @@ class Runner:
         self.fx, self.fy, self.cx, self.cy, self.H, self.W = self.intrinsics_tuple
         self.num_cameras = len(self.gt_images)
 
-        # 2. Init Sub-Modules
+        # 2. Semantics
         self.clip_labels = semantics.SAM_CLIP_Semantics(self.cfg, device=self.device)
+
+        # 3. HashGrid
+        self.hashgrid = HashGrid(self.cfg, device=self.device, transforms_json=os.path.join(self.cfg.scene_dir, "transforms.json"))
         
-        # Prepare data for Model Initialization
-        init_points, init_colors = self._create_initial_point_cloud()
+        # # Prepare data for Model Initialization
+        # init_points, init_colors = self._create_initial_point_cloud()
         
-        # Create GSplat Model
-        intrinsics_dict = {'fx': self.fx, 'fy': self.fy, 'cx': self.cx, 'cy': self.cy, 'H': self.H, 'W': self.W}
-        self.gs_model = GaussianSplatting(self.cfg, init_points, init_colors, intrinsics_dict)
+        # # Create GSplat Model
+        # intrinsics_dict = {'fx': self.fx, 'fy': self.fy, 'cx': self.cx, 'cy': self.cy, 'H': self.H, 'W': self.W}
+        # self.gs_model = GaussianSplatting(self.cfg, init_points, init_colors, intrinsics_dict)
 
     def _load_scene_data(self):
         json_path = os.path.join(self.cfg.scene_dir, "transforms.json")
@@ -123,6 +127,60 @@ class Runner:
             if step % 100 == 0:
                 print(f"Step {step:04d} | GS: {num_gs} | Loss: {loss_val:.5f} | Time: {time.time()-start_time:.1f}s")
 
+
+
+    def train_feature_field(self):
+        """
+        Training loop that trains both Gaussian Splatting and HashGrid.
+        """
+        print(f"Starting training for {self.cfg.iterations} iterations...")
+        start_time = time.time()
+        
+        # Pre-extract CLIP features for a subset of images
+        # (e.g., every 10th image to save time)
+        clip_training_indices = list(range(0, self.num_cameras, 10))
+        
+        for step in range(self.cfg.iterations):
+            # # 1. Train Gaussian Splatting (your existing code)
+            # cam_idx = torch.randint(0, self.num_cameras, (1,)).item()
+            # gt_image = self.gt_images[cam_idx]
+            # c2w = self.c2ws[cam_idx]
+            
+            # gs_loss, num_gs = self.gs_model.step(step, gt_image, c2w)
+            
+
+            if step % self.cfg.hash_train_every_n_steps == 0:
+                # Select a random image that has CLIP features
+                clip_idx = clip_training_indices[
+                    torch.randint(0, len(clip_training_indices), (1,)).item()
+                ]
+                
+                depth = self.gt_depths[clip_idx]
+                rgb = self.gt_images[clip_idx]
+                c2w_hash = self.c2ws[clip_idx]
+                
+                # Convert RGB from [0,1] float tensor to [0,255] uint8 numpy array for SAM
+                rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
+                
+                # Extract CLIP features
+                clip_features = self.clip_labels.extract_dense_features(
+                    rgb_np
+                ).to(self.device)
+                
+                # Train HashGrid
+                hash_loss = self.hashgrid.train_step(
+                    depth=depth,
+                    rgb=rgb,
+                    c2w=c2w_hash,
+                    intrinsics=self.intrinsics_tuple,
+                    clip_features=clip_features
+                )
+                
+
+                print(f"Step: {step:04d} | Hash Loss: {hash_loss:.5f} | Time: {time.time()-start_time:.1f}s")
+
+
+
     def save_results(self):
         save_path = os.path.join(self.cfg.scene_dir, self.cfg.output_name)
         print(f"Saving model to {save_path}...")
@@ -183,20 +241,23 @@ if __name__ == "__main__":
     config = Config()
     runner = Runner(config)
 
+    runner.train_feature_field()
+    runner.hashgrid.save("hashgrid_model.pt")
+
     # runner.run_training()
     # runner.save_results()
 
-    text_query="a microwave"
-    img_index=283
+    # text_query="a microwave"
+    # img_index=283
 
-    image = runner.gt_images[img_index].cpu().numpy()
+    # image = runner.gt_images[img_index].cpu().numpy()
 
 
-    time_start = time.time()
-    feature_map = runner.clip_labels.extract_dense_features(image)
-    time_end = time.time()
-    print(f"Feature extraction time: {time_end - time_start:.2f} seconds")
-    sim_map = runner.clip_labels.query(feature_map, text_query)
-    print(f"Similarity time: {time.time() - time_end:.2f} seconds")
+    # time_start = time.time()
+    # feature_map = runner.clip_labels.extract_dense_features(image)
+    # time_end = time.time()
+    # print(f"Feature extraction time: {time_end - time_start:.2f} seconds")
+    # sim_map = runner.clip_labels.query(feature_map, text_query)
+    # print(f"Similarity time: {time.time() - time_end:.2f} seconds")
 
-    visualize_similarity(runner, feature_map, text_query, img_index)
+    # visualize_similarity(runner, feature_map, text_query, img_index)

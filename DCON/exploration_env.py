@@ -187,6 +187,31 @@ while True:
 # --------------------------------------------------------
 print(f"Saving {len(rgb_imgs)} frames and transforms...")
 
+# Extract scene bounds from habitat simulator
+scene_bounds = None
+if sim.pathfinder.is_loaded:
+    # Get bounds from pathfinder
+    bounds = sim.pathfinder.get_bounds()
+    scene_bounds = {
+        "min": np.array(bounds[0]).tolist(),  # [x_min, y_min, z_min]
+        "max": np.array(bounds[1]).tolist()   # [x_max, y_max, z_max]
+    }
+    print(f"Scene bounds: min={bounds[0]}, max={bounds[1]}")
+else:
+    # Fallback: compute bounds from all agent positions
+    all_positions = np.array([pose[:3, 3] for pose in pose_matrices])
+    scene_min = all_positions.min(axis=0)
+    scene_max = all_positions.max(axis=0)
+    # Add padding
+    padding = (scene_max - scene_min) * 0.2
+    scene_min -= padding
+    scene_max += padding
+    scene_bounds = {
+        "min": scene_min.tolist(),
+        "max": scene_max.tolist()
+    }
+    print(f"Computed scene bounds from trajectory: min={scene_min}, max={scene_max}")
+
 frames_data = []
 
 # Calculate Intrinsics from FOV
@@ -224,6 +249,7 @@ json_data = {
     "k2": 0.0,
     "p1": 0.0,
     "p2": 0.0,
+    "scene_bounds": scene_bounds,  # Add scene bounds
     "frames": frames_data
 }
 
