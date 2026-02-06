@@ -32,7 +32,8 @@ class Runner:
         self.num_cameras = len(self.gt_images)
 
         # 2. Semantics
-        self.clip_labels = semantics.SAM_CLIP_Semantics(self.cfg, device=self.device)
+        self.sam_clip = semantics.SAM_CLIP_Semantics(self.cfg, device=self.device)
+        self.clipseg = semantics.CLIPSeg(device=self.device)
 
         # 3. HashGrid
         self.hashgrid = HashGrid(self.cfg, device=self.device, transforms_json=os.path.join(self.cfg.scene_dir, "transforms.json"))
@@ -127,57 +128,198 @@ class Runner:
             if step % 100 == 0:
                 print(f"Step {step:04d} | GS: {num_gs} | Loss: {loss_val:.5f} | Time: {time.time()-start_time:.1f}s")
 
-
-
     def train_feature_field(self):
-        """
-        Training loop that trains both Gaussian Splatting and HashGrid.
-        """
+        print(f"Starting training for {self.cfg.iterations} iterations...")
+        
+        # Print HashGrid architecture
+        print("\n=== HASHGRID CONFIGURATION ===")
+        print(f"Feature dim: {self.hashgrid.feature_dim}")
+        print(f"Encoding dim: {self.hashgrid.encoding_dim}")
+        print(f"n_levels: {self.cfg.hash_n_levels}")
+        print(f"n_features_per_level: {self.cfg.hash_n_features_per_level}")
+        print(f"log2_hashmap_size: {self.cfg.hash_log2_hashmap_size}")
+        print(f"base_resolution: {self.cfg.hash_base_resolution}")
+        print(f"n_neurons: {self.cfg.hash_n_neurons}")
+        print(f"n_hidden_layers: {self.cfg.hash_n_hidden_layers}")
+        
+        # Extract features
+        clip_idx = 30
+        depth = self.gt_depths[clip_idx]
+        rgb = self.gt_images[clip_idx]
+        c2w_hash = self.c2ws[clip_idx]
+        
+        rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
+        clip_features = self.sam_clip.extract_dense_features(rgb_np)
+        
+        print(f"\n=== CLIP FEATURES ===")
+        print(f"Shape: {clip_features.shape}")
+        print(f"Feature dim: {clip_features.shape[-1]}")
+        print(f"Data type: {clip_features.dtype}")
+        print(f"Min: {clip_features.min():.4f}, Max: {clip_features.max():.4f}")
+        print(f"Mean: {clip_features.mean():.4f}, Std: {clip_features.std():.4f}")
+        
+        # Check if features are already normalized
+        feature_norms = torch.norm(clip_features.reshape(-1, clip_features.shape[-1]), dim=-1)
+        print(f"Feature norms - Min: {feature_norms.min():.4f}, Max: {feature_norms.max():.4f}, Mean: {feature_norms.mean():.4f}")
+        
+        # Precompute training data
+        world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device)
+        fx, fy, cx, cy, H, W = self.intrinsics_tuple
+        mask = (depth > 0.1) & (depth < 10.0)
+        gt_features = clip_features[mask]
+
+
+        # FILTER OUT ZERO-NORM FEATURES
+        feature_norms = gt_features.norm(dim=-1)
+        valid_mask = feature_norms > 1e-6  # Remove near-zero norm features
+        
+        world_points = world_points[valid_mask]
+        gt_features = gt_features[valid_mask]
+        
+        print(f"Total training points: {world_points.shape[0]}")
+        print(f"Filtered out {(~valid_mask).sum().item()} zero-norm features")
+        
+        print(f"\n=== SCENE GEOMETRY ===")
+        print(f"Total points: {world_points.shape[0]}")
+        print(f"Point cloud bounds:")
+        print(f"  X: [{world_points[:, 0].min():.3f}, {world_points[:, 0].max():.3f}]")
+        print(f"  Y: [{world_points[:, 1].min():.3f}, {world_points[:, 1].max():.3f}]")
+        print(f"  Z: [{world_points[:, 2].min():.3f}, {world_points[:, 2].max():.3f}]")
+        print(f"Scene bounds: {self.hashgrid.scene_bounds}")
+        
+        # Check normalized positions
+        normalized_pos = self.hashgrid.normalize_positions(world_points[:1000])
+        print(f"\nNormalized positions (first 1000):")
+        print(f"  Min: {normalized_pos.min():.4f}, Max: {normalized_pos.max():.4f}")
+        print(f"  Mean: {normalized_pos.mean():.4f}")
+        
+        # TEST: Can the network output diverse values at all?
+        print("\n=== NETWORK OUTPUT TEST ===")
+        with torch.no_grad():
+            test_points = torch.rand(1000, 3, device=self.device)  # Random points in [0,1]
+            test_output = self.hashgrid.model(test_points)
+            print(f"Random input -> Output range: [{test_output.min():.4f}, {test_output.max():.4f}]")
+            print(f"Output std: {test_output.std():.4f}")
+            print(f"Output mean: {test_output.mean():.4f}")
+
+
+            # After creating hashgrid, before training
+        print("\n=== TESTING NETWORK CAPACITY ===")
+        test_pts = torch.rand(100, 3, device=self.device)
+        test_target = torch.randn(100, 512, device=self.device)
+        test_target = test_target / (test_target.norm(dim=-1, keepdim=True) + 1e-8)
+
+        test_optimizer = torch.optim.Adam(self.hashgrid.model.parameters(), lr=1e-2)
+
+        for i in range(100):
+            pred = self.hashgrid.model(test_pts)
+            pred_norm = pred / (pred.norm(dim=-1, keepdim=True) + 1e-8)
+            loss = 1.0 - (pred_norm * test_target).sum(dim=-1).mean()
+            
+            test_optimizer.zero_grad()
+            loss.backward()
+            test_optimizer.step()
+            
+            if i % 20 == 0:
+                print(f"Test step {i}: loss={loss.item():.4f}, output_range=[{pred.min():.4f}, {pred.max():.4f}]")        
+
+
         print(f"Starting training for {self.cfg.iterations} iterations...")
         start_time = time.time()
         
-        # Pre-extract CLIP features for a subset of images
-        # (e.g., every 10th image to save time)
-        clip_training_indices = list(range(0, self.num_cameras, 10))
+        # EXTRACT FEATURES ONCE
+        clip_idx = 30
+        depth = self.gt_depths[clip_idx]
+        rgb = self.gt_images[clip_idx]
+        c2w_hash = self.c2ws[clip_idx]
         
+        rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
+        clip_features = self.sam_clip.extract_dense_features(rgb_np)
+        
+        print(f"Extracted CLIP features: {clip_features.shape}")
+        print(f"CLIP feature dim: {clip_features.shape[-1]}")
+        print(f"HashGrid output dim: {self.hashgrid.feature_dim}")
+        
+        # CHECK IF DIMENSIONS MATCH!
+        if clip_features.shape[-1] != self.hashgrid.feature_dim:
+            raise ValueError(f"Dimension mismatch! CLIP: {clip_features.shape[-1]} vs HashGrid: {self.hashgrid.feature_dim}")
+        
+        # Precompute all training data
+        world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device)
+        fx, fy, cx, cy, H, W = self.intrinsics_tuple
+        mask = (depth > 0.1) & (depth < 10.0)
+        gt_features = clip_features[mask]
+        
+        print(f"Total training points: {world_points.shape[0]}")
+        
+        # CHECK SCENE BOUNDS
+        print(f"Point cloud bounds:")
+        print(f"  X: [{world_points[:, 0].min():.3f}, {world_points[:, 0].max():.3f}]")
+        print(f"  Y: [{world_points[:, 1].min():.3f}, {world_points[:, 1].max():.3f}]")
+        print(f"  Z: [{world_points[:, 2].min():.3f}, {world_points[:, 2].max():.3f}]")
+        print(f"HashGrid bounds: {self.hashgrid.scene_bounds}")
+        
+        # Use learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.hashgrid.optimizer, mode='min', factor=0.5, patience=500
+        )
+        
+        best_loss = float('inf')
+    
         for step in range(self.cfg.iterations):
-            # # 1. Train Gaussian Splatting (your existing code)
-            # cam_idx = torch.randint(0, self.num_cameras, (1,)).item()
-            # gt_image = self.gt_images[cam_idx]
-            # c2w = self.c2ws[cam_idx]
+            # Sample batch
+            num_points = world_points.shape[0]
+            if num_points > self.cfg.hash_train_batch_size:
+                indices = torch.randperm(num_points, device=self.device)[:self.cfg.hash_train_batch_size]
+                batch_points = world_points[indices]
+                batch_features = gt_features[indices]
+            else:
+                batch_points = world_points
+                batch_features = gt_features
             
-            # gs_loss, num_gs = self.gs_model.step(step, gt_image, c2w)
+            # Forward pass - NO normalization
+            pred_features = self.hashgrid.forward(batch_points, normalize=False)
+
+            pred_norm = self.hashgrid.safe_normalize(pred_features)
+            batch_features_norm = self.hashgrid.safe_normalize(batch_features)
+
+            # MSE loss
+            loss = ((pred_norm - batch_features_norm) ** 2).mean()
             
-
-            if step % self.cfg.hash_train_every_n_steps == 0:
-                # Select a random image that has CLIP features
-                clip_idx = clip_training_indices[
-                    torch.randint(0, len(clip_training_indices), (1,)).item()
-                ]
+            # Check for NaN
+            if torch.isnan(loss):
+                print(f"NaN detected at step {step}!")
+                print(f"Pred features: min={pred_features.min():.4f}, max={pred_features.max():.4f}, mean={pred_features.mean():.4f}")
+                print(f"Pred norms: min={pred_features.norm(dim=-1).min():.4f}, max={pred_features.norm(dim=-1).max():.4f}")
+                print(f"GT norms: min={batch_features.norm(dim=-1).min():.4f}, max={batch_features.norm(dim=-1).max():.4f}")
+                continue
+            
+            # Backward pass
+            self.hashgrid.optimizer.zero_grad()
+            loss.backward()
+            
+            # Check gradients
+            total_norm = torch.nn.utils.clip_grad_norm_(self.hashgrid.model.parameters(), max_norm=1.0)
+            if torch.isnan(total_norm):
+                print(f"NaN gradients! Skipping step {step}...")
+                continue
+            
+            self.hashgrid.optimizer.step()
+            
+            if step % 100 == 0:
+                with torch.no_grad():
+                    all_pred = self.hashgrid.forward(world_points, normalize=False)
+                    all_pred_norm = self.hashgrid.safe_normalize(all_pred)
+                    all_gt_norm = gt_features / (gt_features.norm(dim=-1, keepdim=True) + 1e-8)
+                    val_loss = 1.0 - (all_pred_norm * all_gt_norm).sum(dim=-1).mean()
+                    
+                    # Track best
+                    if val_loss < best_loss:
+                        best_loss = val_loss
+                        
+                scheduler.step(val_loss)
                 
-                depth = self.gt_depths[clip_idx]
-                rgb = self.gt_images[clip_idx]
-                c2w_hash = self.c2ws[clip_idx]
-                
-                # Convert RGB from [0,1] float tensor to [0,255] uint8 numpy array for SAM
-                rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
-                
-                # Extract CLIP features
-                clip_features = self.clip_labels.extract_dense_features(
-                    rgb_np
-                ).to(self.device)
-                
-                # Train HashGrid
-                hash_loss = self.hashgrid.train_step(
-                    depth=depth,
-                    rgb=rgb,
-                    c2w=c2w_hash,
-                    intrinsics=self.intrinsics_tuple,
-                    clip_features=clip_features
-                )
-                
-
-                print(f"Step: {step:04d} | Hash Loss: {hash_loss:.5f} | Time: {time.time()-start_time:.1f}s")
+                print(f"Step {step:04d} | Train Loss: {loss.item():.5f} | Val Loss: {val_loss.item():.5f} | Best: {best_loss:.5f} | LR: {self.hashgrid.optimizer.param_groups[0]['lr']:.2e} | Time: {time.time()-start_time:.1f}s")
 
 
 
@@ -187,51 +329,103 @@ class Runner:
         self.gs_model.save(save_path)
 
 
-def visualize_similarity(runner, feature_map, text_query, img_index):
+# After training, add this diagnostic:
+def diagnose_hashgrid(runner, clip_idx=30, text_query="a pillow"):
+    """Check if HashGrid can reconstruct training image."""
+    
+    # Get ground truth
+    depth = runner.gt_depths[clip_idx]
+    rgb = runner.gt_images[clip_idx]
+    c2w = runner.c2ws[clip_idx]
+    
+    rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
+    gt_features = runner.sam_clip.extract_dense_features(rgb_np)
+    
+    # Get predictions
+    pred_features = runner.hashgrid.render_feature_map(depth, c2w, runner.intrinsics_tuple)
+    
+    # Compute correlation
+    mask = (depth > 0.1) & (depth < 10.0)
+    gt_flat = gt_features[mask]
+    pred_flat = pred_features[mask]
+    
+    # Normalize both
+    gt_norm = gt_flat / (gt_flat.norm(dim=-1, keepdim=True) + 1e-8)
+    pred_norm = pred_flat / (pred_flat.norm(dim=-1, keepdim=True) + 1e-8)
+    
+    cosine_sim = (gt_norm * pred_norm).sum(dim=-1)
+    
+    print(f"Cosine similarity stats:")
+    print(f"  Mean: {cosine_sim.mean():.4f}")
+    print(f"  Std: {cosine_sim.std():.4f}")
+    print(f"  Min: {cosine_sim.min():.4f}")
+    print(f"  Max: {cosine_sim.max():.4f}")
+    
+    # Test with a text query
+    gt_sim = runner.sam_clip.query(gt_features, text_query)
+    pred_sim = runner.hashgrid.query_similarity(
+        depth, c2w, runner.intrinsics_tuple,
+        text_query,
+        runner.sam_clip.clip_processor,
+        runner.sam_clip.clip_model
+    )
+    
+    visualize_similarity(runner, gt_sim, clip_idx, text_query)
+    visualize_similarity(runner, pred_sim, clip_idx, text_query)
+
+def visualize_similarity(runner, similarity_map, img_index, text_query="a pillow"):
     """
     Visualizes the similarity map with better diagnostics.
     """
-    # Get similarity with debug info
-    sim_map = runner.clip_labels.query(feature_map, text_query)
-    sim_np = sim_map.cpu().numpy()
-    
-    print(f"\n[VISUALIZATION] After normalization to [0,1]:")
-    print(f"  Range: [{sim_np.min():.4f}, {sim_np.max():.4f}]")
-    print(f"  Mean: {sim_np.mean():.4f}, Std: {sim_np.std():.4f}")
+    # # Get similarity with debug info
+    # sim_map = runner.clip_labels.query(feature_map, text_query)
     
     # Get original image
     rgb_image = runner.gt_images[img_index].cpu().numpy()
 
-    vis_data = (sim_np - sim_np.min()) / (sim_np.max() - sim_np.min() + 1e-8)
+    # Convert to numpy and handle invalid values
+    similarity_np = similarity_map.cpu().numpy()
+    
+    # Replace NaN and inf values with 0
+    similarity_np = np.nan_to_num(similarity_np, nan=0.5, posinf=1.0, neginf=0.0)
+    
+    # Clip to valid range [0, 1] before scaling
+    similarity_np = np.clip(similarity_np, 0.0, 1.0)
+    
+    # Convert to uint8
+    similarity_np = (similarity_np * 255).astype(np.uint8)
+    
+    # Print statistics
+    print(f"Score range: [{similarity_np.min():.4f}, {similarity_np.max():.4f}]")
+    print(f"Mean: {similarity_np.mean():.4f}, Std: {similarity_np.std():.4f}")
+
+    # vis_data = (similarity_np - similarity_np.min()) / (similarity_np.max() - similarity_np.min() + 1e-8)
     
     # Create visualization
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    vis_data = similarity_np - similarity_np.min()
+    vis_data = vis_data / (vis_data.max() + 1e-8)
     
     # Original image
     axes[0].imshow(rgb_image)
-    axes[0].set_title("Original Image")
+    axes[0].set_title("Original RGB Image")
     axes[0].axis('off')
     
     # Heatmap overlay
     axes[1].imshow(rgb_image)
-    # Mask values below 0.1 to make them transparent
-    # vis_data_masked = np.ma.masked_where(vis_data < 0.05, vis_data)
-
-    hm = axes[1].imshow(vis_data, cmap='jet', alpha=0.6, vmin=0.5, vmax=1)
-    axes[1].set_title(f"Similarity Overlay\n'{text_query}'")
+    heatmap = axes[1].imshow(vis_data, cmap='jet', alpha=0.6, vmin=0, vmax=1)
+    axes[1].set_title(f"Similarity Overlay")
     axes[1].axis('off')
-    plt.colorbar(hm, ax=axes[1], fraction=0.046, pad=0.04)
+    plt.colorbar(heatmap, ax=axes[1], fraction=0.046, pad=0.04)
     
     # Pure heatmap
-    hm_pure = axes[2].imshow(vis_data, cmap='jet', vmin=0.5, vmax=1)
-    axes[2].set_title("Pure Heatmap")
+    heatmap_pure = axes[2].imshow(vis_data, cmap='jet', vmin=0, vmax=1)
+    axes[2].set_title(f"Heatmap")
     axes[2].axis('off')
-    plt.colorbar(hm_pure, ax=axes[2], fraction=0.046, pad=0.04)
+    plt.colorbar(heatmap_pure, ax=axes[2], fraction=0.046, pad=0.04)
     
     plt.tight_layout()
-    save_path = f"sam_clip_{img_index}_{text_query.replace(' ', '_')}.png"
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"Saved to: {save_path}")
     plt.show()
 
         
@@ -241,23 +435,9 @@ if __name__ == "__main__":
     config = Config()
     runner = Runner(config)
 
-    runner.train_feature_field()
-    runner.hashgrid.save("hashgrid_model.pt")
+    # runner.train_feature_field()
+    # runner.hashgrid.save("hashgrid_model.pt")
+    runner.hashgrid.load("hashgrid_model.pt")
 
-    # runner.run_training()
-    # runner.save_results()
-
-    # text_query="a microwave"
-    # img_index=283
-
-    # image = runner.gt_images[img_index].cpu().numpy()
-
-
-    # time_start = time.time()
-    # feature_map = runner.clip_labels.extract_dense_features(image)
-    # time_end = time.time()
-    # print(f"Feature extraction time: {time_end - time_start:.2f} seconds")
-    # sim_map = runner.clip_labels.query(feature_map, text_query)
-    # print(f"Similarity time: {time.time() - time_end:.2f} seconds")
-
-    # visualize_similarity(runner, feature_map, text_query, img_index)
+    text_query = "a pillow"
+    diagnose_hashgrid(runner, clip_idx=30, text_query=text_query)

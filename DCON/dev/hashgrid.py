@@ -124,11 +124,12 @@ class HashGrid(nn.Module):
         normalized = (positions - self.scene_bounds[0]) / (self.scene_bounds[1] - self.scene_bounds[0])
         return torch.clamp(normalized, 0.0, 1.0)
     
-    def forward(self, positions):
+    def forward(self, positions, normalize=False):
         """
         Query features at given 3D positions.
         Args:
             positions: (N, 3) tensor of 3D world positions
+            normalize: whether to L2 normalize output (use False during training)
         Returns:
             features: (N, feature_dim) tensor of feature vectors
         """
@@ -138,55 +139,55 @@ class HashGrid(nn.Module):
         # Query the network
         features = self.model(normalized_pos.float())
         
-        # L2 normalize features (important for CLIP similarity)
-        features = features / (features.norm(dim=-1, keepdim=True) + 1e-8)
+        # Only normalize if requested (for inference/similarity computation)
+        if normalize:
+            features = features / (features.norm(dim=-1, keepdim=True) + 1e-8)
         
         return features
+
+    def safe_normalize(self, features, dim=-1, eps=1e-6):
+        """Safely normalize features, handling zero-norm cases."""
+        norms = features.norm(dim=dim, keepdim=True)
+        # Only normalize if norm is above threshold, otherwise return small random vector
+        mask = norms > eps
+        normalized = torch.where(
+            mask,
+            features / (norms + eps),
+            torch.randn_like(features) * eps  # Replace zeros with tiny random
+        )
+        return normalized
     
     def train_step(self, depth, rgb, c2w, intrinsics, clip_features=None):
-        """
-        Single training step on an RGBD image.
-        
-        Args:
-            depth: (H, W) depth map
-            rgb: (H, W, 3) RGB image in [0, 1]
-            c2w: (4, 4) camera-to-world transform
-            intrinsics: tuple (fx, fy, cx, cy, H, W)
-            clip_features: (H, W, D) CLIP feature map (optional, if None uses RGB)
-            
-        Returns:
-            loss value
-        """
+        """Single training step on an RGBD image."""
         # 1. Unproject depth to 3D world points
         world_points = unprojection(depth, intrinsics, c2w, self.device)
         
         # 2. Get ground truth features
         fx, fy, cx, cy, H, W = intrinsics
         mask = (depth > 0.1) & (depth < 10.0)
-        
         gt_features = clip_features[mask]
         
-        # 3. Randomly sample points (to avoid OOM on full image)
+        # 3. Randomly sample points
         num_points = world_points.shape[0]
         if num_points > self.cfg.hash_train_batch_size:
             indices = torch.randperm(num_points, device=self.device)[:self.cfg.hash_train_batch_size]
             world_points = world_points[indices]
             gt_features = gt_features[indices]
         
-        # 4. Forward pass
-        pred_features = self.forward(world_points)
+        # 4. Forward pass - NO normalization during training
+        pred_features = self.forward(world_points, normalize=False)
         
-        # 5. Compute loss
-        # Cosine similarity loss (1 - cosine similarity)
-        # Normalize gt_features if using CLIP
-
-        gt_features = gt_features / (gt_features.norm(dim=-1, keepdim=True) + 1e-8)
-        loss = 1.0 - (pred_features * gt_features).sum(dim=-1).mean()
-
+        # 5. Normalize BOTH for loss computation
+        pred_norm = pred_features / (pred_features.norm(dim=-1, keepdim=True) + 1e-8)
+        gt_norm = gt_features / (gt_features.norm(dim=-1, keepdim=True) + 1e-8)
         
-        # 6. Backward pass
+        # 6. Cosine similarity loss
+        loss = 1.0 - (pred_norm * gt_norm).sum(dim=-1).mean()
+        
+        # 7. Backward pass
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         
         return loss.item()
@@ -228,42 +229,23 @@ class HashGrid(nn.Module):
         return features, world_points
     
     def render_feature_map(self, depth, c2w, intrinsics):
-        """
-        Render a full feature map for visualization.
-        
-        Args:
-            depth: (H, W) depth map
-            c2w: (4, 4) camera-to-world transform  
-            intrinsics: tuple (fx, fy, cx, cy, H, W)
-            
-        Returns:
-            feature_map: (H, W, feature_dim) rendered feature map
-        """
+        """Render a full feature map for visualization."""
         fx, fy, cx, cy, H, W = intrinsics
-        
-        # Create output map
         feature_map = torch.zeros((H, W, self.feature_dim), device=self.device)
-        
-        # Get valid mask
         mask = (depth > 0.1) & (depth < 10.0)
-        
-        # Unproject valid points
         world_points = unprojection(depth, intrinsics, c2w, self.device)
         
-        # Query features in batches
         batch_size = self.cfg.hash_inference_batch_size
         all_features = []
         
         for i in range(0, world_points.shape[0], batch_size):
             batch_points = world_points[i:i+batch_size]
             with torch.no_grad():
-                batch_features = self.forward(batch_points)
+                batch_features = self.forward(batch_points, normalize=True)  # Normalize for inference
             all_features.append(batch_features)
         
         all_features = torch.cat(all_features, dim=0)
-        
-        # Assign to feature map
-        feature_map[mask] = all_features
+        feature_map[mask] = all_features.to(feature_map.dtype)
         
         return feature_map
     

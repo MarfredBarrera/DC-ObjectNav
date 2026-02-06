@@ -20,7 +20,7 @@ class Config:
     min_mask_region_area: int = 100  # Filter very small noise
     
     # Training Settings
-    iterations: int = 1000
+    iterations: int = 5000
     device: str = "cuda"
     gpu_indices: str = "1,2"
     
@@ -56,23 +56,23 @@ class Config:
 
     # HashGrid Configuration
     hash_n_levels: int = 16              # Number of resolution levels
-    hash_n_features_per_level: int = 2   # Features per level (2-8 typical)
-    hash_log2_hashmap_size: int = 19     # Hash table size (2^19 entries)
+    hash_n_features_per_level: int = 4   # Features per level (2-8 typical)
+    hash_log2_hashmap_size: int = 21    # Hash table size (2^21 entries)
     hash_base_resolution: int = 16       # Coarsest resolution
     hash_per_level_scale: float = 1.5    # Growth factor between levels
     
     # HashGrid MLP
-    hash_n_neurons: int = 64             # Hidden layer width
-    hash_n_hidden_layers: int = 2        # Number of hidden layers
+    hash_n_neurons: int = 128             # Hidden layer width
+    hash_n_hidden_layers: int = 3        # Number of hidden layers
     hash_feature_dim: int = 512          # Output feature dimension (match CLIP)
     
     # HashGrid Training
-    hash_lr: float = 1e-2                  # Learning rate
+    hash_lr: float = 1e-3                  # Learning rate
     hash_train_batch_size: int = 8192      # Points per training step
     hash_inference_batch_size: int = 16384 # Points per inference batch
     
     # HashGrid Training Schedule
-    hash_train_every_n_steps: int = 10   # Train HashGrid every N steps
+    hash_train_every_n_steps: int = 1   # Train HashGrid every N steps
     hash_warmup_steps: int = 0        # Steps before starting HashGrid training
 
 
