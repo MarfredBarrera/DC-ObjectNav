@@ -156,80 +156,97 @@ class HashGrid(nn.Module):
             torch.randn_like(features) * eps  # Replace zeros with tiny random
         )
         return normalized
-    
-    def train_step(self, depth, rgb, c2w, intrinsics, clip_features=None):
-        """Single training step on an RGBD image."""
-        # 1. Unproject depth to 3D world points
-        world_points = unprojection(depth, intrinsics, c2w, self.device)
+
+    def  train_step(self, batch_points, batch_gt_features):
+        """
+        Single training step on a batch of 3D points and their corresponding GT features.
         
-        # 2. Get ground truth features
-        fx, fy, cx, cy, H, W = intrinsics
-        mask = (depth > 0.1) & (depth < 10.0)
-        gt_features = clip_features[mask]
+        N = batch size
+
+        Args:
+            batch_points: (N, 3) tensor of 3D points
+            batch_gt_features: (N, feature_dim) tensor of ground truth features
+
+        Output:
+            loss: scalar tensor representing training loss
+        """
+
+        # Forward pass - NO normalization during training
+        pred_features = self.forward(batch_points, normalize=False)
         
-        # 3. Randomly sample points
-        num_points = world_points.shape[0]
-        if num_points > self.cfg.hash_train_batch_size:
-            indices = torch.randperm(num_points, device=self.device)[:self.cfg.hash_train_batch_size]
-            world_points = world_points[indices]
-            gt_features = gt_features[indices]
+        # Normalize BOTH for loss computation
+        pred_norm = self.safe_normalize(pred_features)
+        gt_norm = self.safe_normalize(batch_gt_features)
         
-        # 4. Forward pass - NO normalization during training
-        pred_features = self.forward(world_points, normalize=False)
+        # MSE Loss
+        loss = ((pred_norm-gt_norm)**2).sum(dim=-1).mean()
         
-        # 5. Normalize BOTH for loss computation
-        pred_norm = pred_features / (pred_features.norm(dim=-1, keepdim=True) + 1e-8)
-        gt_norm = gt_features / (gt_features.norm(dim=-1, keepdim=True) + 1e-8)
+        # Check for NaN loss
+        if torch.isnan(loss):
+            print(f"NaN loss detected! Skipping step...")
+            return None
         
-        # 6. Cosine similarity loss
-        loss = 1.0 - (pred_norm * gt_norm).sum(dim=-1).mean()
-        
-        # 7. Backward pass
+        # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        if torch.isnan(total_norm):
+            print(f"NaN gradients! Skipping step...")
+            return None
+        
         self.optimizer.step()
         
-        return loss.item()
-    
-    def query_at_pixels(self, depth, c2w, intrinsics, pixel_coords=None):
-        """
-        Query features at specific pixel coordinates.
+        return loss.item() 
+
+    # def query_at_pixels(self, depth, c2w, intrinsics, pixel_coords=None):
+    #     """
+    #     Query features at specific pixel coordinates.
         
-        Args:
-            depth: (H, W) depth map
-            c2w: (4, 4) camera-to-world transform
-            intrinsics: tuple (fx, fy, cx, cy, H, W)
-            pixel_coords: (N, 2) pixel coordinates (u, v), if None queries all valid pixels
+    #     Args:
+    #         depth: (H, W) depth map
+    #         c2w: (4, 4) camera-to-world transform
+    #         intrinsics: tuple (fx, fy, cx, cy, H, W)
+    #         pixel_coords: (N, 2) pixel coordinates (u, v), if None queries all valid pixels
             
+    #     Returns:
+    #         features: (N, feature_dim) feature vectors
+    #         positions: (N, 3) corresponding 3D positions
+    #     """
+    #     fx, fy, cx, cy, H, W = intrinsics
+        
+    #     if pixel_coords is None:
+    #         # Query all valid pixels
+    #         world_points = unprojection(depth, intrinsics, c2w, self.device)
+    #     else:
+    #         # Query specific pixels
+    #         u, v = pixel_coords[:, 0], pixel_coords[:, 1]
+    #         z_c = depth[v, u]
+            
+    #         x_c = (u - cx) * z_c / fx
+    #         y_c = (v - cy) * z_c / fy
+            
+    #         cam_points = torch.stack([x_c, y_c, z_c, torch.ones_like(z_c)], dim=1)
+    #         world_points = (c2w @ cam_points.T).T[:, :3]
+        
+    #     # Query features
+    #     with torch.no_grad():
+    #         features = self.forward(world_points)
+        
+    #     return features, world_points
+    
+    def get_hashgrid_features(self, depth, c2w, intrinsics):
+        """
+        Get a full feature map for the given depth and camera pose.
+
+        Args: 
+        depth: (H, W) depth map
+        c2w: (4, 4) camera-to-world transform
+        intrinsics: tuple (fx, fy, cx, cy, H, W)
+
         Returns:
-            features: (N, feature_dim) feature vectors
-            positions: (N, 3) corresponding 3D positions
+        feature_map: (H, W, feature_dim) feature map
+        
         """
-        fx, fy, cx, cy, H, W = intrinsics
-        
-        if pixel_coords is None:
-            # Query all valid pixels
-            world_points = unprojection(depth, intrinsics, c2w, self.device)
-        else:
-            # Query specific pixels
-            u, v = pixel_coords[:, 0], pixel_coords[:, 1]
-            z_c = depth[v, u]
-            
-            x_c = (u - cx) * z_c / fx
-            y_c = (v - cy) * z_c / fy
-            
-            cam_points = torch.stack([x_c, y_c, z_c, torch.ones_like(z_c)], dim=1)
-            world_points = (c2w @ cam_points.T).T[:, :3]
-        
-        # Query features
-        with torch.no_grad():
-            features = self.forward(world_points)
-        
-        return features, world_points
-    
-    def render_feature_map(self, depth, c2w, intrinsics):
-        """Render a full feature map for visualization."""
         fx, fy, cx, cy, H, W = intrinsics
         feature_map = torch.zeros((H, W, self.feature_dim), device=self.device)
         mask = (depth > 0.1) & (depth < 10.0)
@@ -265,7 +282,7 @@ class HashGrid(nn.Module):
             similarity_map: (H, W) similarity scores
         """
         # Get feature map
-        feature_map = self.render_feature_map(depth, c2w, intrinsics)
+        feature_map = self.get_hashgrid_features(depth, c2w, intrinsics)
         
         # Get text embedding
         inputs = clip_processor(text=[text_query], return_tensors="pt", padding=True).to(self.device)

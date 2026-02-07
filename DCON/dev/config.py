@@ -22,7 +22,7 @@ class Config:
     # Training Settings
     iterations: int = 5000
     device: str = "cuda"
-    gpu_indices: str = "1,2"
+    gpu_indices: str = "2,3"
     
     # Camera / Data
     near_plane: float = 0.01
@@ -70,6 +70,7 @@ class Config:
     hash_lr: float = 1e-3                  # Learning rate
     hash_train_batch_size: int = 8192      # Points per training step
     hash_inference_batch_size: int = 16384 # Points per inference batch
+    hash_rgb_training_batch_size: int = 5
     
     # HashGrid Training Schedule
     hash_train_every_n_steps: int = 1   # Train HashGrid every N steps

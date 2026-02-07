@@ -35,7 +35,7 @@ class SAM_CLIP_Semantics:
         self.clip_model = CLIPModel.from_pretrained(self.cfg.CLIP_model_name).to(self.device)
         self.clip_processor = CLIPProcessor.from_pretrained(self.cfg.CLIP_model_name, use_fast=True)
         
-    def _pad_and_crop(self, image, bbox, expand_ratio=1.25, min_size=10):
+    def _pad_and_crop(self, image, bbox, expand_ratio=1.75, min_size=10):
         """
         "Each region is padded, cropped, and resized..."
         This function handles the padding and cropping logic.

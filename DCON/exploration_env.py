@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 os.environ['GLOG_minloglevel'] = '2'
 os.environ['MAGNUM_LOG'] = 'quiet'
 os.environ['HABITAT_SIM_LOG'] = 'quiet'
-os.environ['CUDA_VISIBLE_DEVICES'] = '4' 
+os.environ['CUDA_VISIBLE_DEVICES'] = '2' 
 
 # --------------------------------------------------------
 # Create output directory
