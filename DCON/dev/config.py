@@ -20,7 +20,7 @@ class Config:
     min_mask_region_area: int = 100  # Filter very small noise
     
     # Training Settings
-    iterations: int = 5000
+    iterations: int = 10000
     device: str = "cuda"
     gpu_indices: str = "2,3"
     
@@ -70,7 +70,9 @@ class Config:
     hash_lr: float = 1e-3                  # Learning rate
     hash_train_batch_size: int = 8192      # Points per training step
     hash_inference_batch_size: int = 16384 # Points per inference batch
-    hash_rgb_training_batch_size: int = 5
+    hash_replay_buffer_size: int = 10      # Number of samples to keep in replay buffer
+    hash_buffer_refresh_interval: int = 200  # Refresh buffer every N steps
+
     
     # HashGrid Training Schedule
     hash_train_every_n_steps: int = 1   # Train HashGrid every N steps

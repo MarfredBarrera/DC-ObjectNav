@@ -8,6 +8,7 @@ import imageio.v2 as imageio
 import cv2
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+from collections import deque
 
 # Custom Imports
 from config import Config
@@ -128,65 +129,58 @@ class Runner:
             if step % 100 == 0:
                 print(f"Step {step:04d} | GS: {num_gs} | Loss: {loss_val:.5f} | Time: {time.time()-start_time:.1f}s")
     
-    def batch_sample_rgbs(self):
+    def sample_rgb(self):
 
-        world_points_list = []
-        gt_features_list = []
+        idx = torch.randint(0, len(self.gt_images), (1,)).item()
 
-        for i in range(self.cfg.hash_rgb_training_batch_size):
-            idx = torch.randint(0, len(self.gt_images), (1,)).item()
+        depth = self.gt_depths[idx]
+        rgb = self.gt_images[idx]
+        c2w_hash = self.c2ws[idx]
+        
+        rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
+        clip_features = self.sam_clip.extract_dense_features(rgb_np)
+        
+        # Compute world points and features
+        world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device)
+        mask = (depth > 0.1) & (depth < 10.0)
+        gt_features = clip_features[mask]
 
-            depth = self.gt_depths[idx]
-            rgb = self.gt_images[idx]
-            c2w_hash = self.c2ws[idx]
-            
-            rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
-            clip_features = self.sam_clip.extract_dense_features(rgb_np)
-            
-            world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device)
-            mask = (depth > 0.1) & (depth < 10.0)
-            gt_features = clip_features[mask]
+        # Filter zero-norm features
+        valid_mask = gt_features.norm(dim=-1) > 1e-6
+        world_points = world_points[valid_mask]
+        gt_features = gt_features[valid_mask]
 
-            # Filter zero-norm feature
-            valid_mask = gt_features.norm(dim=-1) > 1e-6  # Remove near-zero norm features
-            world_points = world_points[valid_mask]
-            gt_features = gt_features[valid_mask]
-
-            num_points = world_points.shape[0]
-            if num_points > self.cfg.hash_train_batch_size:
-                indices = torch.randperm(num_points, device=self.device)[:self.cfg.hash_train_batch_size]
-                world_points = world_points[indices]
-                gt_features = gt_features[indices]
-            else:
-                world_points = world_points
-                gt_features = gt_features
-            
-            # Precompute all training data
-            world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device)
-            mask = (depth > 0.1) & (depth < 10.0)
-            gt_features = clip_features[mask]
-
-            # Filter zero-norm feature
-            valid_mask = gt_features.norm(dim=-1) > 1e-6  # Remove near-zero norm features
-            world_points = world_points[valid_mask]
-            gt_features = gt_features[valid_mask]
-
-            world_points_list.append(world_points)
-            gt_features_list.append(gt_features)
-
-            print(f"CLIP labeled for image {i}")
-
-        return torch.cat(world_points_list, dim=0), torch.cat(gt_features_list, dim=0)
+        return world_points, gt_features
 
     def train_feature_field(self):
-        
-        world_points, gt_features = self.batch_sample_rgbs()
+
+        buf_size = self.cfg.hash_replay_buffer_size
+        replay_buffer = deque(maxlen=buf_size)
+        refresh_interval = self.cfg.hash_buffer_refresh_interval 
+
+        print(f"Initializing replay buffer with {buf_size} samples...")
+        for i in range(buf_size):
+            world_points, gt_features = self.sample_rgb()
+            valid_mask = gt_features.norm(dim=-1) > 1e-6  # Remove near-zero norm features
+            world_points = world_points[valid_mask]
+            gt_features = gt_features[valid_mask]
+
+            replay_buffer.append((world_points, gt_features))
+            print(f"  Buffered sample {i+1}/{buf_size}")
+            
+            # Free memory after each sample
+            if i % 3 == 2:  # Every 3 samples
+                torch.cuda.empty_cache()
+
+        world_points = torch.cat([x[0] for x in replay_buffer], dim=0)
+        gt_features = torch.cat([x[1] for x in replay_buffer], dim=0)
+
         torch.cuda.empty_cache()
         batch_size = min(self.cfg.hash_train_batch_size, world_points.shape[0])
 
         start_time = time.time()
         for step in range(self.cfg.iterations):
-            # Sample a batch (not all points!)
+            # Sample a batch from concatenated data
             batch_indx = torch.randperm(world_points.shape[0], device=world_points.device)[:batch_size]
             batch_points = world_points[batch_indx]
             batch_features = gt_features[batch_indx]
@@ -194,9 +188,36 @@ class Runner:
             loss = self.hashgrid.train_step(batch_points, batch_features)
             if loss is None:
                 continue
+            
+            # Logging
             if step % 100 == 0:
                 print(f"Step {step:04d} | Train Loss: {loss:.5f} | Time: {time.time()-start_time:.1f}s")
-                # batch_points, batch_features = self.batch_sample_rgbs()
+            
+            # Buffer refresh
+            if step > 0 and step % refresh_interval == 0:
+                
+                # Free old concatenated tensors before refresh
+                del world_points, gt_features
+                torch.cuda.empty_cache()
+                
+                # Sample new data and add to buffer
+                sample_points, sample_features = self.sample_rgb()
+                valid_mask = sample_features.norm(dim=-1) > 1e-6
+                sample_points = sample_points[valid_mask]
+                sample_features = sample_features[valid_mask]
+                
+                # Add to buffer - oldest entry automatically removed due to maxlen
+                replay_buffer.append((sample_points, sample_features))
+                
+                # Refresh concatenated training data from updated buffer
+                world_points = torch.cat([x[0] for x in replay_buffer], dim=0)
+                gt_features = torch.cat([x[1] for x in replay_buffer], dim=0)
+                batch_size = min(self.cfg.hash_train_batch_size, world_points.shape[0])
+                
+                torch.cuda.empty_cache()
+                print(f"Buffer updated")
+                
+
 
 
 
@@ -305,10 +326,10 @@ if __name__ == "__main__":
     config = Config()
     runner = Runner(config)
 
-    runner.train_feature_field()
-    runner.hashgrid.save("hashgrid_model.pt")
-    # runner.hashgrid.load("hashgrid_model.pt")
+    # runner.train_feature_field()
+    # runner.hashgrid.save("hashgrid_model.pt")
+    runner.hashgrid.load("hashgrid_model.pt")
 
     text_query = "a pillow"
-    clip_idx = 110
+    clip_idx = 162
     diagnose_hashgrid(runner, clip_idx=clip_idx, text_query=text_query)
