@@ -16,6 +16,7 @@ from gaussians import GaussianSplatting
 import semantics
 from utils import unprojection
 from hashgrid import HashGrid
+from visualizer import Visualizer
 
 class Runner:
     def __init__(self, cfg: Config):
@@ -38,6 +39,11 @@ class Runner:
 
         # 3. HashGrid
         self.hashgrid = HashGrid(self.cfg, device=self.device, transforms_json=os.path.join(self.cfg.scene_dir, "transforms.json"))
+
+        bounds = self.hashgrid.load_scene_bounds_from_json(os.path.join(self.cfg.scene_dir, "transforms.json"))
+
+        self.bounds_min = bounds[0]
+        self.bounds_max = bounds[1]
         
         # # Prepare data for Model Initialization
         # init_points, init_colors = self._create_initial_point_cloud()
@@ -100,7 +106,7 @@ class Runner:
             c2w = self.c2ws[idx]
             mask = (depth > 0.1) & (depth < 10.0)
 
-            world_points = unprojection(depth, self.intrinsics_tuple, c2w, self.device)
+            world_points = unprojection(depth, self.intrinsics_tuple, c2w, self.device, mask=mask)
             points_list.append(world_points)
             colors_list.append(color[mask])
 
@@ -141,8 +147,8 @@ class Runner:
         clip_features = self.sam_clip.extract_dense_features(rgb_np)
         
         # Compute world points and features
-        world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device)
         mask = (depth > 0.1) & (depth < 10.0)
+        world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device, mask=mask)
         gt_features = clip_features[mask]
 
         # Filter zero-norm features
@@ -328,8 +334,19 @@ if __name__ == "__main__":
 
     # runner.train_feature_field()
     # runner.hashgrid.save("hashgrid_model.pt")
-    runner.hashgrid.load("hashgrid_model.pt")
+    runner.hashgrid.load("output/hashgrid_model.pt")
 
     text_query = "a pillow"
     clip_idx = 162
-    diagnose_hashgrid(runner, clip_idx=clip_idx, text_query=text_query)
+    # diagnose_hashgrid(runner, clip_idx=clip_idx, text_query=text_query)
+    
+    visualizer = Visualizer(runner)
+    # visualizer.visualize_2d_similarity(clip_idx, text_query)
+
+    visualizer.create_birds_eye_view(text_query, 
+                                     num_cameras=100, 
+                                     grid_resolution=0.01, 
+                                     aggregation='median', 
+                                     save_path=None, 
+                                     colormap='jet', 
+                                     vmin=0.6)

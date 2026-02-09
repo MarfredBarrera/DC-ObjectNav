@@ -148,15 +148,23 @@ class SAM_CLIP_Semantics:
     def query(self, feature_map, text_query):
         """
         Standard Cosine Similarity query.
+
+        Args:
+            feature_map: torch.Tensor (H, W, D) - dense features from the image
+            text_query: str - the semantic query (e.g., "a pillow")
+
+        Returns: 
+            similarity_map: torch.Tensor (H, W) with cosine similarity scores
         """
         inputs = self.clip_processor(text=[text_query], return_tensors="pt", padding=True).to(self.device)
         with torch.no_grad():
             text_embed = self.clip_model.get_text_features(**inputs)
             text_embed /= text_embed.norm(dim=-1, keepdim=True)
             
-        # Reshape map for matmul: (H*W, D)
+        # # Reshape map for matmul: (H*W, D)
         H, W, D = feature_map.shape
         flat_map = feature_map.view(-1, D)
+
         
         # Similarity
         sim = torch.matmul(flat_map, text_embed.T).view(H, W)

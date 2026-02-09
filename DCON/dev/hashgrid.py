@@ -197,42 +197,6 @@ class HashGrid(nn.Module):
         self.optimizer.step()
         
         return loss.item() 
-
-    # def query_at_pixels(self, depth, c2w, intrinsics, pixel_coords=None):
-    #     """
-    #     Query features at specific pixel coordinates.
-        
-    #     Args:
-    #         depth: (H, W) depth map
-    #         c2w: (4, 4) camera-to-world transform
-    #         intrinsics: tuple (fx, fy, cx, cy, H, W)
-    #         pixel_coords: (N, 2) pixel coordinates (u, v), if None queries all valid pixels
-            
-    #     Returns:
-    #         features: (N, feature_dim) feature vectors
-    #         positions: (N, 3) corresponding 3D positions
-    #     """
-    #     fx, fy, cx, cy, H, W = intrinsics
-        
-    #     if pixel_coords is None:
-    #         # Query all valid pixels
-    #         world_points = unprojection(depth, intrinsics, c2w, self.device)
-    #     else:
-    #         # Query specific pixels
-    #         u, v = pixel_coords[:, 0], pixel_coords[:, 1]
-    #         z_c = depth[v, u]
-            
-    #         x_c = (u - cx) * z_c / fx
-    #         y_c = (v - cy) * z_c / fy
-            
-    #         cam_points = torch.stack([x_c, y_c, z_c, torch.ones_like(z_c)], dim=1)
-    #         world_points = (c2w @ cam_points.T).T[:, :3]
-        
-    #     # Query features
-    #     with torch.no_grad():
-    #         features = self.forward(world_points)
-        
-    #     return features, world_points
     
     def get_hashgrid_features(self, depth, c2w, intrinsics):
         """
@@ -250,7 +214,7 @@ class HashGrid(nn.Module):
         fx, fy, cx, cy, H, W = intrinsics
         feature_map = torch.zeros((H, W, self.feature_dim), device=self.device)
         mask = (depth > 0.1) & (depth < 10.0)
-        world_points = unprojection(depth, intrinsics, c2w, self.device)
+        world_points = unprojection(depth, intrinsics, c2w, self.device, mask=mask)
         
         batch_size = self.cfg.hash_inference_batch_size
         all_features = []

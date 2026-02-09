@@ -38,7 +38,7 @@ def eval_sh(coeffs, dirs):
     return result
 
 
-def unprojection(depth, intrinsics, c2w, device):
+def unprojection(depth, intrinsics, c2w, device, mask=None):
     """
     Unprojects depth image to camera-space 3D coordinates.
     
@@ -56,15 +56,22 @@ def unprojection(depth, intrinsics, c2w, device):
     x_c = (x - cx) * z_c / fx
     y_c = (y - cy) * z_c / fy
 
-    mask = (depth > 0.1) & (depth < 10.0)
+    if mask is not None:
         
-    cam_points = torch.stack([
-        x_c[mask],
-        y_c[mask],
-        z_c[mask],
-        torch.ones_like(z_c[mask])
-    ], dim=1)
-    
+        cam_points = torch.stack([
+            x_c[mask],
+            y_c[mask],
+            z_c[mask],
+            torch.ones_like(z_c[mask])
+        ], dim=1)
+    else:
+        cam_points = torch.stack([
+            x_c.flatten(),
+            y_c.flatten(),
+            z_c.flatten(),
+            torch.ones_like(z_c.flatten())
+        ], dim=1)
+        
     # Transform to world
     world_points = (c2w @ cam_points.T).T[:, :3]
 
