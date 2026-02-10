@@ -4,7 +4,7 @@ import os
 from gsplat import rasterization
 from gsplat.strategy import DefaultStrategy
 from torchmetrics.image import StructuralSimilarityIndexMeasure
-from utils import rgb_to_sh, eval_sh
+from dev.utils import rgb_to_sh, eval_sh
 
 class GaussianSplatting:
     def __init__(self, config, init_points, init_colors, intrinsics_dict):

@@ -3,7 +3,7 @@ import torch.nn as nn
 import tinycudann as tcnn
 import numpy as np
 import json
-from utils import unprojection
+from dev.utils import unprojection
 
 
 class HashGrid(nn.Module):

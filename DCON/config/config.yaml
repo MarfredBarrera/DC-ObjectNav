@@ -1,0 +1,80 @@
+# DCON Configuration File
+
+# Paths
+paths:
+  scene_dir: "/workspace/DCON/output/current_scene"
+  output_name: "model.pt"
+  sam_checkpoint: "/workspace/DCON/SAM_models/sam_vit_b_01ec64.pth"
+
+# Semantics Settings
+semantics:
+  sam_model_type: "vit_b"
+  clip_model_name: "openai/clip-vit-base-patch32"
+  clip_label_batch_size: 64
+  points_per_side: 32
+  pred_iou_thresh: 0.86
+  stability_score_thresh: 0.92
+  crop_n_layers: 1
+  crop_n_points_downscale_factor: 2
+  min_mask_region_area: 100
+
+# Training Settings
+training:
+  iterations: 10000
+  device: "cuda"
+  gpu_indices: "2,3"
+  near_plane: 0.01
+
+# Hyperparameters
+hyperparameters:
+  ssim_weight: 0.2
+  l1_weight: 0.8
+  scale_reg: 0.01
+  uncertainty_weight: 0.1
+  uncertainty_dim: 16
+
+# Learning Rates
+learning_rates:
+  means: 0.00016
+  scales: 0.005
+  quats: 0.001
+  opacities: 0.05
+  sh0: 0.0025
+  shN: 0.000125
+  uncertainty: 0.001
+
+# Strategy Settings
+strategy:
+  refine_start_iter: 100
+  refine_stop_iter: 9500
+  refine_every: 100
+  reset_every: 1000
+  grow_grad2d: 0.0002
+  prune_opa: 0.005
+
+# Toggles
+toggles:
+  train_uncertainty: true
+
+# HashGrid Configuration
+hashgrid:
+  # Grid Structure
+  n_levels: 16
+  n_features_per_level: 4
+  log2_hashmap_size: 21
+  base_resolution: 16
+  per_level_scale: 1.5
+  
+  # MLP Architecture
+  n_neurons: 128
+  n_hidden_layers: 3
+  feature_dim: 512
+  
+  # Training
+  lr: 0.001
+  train_batch_size: 8192
+  inference_batch_size: 16384
+  replay_buffer_size: 10
+  buffer_refresh_interval: 200
+  train_every_n_steps: 1
+  warmup_steps: 0

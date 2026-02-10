@@ -11,12 +11,12 @@ import matplotlib.cm as cm
 from collections import deque
 
 # Custom Imports
-from config import Config
-from gaussians import GaussianSplatting
-import semantics
-from utils import unprojection
-from hashgrid import HashGrid
-from visualizer import Visualizer
+from dev.config import Config
+from dev.gaussians import GaussianSplatting
+from dev.semantics import SAM_CLIP_Semantics
+from dev.utils import unprojection
+from dev.hashgrid import HashGrid
+from dev.visualizer import Visualizer
 
 class Runner:
     def __init__(self, cfg: Config):
@@ -34,8 +34,7 @@ class Runner:
         self.num_cameras = len(self.gt_images)
 
         # 2. Semantics
-        self.sam_clip = semantics.SAM_CLIP_Semantics(self.cfg, device=self.device)
-        self.clipseg = semantics.CLIPSeg(device=self.device)
+        self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
 
         # 3. HashGrid
         self.hashgrid = HashGrid(self.cfg, device=self.device, transforms_json=os.path.join(self.cfg.scene_dir, "transforms.json"))
@@ -222,11 +221,6 @@ class Runner:
                 
                 torch.cuda.empty_cache()
                 print(f"Buffer updated")
-                
-
-
-
-
 
 
 
@@ -329,7 +323,7 @@ def visualize_similarity(runner, similarity_map, img_index, text_query="a pillow
 
 
 if __name__ == "__main__":
-    config = Config()
+    config = Config("config/config.yaml")
     runner = Runner(config)
 
     # runner.train_feature_field()
@@ -341,12 +335,12 @@ if __name__ == "__main__":
     # diagnose_hashgrid(runner, clip_idx=clip_idx, text_query=text_query)
     
     visualizer = Visualizer(runner)
-    # visualizer.visualize_2d_similarity(clip_idx, text_query)
+    visualizer.visualize_2d_similarity(clip_idx, text_query)
 
-    visualizer.create_birds_eye_view(text_query, 
-                                     num_cameras=100, 
-                                     grid_resolution=0.01, 
-                                     aggregation='median', 
-                                     save_path=None, 
-                                     colormap='jet', 
-                                     vmin=0.6)
+    # visualizer.create_birds_eye_view(text_query, 
+    #                                  num_cameras=100, 
+    #                                  grid_resolution=0.01, 
+    #                                  aggregation='median', 
+    #                                  save_path='figs/bev_map.png', 
+    #                                  colormap='jet', 
+    #                                  vmin=0.6)

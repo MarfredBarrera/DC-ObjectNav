@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from matplotlib.colors import LinearSegmentedColormap
-from utils import unprojection
+from dev.utils import unprojection
 import cv2
 
 
@@ -145,7 +145,6 @@ class Visualizer:
                 intrinsics = self.runner.intrinsics_tuple
                 
                 # Get 3D world points
-                from utils import unprojection
                 world_points = unprojection(depth, intrinsics, c2w, self.device)
                 
                 # Filter by height early (Y is up)
@@ -215,7 +214,6 @@ class Visualizer:
                 intrinsics = self.runner.intrinsics_tuple
                 
                 # Get 3D world points
-                from utils import unprojection
                 world_points = unprojection(depth, intrinsics, c2w, self.device)
                 
                 # Get features from HashGrid
