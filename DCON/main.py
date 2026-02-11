@@ -40,16 +40,16 @@ class HabitatSim:
         self.device = self.cfg.device
         
         # Output directory
-        self.output_dir = cfg.scene_dir
+        self.output_dir = cfg.output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(f"{self.output_dir}/rgbs", exist_ok=True)
         os.makedirs(f"{self.output_dir}/depth_data", exist_ok=True)
         os.makedirs(f"{self.output_dir}/depth_vis", exist_ok=True)
         
         # Camera parameters
-        self.IMG_WIDTH = 720
-        self.IMG_HEIGHT = 720
-        self.FOV_DEG = 90.0
+        self.IMG_WIDTH = cfg.img_width
+        self.IMG_HEIGHT = cfg.img_height
+        self.FOV_DEG = cfg.fov
 
         # Initialize semantics and hashgrid
         self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
@@ -78,8 +78,10 @@ class HabitatSim:
         self.replay_buffer = deque(maxlen=self.cfg.hash_replay_buffer_size)
         self.training_step = 0
         self.training_active = False
+        self.extraction_thread = None
         self.training_thread = None
-        self.data_queue = queue.Queue(maxsize=10)
+        self.data_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
+        self.training_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
         
         # Visualization
         self.visualizer = None
@@ -166,6 +168,109 @@ class HabitatSim:
         
         return transform_matrix
     
+    def _create_telemetry_panel(self, width=400, height=512):
+        """Create a telemetry information panel"""
+        panel = np.ones((height, width, 3), dtype=np.uint8) * 40  # Dark background
+        
+        # Title
+        cv2.putText(panel, "TELEMETRY", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.line(panel, (10, 40), (width - 10, 40), (100, 100, 100), 1)
+        
+        # Frame info
+        y_pos = 70
+        cv2.putText(panel, "Frame Count:", (10, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(panel, f"{self.frame_count}", (width - 100, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Buffer info
+        y_pos += 35
+        cv2.putText(panel, "Replay Buffer:", (10, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        buffer_text = f"{len(self.replay_buffer)}/{self.cfg.hash_replay_buffer_size}"
+        cv2.putText(panel, buffer_text, (width - 120, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Buffer bar
+        bar_x, bar_y, bar_w, bar_h = 10, y_pos + 10, width - 20, 20
+        cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (100, 100, 100), 1)
+        if self.cfg.hash_replay_buffer_size > 0:
+            fill_w = int(bar_w * len(self.replay_buffer) / self.cfg.hash_replay_buffer_size)
+            cv2.rectangle(panel, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), (0, 200, 255), -1)
+        
+        # Training status
+        y_pos += 55
+        cv2.putText(panel, "Training Status:", (10, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        status_text = "ON" if self.training_active else "OFF"
+        status_color = (0, 255, 0) if self.training_active else (0, 0, 255)
+        cv2.putText(panel, status_text, (width - 80, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+        
+        # Training step
+        y_pos += 35
+        cv2.putText(panel, "Training Step:", (10, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(panel, f"{self.training_step}", (width - 120, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Queue status
+        y_pos += 35
+        cv2.putText(panel, "Data Queue:", (10, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(panel, f"{self.data_queue.qsize()}/{self.cfg.data_queue_size}", (width - 100, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        y_pos += 35
+        cv2.putText(panel, "Training Queue:", (10, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(panel, f"{self.training_queue.qsize()}/{self.cfg.training_queue_size}", (width - 100, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Separator
+        y_pos += 25
+        cv2.line(panel, (10, y_pos), (width - 10, y_pos), (100, 100, 100), 1)
+        
+        # Camera position
+        y_pos += 30
+        state = self.agent.get_state()
+        pos = state.position
+        cv2.putText(panel, "Camera Position:", (10, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        y_pos += 25
+        cv2.putText(panel, f"X: {pos[0]:6.2f}", (20, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_pos += 20
+        cv2.putText(panel, f"Y: {pos[1]:6.2f}", (20, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_pos += 20
+        cv2.putText(panel, f"Z: {pos[2]:6.2f}", (20, y_pos),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # # Controls reminder
+        # y_pos = height - 120
+        # cv2.line(panel, (10, y_pos - 10), (width - 10, y_pos - 10), (100, 100, 100), 1)
+        # cv2.putText(panel, "CONTROLS:", (10, y_pos),
+        #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        # y_pos += 25
+        # cv2.putText(panel, "[W] Forward", (10, y_pos),
+        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # y_pos += 20
+        # cv2.putText(panel, "[A] Turn Left", (10, y_pos),
+        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # y_pos += 20
+        # cv2.putText(panel, "[D] Turn Right", (10, y_pos),
+        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # y_pos += 20
+        # cv2.putText(panel, "[T] Toggle Training", (10, y_pos),
+        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # y_pos += 20
+        # cv2.putText(panel, "[Q] Quit", (10, y_pos),
+        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        
+        return panel
+    
     def run_exploration(self):
         """Exploration loop with keyboard controls"""
         print("\n" + "="*40)
@@ -183,38 +288,32 @@ class HabitatSim:
             obs = self.simulator.get_sensor_observations()    
             rgb = obs["rgb"]
             depth = obs["depth"]
-            
-            print(f"DEBUG: Habitat RGB - shape: {rgb.shape}, dtype: {rgb.dtype}, min: {rgb.min()}, max: {rgb.max()}")
-
             current_matrix = self._get_camera_matrix()
 
-            # Window display of RGB
+            # Create agent view and telemetry panel
             cv2_img = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
-            small_img = cv2.resize(cv2_img, (512, 512))
+            agent_view = cv2.resize(cv2_img, (640, 512))
             
-            # Add info overlay
-            info_img = small_img.copy()
-            cv2.putText(info_img, f"Frame: {self.frame_count}", (10, 30),
+            # Add simple label to agent view
+            cv2.putText(agent_view, "AGENT VIEW", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(info_img, f"Buffer: {len(self.replay_buffer)}/{self.cfg.hash_replay_buffer_size}", 
-                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(info_img, f"Training: {'ON' if self.training_active else 'OFF'}", 
-                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 
-                       (0, 255, 0) if self.training_active else (0, 0, 255), 2)
-            cv2.putText(info_img, f"Train Step: {self.training_step}", 
-                       (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            cv2.imshow("Habitat Agent View", info_img)
+            # Create telemetry panel
+            telemetry_panel = self._create_telemetry_panel(width=400, height=512)
+            
+            # Combine horizontally
+            combined_view = np.hstack([agent_view, telemetry_panel])
+            
+            cv2.imshow("Habitat Explorer - Agent View & Telemetry", combined_view)
 
             try:
-
-                # Tensors are already on CPU from _process_frame, just add to queue
-                self.data_queue.put_nowait((rgb,depth,current_matrix))
-                
-                # Save RGB and depth
-                self.rgb_imgs.append(cv2_img)
-                self.depth_imgs.append(depth)
-                self.pose_matrices.append(current_matrix)
+                if self.frame_count % self.viz_update_interval == 0:
+                    self.data_queue.put_nowait((rgb,depth,current_matrix))
+                    
+                    # Save RGB and depth
+                    self.rgb_imgs.append(cv2_img)
+                    self.depth_imgs.append(depth)
+                    self.pose_matrices.append(current_matrix)
                 
             except queue.Full:
                 print("Queue full, skipping frame")
@@ -223,29 +322,36 @@ class HabitatSim:
                 import traceback
                 traceback.print_exc()
 
-            print("Waiting for input...")
-            key = cv2.waitKey(0)
+            # Non-blocking key detection (1ms wait)
+            key = cv2.waitKey(1) & 0xFF
             
-            print(f"Key pressed: {key}")
-            
-            if key == ord('q'):
+            if key == ord('q') or key == 27:  # 'q' or ESC
+                print("Quit requested")
                 break
             elif key == ord('w'):
                 self.simulator.step("move_forward")
                 print("Action: Move Forward")
+                self.frame_count += 1
             elif key == ord('a'):
                 self.simulator.step("turn_left")
                 print("Action: Turn Left")
+                self.frame_count += 1
             elif key == ord('d'):
                 self.simulator.step("turn_right")
                 print("Action: Turn Right")
+                self.frame_count += 1
             elif key == ord('t'):
                 if self.training_active:
                     self.stop_training()
                 else:
                     self.start_training()
+            else:
+                self.frame_count += 1
+            
+            # # Small delay to prevent CPU spinning
+            # time.sleep(0.01)
 
-            self.frame_count += 1
+            time.sleep(0.2)
 
     def save_data(self):
         """Save all collected data and models"""
@@ -339,7 +445,6 @@ class HabitatSim:
         print(f"Extracting features from {rgb_np.shape} image...")
         try:
             clip_features = self.sam_clip.extract_dense_features(rgb_np)
-            print(f"Features shape: {clip_features.shape}")
             
             # IMMEDIATELY move to CPU to free GPU memory for SAM
             clip_features_cpu = clip_features.cpu()
@@ -387,12 +492,24 @@ class HabitatSim:
         world_points_final = world_points_cpu[valid_mask]
         gt_features_final = gt_features_cpu[valid_mask]
         
-        del world_points_cpu, gt_features_cpu
-        
-        print(f"Extracted {world_points_final.shape[0]} valid points with features")
-        
+        del world_points_cpu, gt_features_cpu        
         # Return CPU tensors - they'll be moved to GPU in training worker
         return world_points_final, gt_features_final, rgb_np, depth, c2w_cv
+    
+    def _extract_semantics(self):
+
+        while self.training_active:
+            try:
+                new_data = self.data_queue.get_nowait()
+                if new_data is not None:
+                    rgb, depth, current_matrix = new_data
+                    world_points_cpu, gt_features_cpu, _, _, _ = self._process_frame(
+                        rgb, depth, current_matrix)
+                    self.training_queue.put_nowait((world_points_cpu, gt_features_cpu))
+                    print(f"Enqueued {world_points_cpu.shape[0]} points for training")
+                    time.sleep(0.1)
+            except queue.Empty:
+                pass
 
     def _training_worker(self):
         """Background thread for continuous training"""
@@ -402,15 +519,12 @@ class HabitatSim:
         while self.training_active:
             # Get data from queue if available
             try:
-                new_data = self.data_queue.get_nowait()
-                if new_data is not None:
-                    rgb, depth, current_matrix = new_data
-                    # Move data to GPU for training
-                    world_points_cpu, gt_features_cpu, rgb_np, depth_np, c2w_cv = self._process_frame(
-                    rgb, depth, current_matrix)
-                    print(f"Received data from queue: {world_points_cpu.shape[0]} points")
+                new_training_data = self.training_queue.get_nowait()
+                if new_training_data is not None:
+                    world_points_cpu, gt_features_cpu = new_training_data
                     world_points_gpu = world_points_cpu.to(self.device)
                     gt_features_gpu = gt_features_cpu.to(self.device)
+
                     self.replay_buffer.append((world_points_gpu, gt_features_gpu))
                     print(f"Buffer size: {len(self.replay_buffer)}/{self.cfg.hash_replay_buffer_size}")
             except queue.Empty:
@@ -427,12 +541,10 @@ class HabitatSim:
                 gt_features = torch.cat([x[1] for x in self.replay_buffer], dim=0)
             except Exception as e:
                 print(f"Error concatenating buffer: {e}")
-                time.sleep(0.1)
                 continue
             
             if world_points.shape[0] < batch_size:
                 print(f"Not enough points for batch: {world_points.shape[0]} < {batch_size}")
-                time.sleep(0.1)
                 continue
             
             # Sample batch
@@ -455,6 +567,8 @@ class HabitatSim:
         """Start background training thread"""
         if not self.training_active:
             self.training_active = True
+            self.extraction_thread = threading.Thread(target=self._extract_semantics, daemon=True)
+            self.extraction_thread.start()
             self.training_thread = threading.Thread(target=self._training_worker, daemon=True)
             self.training_thread.start()
             print("Background training started!")
@@ -467,10 +581,16 @@ class HabitatSim:
                 self.training_thread.join(timeout=2.0)
             print("Background training stopped!")
 
+    def stop_extraction(self):
+        """Stop background extraction thread"""
+        if self.extraction_thread:
+            self.extraction_thread.join(timeout=2.0)
+            print("Background extraction stopped!")
     
     def cleanup(self):
         """Cleanup resources"""
         self.stop_training()
+        self.stop_extraction()
         cv2.destroyAllWindows()
         self.simulator.close()
 

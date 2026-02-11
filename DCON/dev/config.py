@@ -13,9 +13,17 @@ class Config:
         """
         # Set all default values first
         # Paths
-        self.scene_dir = "/workspace/DCON/output/current_scene"
+        self.output_dir = "/workspace/DCON/output/current_scene"
         self.output_name = "model.pt"
         self.SAM_checkpoint_path = "/workspace/DCON/SAM_models/sam_vit_b_01ec64.pth"
+
+        # Habitat Settings
+        self.scene_path = "/workspace/DCON/gibson_scenes/Anaheim.glb"
+        self.img_width = 720
+        self.img_height = 720
+        self.fov = 90
+        self.data_queue_size = 30
+        self.training_queue_size = 10
         
         # Semantics Settings
         self.SAM_model_type = "vit_b"
@@ -96,12 +104,27 @@ class Config:
         # Paths
         if 'paths' in yaml_data:
             paths = yaml_data['paths']
-            if 'scene_dir' in paths:
-                self.scene_dir = paths['scene_dir']
+            if 'output_dir' in paths:
+                self.output_dir = paths['output_dir']
             if 'output_name' in paths:
                 self.output_name = paths['output_name']
             if 'sam_checkpoint' in paths:
                 self.SAM_checkpoint_path = paths['sam_checkpoint']
+        # Habitat Settings
+        if 'habitat' in yaml_data:
+            habitat = yaml_data['habitat']
+            if 'scene_path' in habitat:
+                self.scene_path = habitat['scene_path']
+            if 'img_width' in habitat:
+                self.img_width = habitat['img_width']
+            if 'img_height' in habitat:
+                self.img_height = habitat['img_height']
+            if 'fov' in habitat:
+                self.fov = habitat['fov']
+            if 'data_queue_size' in habitat:
+                self.data_queue_size = habitat['data_queue_size']
+            if 'training_queue_size' in habitat:
+                self.training_queue_size = habitat['training_queue_size']
         
         # Semantics
         if 'semantics' in yaml_data:
@@ -224,11 +247,3 @@ class Config:
                 self.hash_train_every_n_steps = hg['train_every_n_steps']
             if 'warmup_steps' in hg:
                 self.hash_warmup_steps = hg['warmup_steps']
-
-
-# Usage examples:
-# Load from YAML file:
-# config = Config('path/to/config.yaml')
-
-# Use default values:
-# config = Config()

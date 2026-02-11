@@ -28,7 +28,7 @@ class Runner:
         self.device = self.cfg.device
 
         # 1. Load Data
-        print(f"Loading data from {self.cfg.scene_dir}...")
+        print(f"Loading data from {self.cfg.output_dir}...")
         self.gt_images, self.gt_depths, self.c2ws, self.intrinsics_tuple = self._load_scene_data()
         self.fx, self.fy, self.cx, self.cy, self.H, self.W = self.intrinsics_tuple
         self.num_cameras = len(self.gt_images)
@@ -37,9 +37,9 @@ class Runner:
         self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
 
         # 3. HashGrid
-        self.hashgrid = HashGrid(self.cfg, device=self.device, transforms_json=os.path.join(self.cfg.scene_dir, "transforms.json"))
+        self.hashgrid = HashGrid(self.cfg, device=self.device, transforms_json=os.path.join(self.cfg.output_dir, "transforms.json"))
 
-        bounds = self.hashgrid.load_scene_bounds_from_json(os.path.join(self.cfg.scene_dir, "transforms.json"))
+        bounds = self.hashgrid.load_scene_bounds_from_json(os.path.join(self.cfg.output_dir, "transforms.json"))
 
         self.bounds_min = bounds[0]
         self.bounds_max = bounds[1]
@@ -52,12 +52,12 @@ class Runner:
         # self.gs_model = GaussianSplatting(self.cfg, init_points, init_colors, intrinsics_dict)
 
     def _load_scene_data(self):
-        json_path = os.path.join(self.cfg.scene_dir, "transforms.json")
+        json_path = os.path.join(self.cfg.output_dir, "transforms.json")
         with open(json_path, 'r') as f:
             meta = json.load(f)
 
         frames = meta['frames']
-        img_0 = imageio.imread(os.path.join(self.cfg.scene_dir, frames[0]['file_path']))
+        img_0 = imageio.imread(os.path.join(self.cfg.output_dir, frames[0]['file_path']))
         H, W = img_0.shape[:2]
         
         fov_x = meta['camera_angle_x']
@@ -72,13 +72,13 @@ class Runner:
 
         for frame in frames:
             # RGB
-            rgb_path = os.path.join(self.cfg.scene_dir, frame['file_path'])
+            rgb_path = os.path.join(self.cfg.output_dir, frame['file_path'])
             rgb = imageio.imread(rgb_path)
             gt_images.append(torch.from_numpy(rgb).float().to(self.device) / 255.0)
 
             # Depth
             depth_name = os.path.basename(frame['file_path']).replace("rgb", "depth").replace(".png", ".npy")
-            depth_path = os.path.join(self.cfg.scene_dir, "depth_data", depth_name)
+            depth_path = os.path.join(self.cfg.output_dir, "depth_data", depth_name)
             depth = np.load(depth_path)
             if depth.shape[:2] != (H, W):
                 depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
@@ -225,7 +225,7 @@ class Runner:
 
 
     def save_results(self):
-        save_path = os.path.join(self.cfg.scene_dir, self.cfg.output_name)
+        save_path = os.path.join(self.cfg.output_dir, self.cfg.output_name)
         print(f"Saving model to {save_path}...")
         self.gs_model.save(save_path)
 
@@ -328,10 +328,10 @@ if __name__ == "__main__":
 
     # runner.train_feature_field()
     # runner.hashgrid.save("hashgrid_model.pt")
-    runner.hashgrid.load("output/hashgrid_model.pt")
+    runner.hashgrid.load("output/current_scene/hashgrid_model.pt")
 
     text_query = "a pillow"
-    clip_idx = 15
+    clip_idx = 21
     # diagnose_hashgrid(runner, clip_idx=clip_idx, text_query=text_query)
     
     visualizer = Visualizer(runner)
