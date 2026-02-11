@@ -207,11 +207,9 @@ class HabitatSim:
             cv2.imshow("Habitat Agent View", info_img)
 
             try:
-                world_points, gt_features, rgb_np, depth_np, c2w_cv = self._process_frame(
-                                rgb, depth, current_matrix)
-                
+
                 # Tensors are already on CPU from _process_frame, just add to queue
-                self.data_queue.put_nowait((world_points, gt_features))
+                self.data_queue.put_nowait((rgb,depth,current_matrix))
                 
                 # Save RGB and depth
                 self.rgb_imgs.append(cv2_img)
@@ -406,8 +404,10 @@ class HabitatSim:
             try:
                 new_data = self.data_queue.get_nowait()
                 if new_data is not None:
+                    rgb, depth, current_matrix = new_data
                     # Move data to GPU for training
-                    world_points_cpu, gt_features_cpu = new_data
+                    world_points_cpu, gt_features_cpu, rgb_np, depth_np, c2w_cv = self._process_frame(
+                    rgb, depth, current_matrix)
                     print(f"Received data from queue: {world_points_cpu.shape[0]} points")
                     world_points_gpu = world_points_cpu.to(self.device)
                     gt_features_gpu = gt_features_cpu.to(self.device)
