@@ -352,7 +352,7 @@ if __name__ == "__main__":
     config = Config(
         scene_dir="/workspace/DCON/output/current_scene",
         iterations=10000,
-        gpu_indices="4,5"
+        gpu_indices="2,3"
     )
 
     # Initialize Runner
