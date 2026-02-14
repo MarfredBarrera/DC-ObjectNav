@@ -85,6 +85,7 @@ class Config:
         
         # HashGrid Training
         self.hash_lr = 1e-3
+        self.hash_per_image_batch_size = 4096
         self.hash_train_batch_size = 8192
         self.hash_inference_batch_size = 16384
         self.hash_replay_buffer_size = 10
@@ -235,6 +236,8 @@ class Config:
                 self.hash_feature_dim = hg['feature_dim']
             if 'lr' in hg:
                 self.hash_lr = hg['lr']
+            if 'per_image_batch_size' in hg:
+                self.hash_per_image_batch_size = hg['per_image_batch_size']
             if 'train_batch_size' in hg:
                 self.hash_train_batch_size = hg['train_batch_size']
             if 'inference_batch_size' in hg:

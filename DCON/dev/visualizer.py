@@ -527,4 +527,4 @@ class Visualizer:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"Saved comparison to {save_path}")
         
-        plt.show()
+        plt.show()    

@@ -8,6 +8,8 @@ import cv2
 import matplotlib.pyplot as plt
 from collections import deque
 import queue
+import threading
+import random
 
 # Custom imports
 from dev.config import Config
@@ -15,8 +17,6 @@ from dev.semantics import SAM_CLIP_Semantics
 from dev.utils import unprojection
 from dev.hashgrid import HashGrid
 from dev.visualizer import Visualizer
-
-import threading
 
 # Habitat imports
 import habitat_sim
@@ -27,7 +27,6 @@ os.environ['GLOG_minloglevel'] = '2'
 os.environ['MAGNUM_LOG'] = 'quiet'
 os.environ['HABITAT_SIM_LOG'] = 'quiet'
 os.environ['CUDA_VISIBLE_DEVICES'] = '2' 
-
 
 class HabitatSim:
     def __init__(self, cfg: Config, scene_path: str):
@@ -75,18 +74,25 @@ class HabitatSim:
         self.frame_count = 0
         
         # Training state
-        self.replay_buffer = deque(maxlen=self.cfg.hash_replay_buffer_size)
+        # CHANGED: Replaced deque with a standard list to hold ALL history on CPU
+        self.global_point_buffer = [] 
         self.training_step = 0
         self.training_active = False
         self.extraction_thread = None
         self.training_thread = None
+        
+        # Queues
         self.data_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
         self.training_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
         
+        # Thread safety
+        self.buffer_lock = threading.Lock()
+        
         # Visualization
-        self.visualizer = None
+        self.viz_active = False
         self.last_viz_update = 0
-        self.viz_update_interval = 5  # Update visualization every 5 frames
+        self.viz_thread = None
+        self.viz_update_interval = 5 
         
         print("\nInitialization complete!")
 
@@ -174,59 +180,53 @@ class HabitatSim:
         
         # Title
         cv2.putText(panel, "TELEMETRY", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.8, (255, 255, 255), 2)
         cv2.line(panel, (10, 40), (width - 10, 40), (100, 100, 100), 1)
         
         # Frame info
         y_pos = 70
         cv2.putText(panel, "Frame Count:", (10, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (200, 200, 200), 1)
         cv2.putText(panel, f"{self.frame_count}", (width - 100, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (255, 255, 255), 2)
         
         # Buffer info
         y_pos += 35
-        cv2.putText(panel, "Replay Buffer:", (10, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        buffer_text = f"{len(self.replay_buffer)}/{self.cfg.hash_replay_buffer_size}"
-        cv2.putText(panel, buffer_text, (width - 120, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Buffer bar
-        bar_x, bar_y, bar_w, bar_h = 10, y_pos + 10, width - 20, 20
-        cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (100, 100, 100), 1)
-        if self.cfg.hash_replay_buffer_size > 0:
-            fill_w = int(bar_w * len(self.replay_buffer) / self.cfg.hash_replay_buffer_size)
-            cv2.rectangle(panel, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), (0, 200, 255), -1)
+        cv2.putText(panel, "Total Samples:", (10, y_pos),
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (200, 200, 200), 1)
+        with self.buffer_lock:
+            buf_len = len(self.global_point_buffer)
+        cv2.putText(panel, f"{buf_len}", (width - 120, y_pos),
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (255, 255, 255), 2)
         
         # Training status
         y_pos += 55
         cv2.putText(panel, "Training Status:", (10, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (200, 200, 200), 1)
         status_text = "ON" if self.training_active else "OFF"
         status_color = (0, 255, 0) if self.training_active else (0, 0, 255)
         cv2.putText(panel, status_text, (width - 80, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, status_color, 2)
         
         # Training step
         y_pos += 35
         cv2.putText(panel, "Training Step:", (10, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (200, 200, 200), 1)
         cv2.putText(panel, f"{self.training_step}", (width - 120, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (255, 255, 255), 2)
         
         # Queue status
         y_pos += 35
         cv2.putText(panel, "Data Queue:", (10, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (200, 200, 200), 1)
         cv2.putText(panel, f"{self.data_queue.qsize()}/{self.cfg.data_queue_size}", (width - 100, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (255, 255, 255), 2)
         
         y_pos += 35
         cv2.putText(panel, "Training Queue:", (10, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (200, 200, 200), 1)
         cv2.putText(panel, f"{self.training_queue.qsize()}/{self.cfg.training_queue_size}", (width - 100, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (255, 255, 255), 2)
         
         # Separator
         y_pos += 25
@@ -237,37 +237,16 @@ class HabitatSim:
         state = self.agent.get_state()
         pos = state.position
         cv2.putText(panel, "Camera Position:", (10, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.6, (200, 200, 200), 1)
         y_pos += 25
         cv2.putText(panel, f"X: {pos[0]:6.2f}", (20, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.5, (255, 255, 255), 1)
         y_pos += 20
         cv2.putText(panel, f"Y: {pos[1]:6.2f}", (20, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.5, (255, 255, 255), 1)
         y_pos += 20
         cv2.putText(panel, f"Z: {pos[2]:6.2f}", (20, y_pos),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        # # Controls reminder
-        # y_pos = height - 120
-        # cv2.line(panel, (10, y_pos - 10), (width - 10, y_pos - 10), (100, 100, 100), 1)
-        # cv2.putText(panel, "CONTROLS:", (10, y_pos),
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        # y_pos += 25
-        # cv2.putText(panel, "[W] Forward", (10, y_pos),
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        # y_pos += 20
-        # cv2.putText(panel, "[A] Turn Left", (10, y_pos),
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        # y_pos += 20
-        # cv2.putText(panel, "[D] Turn Right", (10, y_pos),
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        # y_pos += 20
-        # cv2.putText(panel, "[T] Toggle Training", (10, y_pos),
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        # y_pos += 20
-        # cv2.putText(panel, "[Q] Quit", (10, y_pos),
-        #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                   cv2.FONT_HERSHEY_TRIPLEX, 0.5, (255, 255, 255), 1)
         
         return panel
     
@@ -292,16 +271,12 @@ class HabitatSim:
 
             # Create agent view and telemetry panel
             cv2_img = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
-            agent_view = cv2.resize(cv2_img, (640, 512))
+            agent_view = cv2.resize(cv2_img, (720, 720))
             
-            # Add simple label to agent view
             cv2.putText(agent_view, "AGENT VIEW", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                       cv2.FONT_HERSHEY_TRIPLEX, 0.7, (0, 255, 0), 2)
             
-            # Create telemetry panel
-            telemetry_panel = self._create_telemetry_panel(width=400, height=512)
-            
-            # Combine horizontally
+            telemetry_panel = self._create_telemetry_panel(width=400, height=720)
             combined_view = np.hstack([agent_view, telemetry_panel])
             
             cv2.imshow("Habitat Explorer - Agent View & Telemetry", combined_view)
@@ -322,10 +297,9 @@ class HabitatSim:
                 import traceback
                 traceback.print_exc()
 
-            # Non-blocking key detection (1ms wait)
             key = cv2.waitKey(1) & 0xFF
             
-            if key == ord('q') or key == 27:  # 'q' or ESC
+            if key == ord('q') or key == 27:
                 print("Quit requested")
                 break
             elif key == ord('w'):
@@ -348,10 +322,7 @@ class HabitatSim:
             else:
                 self.frame_count += 1
             
-            # # Small delay to prevent CPU spinning
-            # time.sleep(0.01)
-
-            time.sleep(0.2)
+            time.sleep(0.5)
 
     def save_data(self):
         """Save all collected data and models"""
@@ -423,81 +394,72 @@ class HabitatSim:
         print(f"Saved HashGrid model to {hashgrid_path}")
 
     def _process_frame(self, rgb, depth, pose_matrix):
-        """Process and extract features from a frame"""
-        # Habitat returns uint8 [0, 255] RGBA
-        # Convert to RGB only (remove alpha channel)
+        """Process and extract features from a frame, strictly returning CPU tensors"""
         if rgb.shape[-1] == 4:
-            rgb_np = rgb[:, :, :3]  # Just remove alpha, keep as uint8
+            rgb_np = rgb[:, :, :3]
         else:
             rgb_np = rgb
             
-        # Ensure it's uint8 in [0, 255] for SAM
         if rgb_np.dtype != np.uint8:
             if rgb_np.max() <= 1.0:
                 rgb_np = (rgb_np * 255).astype(np.uint8)
             else:
                 rgb_np = rgb_np.astype(np.uint8)
         
-        # Clear GPU cache before heavy SAM processing
         torch.cuda.empty_cache()
         
-        # Extract CLIP features (returns torch tensor on GPU)
-        print(f"Extracting features from {rgb_np.shape} image...")
         try:
+            # clip_features comes from SAM as a GPU tensor usually
             clip_features = self.sam_clip.extract_dense_features(rgb_np)
-            
-            # IMMEDIATELY move to CPU to free GPU memory for SAM
             clip_features_cpu = clip_features.cpu()
             del clip_features
-            torch.cuda.empty_cache()
-            
         except torch.cuda.OutOfMemoryError as e:
-            print(f"CUDA OOM during feature extraction: {e}")
-            print("Try reducing SAM settings in config or killing other GPU processes")
+            print(f"CUDA OOM: {e}")
             torch.cuda.empty_cache()
             raise
         
-        # Convert depth to CPU tensor first
         depth_tensor = torch.from_numpy(depth).float()
         
-        # Habitat (OpenGL) -> GSplat (OpenCV) coordinate conversion
         convert_mat = np.array([[1,0,0,0], [0,-1,0,0], [0,0,-1,0], [0,0,0,1]])
         c2w_cv = pose_matrix @ convert_mat
         c2w_cpu = torch.from_numpy(c2w_cv).float()
         
-        # Do unprojection on CPU to avoid GPU memory issues
-        mask = (depth_tensor > 0.1) & (depth_tensor < 10.0)
+        depth_mask = (depth_tensor > 0.1) & (depth_tensor < 10.0)
+        valid_indices = torch.nonzero(depth_mask.flatten(), as_tuple=False).squeeze(1)
+
+        mask = torch.zeros(depth_tensor.numel(), dtype=torch.bool)
+        mask[valid_indices] = True
+        mask = mask.view_as(depth_tensor)
         
-        # Move only what we need to GPU for unprojection
+        # Temp move to GPU for fast unprojection
         depth_gpu = depth_tensor.to(self.device)
         c2w_gpu = c2w_cpu.to(self.device)
         
-        world_points = unprojection(depth_gpu, self.intrinsics_tuple, c2w_gpu, self.device, mask=mask)
+        world_points = unprojection(
+            depth_gpu,
+            self.intrinsics_tuple,
+            c2w_gpu,
+            self.device,
+            mask=mask.to(self.device)
+        )
         
-        # Free GPU tensors immediately
-        del depth_gpu, c2w_gpu
-        torch.cuda.empty_cache()
-        
-        # Move world_points to CPU, apply mask on CPU
+        # Move immediately back to CPU
         world_points_cpu = world_points.cpu()
-        del world_points
+        del world_points, depth_gpu, c2w_gpu
         torch.cuda.empty_cache()
         
-        # Apply mask to features on CPU
         gt_features_cpu = clip_features_cpu[mask]
         del clip_features_cpu
         
-        # Filter zero-norm features on CPU
         valid_mask = gt_features_cpu.norm(dim=-1) > 1e-6
         world_points_final = world_points_cpu[valid_mask]
         gt_features_final = gt_features_cpu[valid_mask]
         
-        del world_points_cpu, gt_features_cpu        
-        # Return CPU tensors - they'll be moved to GPU in training worker
+        # Returns all CPU tensors
         return world_points_final, gt_features_final, rgb_np, depth, c2w_cv
     
     def _extract_semantics(self):
-
+        """gets frames from data queue, extracts semantics, then pushes result to training queue"""
         while self.training_active:
             try:
                 new_data = self.data_queue.get_nowait()
@@ -505,66 +467,223 @@ class HabitatSim:
                     rgb, depth, current_matrix = new_data
                     world_points_cpu, gt_features_cpu, _, _, _ = self._process_frame(
                         rgb, depth, current_matrix)
+                    
+                    # Push CPU tensors to the training queue
                     self.training_queue.put_nowait((world_points_cpu, gt_features_cpu))
-                    print(f"Enqueued {world_points_cpu.shape[0]} points for training")
-                    time.sleep(0.1)
+                    time.sleep(0.01)
             except queue.Empty:
-                pass
+                time.sleep(0.1)
+
+    def _sample_from_global_history(self, batch_size, num_frames_to_sample=4):
+        """
+        Randomly samples a batch from the global history buffer.
+        
+        Args: 
+        batch_size (int): Number of points to sample in total.
+        num_frames_to_sample (int): Number of frames to sample from the global history.
+
+        Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Sampled points and features tensors.
+        """
+        with self.buffer_lock:
+            total_frames = len(self.global_point_buffer)
+            if total_frames == 0:
+                return None, None
+            
+            # 1. Pick random frames
+            sample_count = min(total_frames, num_frames_to_sample)
+            frame_indices = np.random.choice(total_frames, size=sample_count, replace=False)
+            
+            # 2. Pre-calculate how many points to take from each frame
+            # (Uniformly distribute the batch size across selected frames)
+            points_per_frame = batch_size // sample_count
+            remainder = batch_size % sample_count
+            
+            batch_points_list = []
+            batch_features_list = []
+            
+            for i, idx in enumerate(frame_indices):
+                pts, fts = self.global_point_buffer[idx]
+                n_available = pts.shape[0]
+                
+                # Calculate how many to take for this frame
+                n_take = points_per_frame + (1 if i < remainder else 0)
+                
+                # If frame has fewer points than we want, take all of them
+                if n_available <= n_take:
+                    batch_points_list.append(pts)
+                    batch_features_list.append(fts)
+                else:
+                    # Randomly sample INDICES on CPU, then slice
+                    # This is faster than concating huge arrays then slicing
+                    rand_idx = torch.randperm(n_available)[:n_take]
+                    batch_points_list.append(pts[rand_idx])
+                    batch_features_list.append(fts[rand_idx])
+        
+        # 3. Concatenate smaller chunks (Much faster)
+        batch_points = torch.cat(batch_points_list, dim=0)
+        batch_features = torch.cat(batch_features_list, dim=0)
+        
+        # 4. Move to GPU
+        return batch_points.to(self.device), batch_features.to(self.device)
+
 
     def _training_worker(self):
-        """Background thread for continuous training"""
+        """
+        Background thread for continuous training.
+        Optimized with a GPU Staging Buffer (Super-Batch) to reduce CPU-GPU transfer overhead.
+        """
         print("Training worker started...")
-        batch_size = self.cfg.hash_train_batch_size
+        
+        # Configuration
+        mini_batch_size = self.cfg.hash_train_batch_size
+        steps_per_stage = 50  # How many steps to train on one GPU chunk
+        staging_size = mini_batch_size * steps_per_stage  # Size of the "Super-Batch"
         
         while self.training_active:
-            # Get data from queue if available
-            try:
-                new_training_data = self.training_queue.get_nowait()
-                if new_training_data is not None:
-                    world_points_cpu, gt_features_cpu = new_training_data
-                    world_points_gpu = world_points_cpu.to(self.device)
-                    gt_features_gpu = gt_features_cpu.to(self.device)
+            # --- PHASE 1: Ingest New Data (CPU) ---
+            # Always drain the queue first so our history is up to date
+            data_added = 0
+            while not self.training_queue.empty():
+                try:
+                    new_training_data = self.training_queue.get_nowait()
+                    if new_training_data is not None:
+                        with self.buffer_lock:
+                            self.global_point_buffer.append(new_training_data)
+                        data_added += 1
+                except queue.Empty:
+                    break
+        
 
-                    self.replay_buffer.append((world_points_gpu, gt_features_gpu))
-                    print(f"Buffer size: {len(self.replay_buffer)}/{self.cfg.hash_replay_buffer_size}")
-            except queue.Empty:
-                pass
-            
-            # Check if we have enough data in buffer
-            if len(self.replay_buffer) < 3:
+            # Check if we have enough data to start
+            with self.buffer_lock:
+                buffer_len = len(self.global_point_buffer)
+
+            if buffer_len < 1:
                 time.sleep(0.1)
                 continue
+
+            # --- PHASE 2: Create Super-Batch (CPU -> GPU) ---
+            # We pull a large diversified chunk of history to the GPU.
+            # This is the "expensive" step, but we only do it once every 50 steps.
             
-            # Prepare training batch from replay buffer
+            # Note: We sample from many frames (e.g., 32) to ensure the agent 
+            # doesn't forget the past while learning the new room.
+            super_points_gpu, super_features_gpu = self._sample_from_global_history(
+                batch_size=staging_size, 
+                num_frames_to_sample=10 
+            )
+            
+            if super_points_gpu is None:
+                time.sleep(0.1)
+                continue
+
+            # --- PHASE 3: Fast Inner Loop (GPU Only) ---
+            # Train for multiple steps on the resident GPU data.
+            # This loop is extremely fast because there is no PCIe transfer.
+            
+            total_super_samples = super_points_gpu.shape[0]
+            
+            # If we don't have enough data for a full stage, just train once
+            current_stage_steps = steps_per_stage if total_super_samples >= mini_batch_size else 1
+            
+            for _ in range(current_stage_steps):
+                if not self.training_active:
+                    break
+
+                # 1. Randomly slice a mini-batch from the Super-Batch (Instant)
+                # We use randint to pick random indices from the GPU tensor
+                batch_idx = torch.randint(0, total_super_samples, (mini_batch_size,), device=self.device)
+                
+                batch_p = super_points_gpu[batch_idx]
+                batch_f = super_features_gpu[batch_idx]
+                
+                # 2. Train Step
+                loss = self.hashgrid.train_step(batch_p, batch_f)
+                
+                # 3. Logging
+                if loss is not None and self.training_step % 50 == 0:
+                    print(f"Training Step {self.training_step:04d} | Loss: {loss:.5f}")
+                
+                self.training_step += 1
+                
+                # Tiny sleep to allow other GPU operations (like rendering) to sneak in
+                time.sleep(0.002)
+
+        
+    def _offline_training(self):
+        print("Starting offline training with Super-Batch Staging...")
+        
+        # Configuration
+        batch_size = self.cfg.hash_train_batch_size
+        # How many training steps to run on one GPU chunk before fetching new CPU data
+        steps_per_stage = 50  
+        # Size of the chunk to move to GPU (amortizes the transfer cost)
+        staging_size = batch_size * steps_per_stage
+        
+        target_step = self.training_step + self.cfg.iterations
+        
+        # Ensure pending data is in global buffer
+        while not self.training_queue.empty():
             try:
-                world_points = torch.cat([x[0] for x in self.replay_buffer], dim=0)
-                gt_features = torch.cat([x[1] for x in self.replay_buffer], dim=0)
-            except Exception as e:
-                print(f"Error concatenating buffer: {e}")
-                continue
+                self.global_point_buffer.append(self.training_queue.get_nowait())
+            except:
+                break
+                
+        print(f"Total history size: {len(self.global_point_buffer)} frames")
+        if len(self.global_point_buffer) == 0:
+            print("No data to train on!")
+            return
+
+        # Main Loop
+        while self.training_step < target_step:
             
-            if world_points.shape[0] < batch_size:
-                print(f"Not enough points for batch: {world_points.shape[0]} < {batch_size}")
-                continue
+            # --- PHASE 1: Heavy Lifting (CPU -> GPU) ---
+            # We do this expensive part only once every 'steps_per_stage' iterations
             
-            # Sample batch
-            batch_idx = torch.randperm(world_points.shape[0], device=self.device)[:batch_size]
-            batch_points = world_points[batch_idx]
-            batch_features = gt_features[batch_idx]
+            # Sample a massive chunk from history
+            # (Reusing the improved sampling logic discussed previously)
+            super_points, super_features = self._sample_from_global_history(
+                batch_size=staging_size,
+                num_frames_to_sample=len(self.global_point_buffer)//3 # Sample from many frames for diversity
+            )
             
-            # Training step
-            loss = self.hashgrid.train_step(batch_points, batch_features)
+            if super_points is None:
+                break
+                
+            # Move big chunk to GPU once
+            super_points = super_points.to(self.device)
+            super_features = super_features.to(self.device)
             
-            if loss is not None and self.training_step % 50 == 0:
-                print(f"Training Step {self.training_step:04d} | Loss: {loss:.5f}")
+            total_super_samples = super_points.shape[0]
             
-            self.training_step += 1
+            # --- PHASE 2: Fast Training (GPU only) ---
+            # Run multiple steps on this GPU-resident data
+            # This mimics the speed of your "old" code
             
-            # Small sleep to prevent GPU overload
-            time.sleep(0.01)
+            for _ in range(steps_per_stage):
+                if self.training_step >= target_step:
+                    break
+                
+                # Fast GPU slicing (Instant)
+                # Randomly sample indices from our local GPU super-batch
+                batch_idx = torch.randint(0, total_super_samples, (batch_size,), device=self.device)
+                
+                batch_p = super_points[batch_idx]
+                batch_f = super_features[batch_idx]
+                
+                # Train
+                loss = self.hashgrid.train_step(batch_p, batch_f)
+                
+                if loss is not None and self.training_step % 100 == 0:
+                    print(f"Offline Step {self.training_step:04d} | Loss: {loss:.5f}")
+
+                self.training_step += 1
+
+    def _visualize_score(self):
+        pass
 
     def start_training(self):
-        """Start background training thread"""
         if not self.training_active:
             self.training_active = True
             self.extraction_thread = threading.Thread(target=self._extract_semantics, daemon=True)
@@ -574,7 +693,6 @@ class HabitatSim:
             print("Background training started!")
 
     def stop_training(self):
-        """Stop background training thread"""
         if self.training_active:
             self.training_active = False
             if self.training_thread:
@@ -582,13 +700,18 @@ class HabitatSim:
             print("Background training stopped!")
 
     def stop_extraction(self):
-        """Stop background extraction thread"""
         if self.extraction_thread:
             self.extraction_thread.join(timeout=2.0)
             print("Background extraction stopped!")
+
+    def start_viz(self):
+        if not self.viz_active:
+            self.viz_active = True
+            self.viz_thread = threading.Thread(target=self._visualize_score, daemon = True)
+            self.viz_thread.start()
+            print("Visualization thread started!")
     
     def cleanup(self):
-        """Cleanup resources"""
         self.stop_training()
         self.stop_extraction()
         cv2.destroyAllWindows()
@@ -601,12 +724,14 @@ def main():
     try:
         runner.run_exploration()
     finally:
+        runner.stop_extraction()
+        runner.stop_training()
+        runner._offline_training()
         runner.save_data()
         runner.cleanup()
         print("\n" + "="*60)
         print("Session complete! Data saved and ready for analysis.")
         print("="*60)
-
 
 if __name__ == "__main__":
     main()

@@ -331,7 +331,7 @@ if __name__ == "__main__":
     runner.hashgrid.load("output/current_scene/hashgrid_model.pt")
 
     text_query = "a pillow"
-    clip_idx = 21
+    clip_idx = 7
     # diagnose_hashgrid(runner, clip_idx=clip_idx, text_query=text_query)
     
     visualizer = Visualizer(runner)
