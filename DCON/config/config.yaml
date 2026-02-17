@@ -68,8 +68,8 @@ toggles:
 hashgrid:
   # Grid Structure
   n_levels: 16
-  n_features_per_level: 4
-  log2_hashmap_size: 21
+  n_features_per_level: 2
+  log2_hashmap_size: 19
   base_resolution: 16
   per_level_scale: 1.5
   
@@ -87,3 +87,6 @@ hashgrid:
   buffer_refresh_interval: 200
   train_every_n_steps: 1
   warmup_steps: 0
+
+ensemble:
+  num_models: 3

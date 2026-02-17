@@ -92,6 +92,9 @@ class Config:
         self.hash_buffer_refresh_interval = 200
         self.hash_train_every_n_steps = 1
         self.hash_warmup_steps = 0
+
+        # Ensemble
+        self.ensemble_num_models = 3
         
         # Load from YAML if path provided
         if yaml_path is not None:
@@ -250,3 +253,9 @@ class Config:
                 self.hash_train_every_n_steps = hg['train_every_n_steps']
             if 'warmup_steps' in hg:
                 self.hash_warmup_steps = hg['warmup_steps']
+        
+        # Ensemble
+        if 'ensemble' in yaml_data:
+            ensemble = yaml_data['ensemble']
+            if 'num_models' in ensemble:
+                self.ensemble_num_models = ensemble['num_models']

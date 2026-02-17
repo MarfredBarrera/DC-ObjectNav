@@ -52,9 +52,12 @@ class HabitatSim:
 
         # Initialize semantics and hashgrid
         self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
-        
-        print("Initializing HashGrid...")
         self.hashgrid = HashGrid(self.cfg, device=self.device)
+
+        # Initialize ensemble
+        self.ensemble_models = []
+        for _ in range(self.cfg.ensemble_num_models):
+            self.ensemble_models.append(HashGrid(self.cfg, device=self.device))
 
         # Initialize Habitat simulator
         self._init_simulator()
@@ -80,7 +83,13 @@ class HabitatSim:
         self.training_active = False
         self.extraction_thread = None
         self.training_thread = None
+        self.ensemble_training_active = False
+        self.ensemble_training_thread = None
         
+        # One thread per ensemble model (parallel training)
+        self.ensemble_training_threads = []
+        self.ensemble_steps = [0] * self.cfg.ensemble_num_models
+
         # Queues
         self.data_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
         self.training_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
@@ -93,6 +102,8 @@ class HabitatSim:
         self.last_viz_update = 0
         self.viz_thread = None
         self.viz_update_interval = 5 
+        self.camera_on = True
+
         
         print("\nInitialization complete!")
 
@@ -250,79 +261,6 @@ class HabitatSim:
         
         return panel
     
-    def run_exploration(self):
-        """Exploration loop with keyboard controls"""
-        print("\n" + "="*40)
-        print(" COMMANDS:")
-        print("  [w]    : Move Forward")
-        print("  [a]    : Turn Left")
-        print("  [d]    : Turn Right")
-        print("  [t]    : Toggle training on/off")
-        print("  [Q] or [ESC]  : Quit")
-        print("="*40 + "\n")
-
-        self.start_training()
-
-        while True:
-            obs = self.simulator.get_sensor_observations()    
-            rgb = obs["rgb"]
-            depth = obs["depth"]
-            current_matrix = self._get_camera_matrix()
-
-            # Create agent view and telemetry panel
-            cv2_img = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
-            agent_view = cv2.resize(cv2_img, (720, 720))
-            
-            cv2.putText(agent_view, "AGENT VIEW", (10, 30),
-                       cv2.FONT_HERSHEY_TRIPLEX, 0.7, (0, 255, 0), 2)
-            
-            telemetry_panel = self._create_telemetry_panel(width=400, height=720)
-            combined_view = np.hstack([agent_view, telemetry_panel])
-            
-            cv2.imshow("Habitat Explorer - Agent View & Telemetry", combined_view)
-
-            try:
-                if self.frame_count % self.viz_update_interval == 0:
-                    self.data_queue.put_nowait((rgb,depth,current_matrix))
-                    
-                    # Save RGB and depth
-                    self.rgb_imgs.append(cv2_img)
-                    self.depth_imgs.append(depth)
-                    self.pose_matrices.append(current_matrix)
-                
-            except queue.Full:
-                print("Queue full, skipping frame")
-            except Exception as e:
-                print(f"Frame processing error: {e}")
-                import traceback
-                traceback.print_exc()
-
-            key = cv2.waitKey(1) & 0xFF
-            
-            if key == ord('q') or key == 27:
-                print("Quit requested")
-                break
-            elif key == ord('w'):
-                self.simulator.step("move_forward")
-                print("Action: Move Forward")
-                self.frame_count += 1
-            elif key == ord('a'):
-                self.simulator.step("turn_left")
-                print("Action: Turn Left")
-                self.frame_count += 1
-            elif key == ord('d'):
-                self.simulator.step("turn_right")
-                print("Action: Turn Right")
-                self.frame_count += 1
-            elif key == ord('t'):
-                if self.training_active:
-                    self.stop_training()
-                else:
-                    self.start_training()
-            else:
-                self.frame_count += 1
-            
-            time.sleep(0.5)
 
     def save_data(self):
         """Save all collected data and models"""
@@ -392,6 +330,12 @@ class HabitatSim:
         hashgrid_path = f"{self.output_dir}/hashgrid_model.pt"
         self.hashgrid.save(hashgrid_path)
         print(f"Saved HashGrid model to {hashgrid_path}")
+
+        # Save ensemble models
+        for i, model in enumerate(self.ensemble_models):
+            ensemble_path = f"{self.output_dir}/ensemble/hashgrid_ensemble_{i}.pt"
+            model.save(ensemble_path)
+            print(f"Saved Ensemble Model {i} to {ensemble_path}")
 
     def _process_frame(self, rgb, depth, pose_matrix):
         """Process and extract features from a frame, strictly returning CPU tensors"""
@@ -612,7 +556,7 @@ class HabitatSim:
 
         
     def _offline_training(self):
-        print("Starting offline training with Super-Batch Staging...")
+        print("Starting offline training...")
         
         # Configuration
         batch_size = self.cfg.hash_train_batch_size
@@ -634,8 +578,9 @@ class HabitatSim:
         if len(self.global_point_buffer) == 0:
             print("No data to train on!")
             return
+        
 
-        # Main Loop
+        # Main Loop - continue training original feature field
         while self.training_step < target_step:
             
             # --- PHASE 1: Heavy Lifting (CPU -> GPU) ---
@@ -659,8 +604,7 @@ class HabitatSim:
             
             # --- PHASE 2: Fast Training (GPU only) ---
             # Run multiple steps on this GPU-resident data
-            # This mimics the speed of your "old" code
-            
+
             for _ in range(steps_per_stage):
                 if self.training_step >= target_step:
                     break
@@ -679,6 +623,165 @@ class HabitatSim:
                     print(f"Offline Step {self.training_step:04d} | Loss: {loss:.5f}")
 
                 self.training_step += 1
+        
+        # Start ensemble training thread
+        self.start_ensemble_training()
+
+
+    def _ensemble_model_worker(self, model_idx: int):
+        """
+        Trains a single ensemble model in its own dedicated background thread.
+
+        Each model runs independently: it samples its own super-batch from the
+        shared CPU history buffer and trains for `steps_per_stage` GPU steps
+        before re-sampling.  Because every model thread uses a different random
+        seed implicitly (via torch.randint / np.random.choice), the models
+        naturally diverge and provide diverse uncertainty estimates.
+
+        Args:
+            model_idx: Index into self.ensemble_models and self.ensemble_steps.
+        """
+        model = self.ensemble_models[model_idx]
+        print(f"Ensemble worker {model_idx} started...")
+
+        # Configuration (mirrors the layout used in _training_worker)
+        mini_batch_size = self.cfg.hash_train_batch_size
+        steps_per_stage = 50
+        staging_size = mini_batch_size * steps_per_stage
+
+        while self.ensemble_training_active:
+            # --- Wait until there is enough history to sample from ---
+            with self.buffer_lock:
+                buffer_len = len(self.global_point_buffer)
+
+            if buffer_len < 5:   # Wait for at least 5 frames
+                time.sleep(1.0)
+                continue
+
+            # --- PHASE 1: Sample a Super-Batch from CPU history (CPU -> GPU) ---
+            # Use a slightly larger frame sample than the main worker to encourage
+            # diversity across ensemble members.
+            super_points_gpu, super_features_gpu = self._sample_from_global_history(
+                batch_size=staging_size,
+                num_frames_to_sample=15
+            )
+
+            if super_points_gpu is None:
+                time.sleep(0.1)
+                continue
+
+            total_super_samples = super_points_gpu.shape[0]
+
+            # --- PHASE 2: Fast Inner Training Loop (GPU Only) ---
+            for _ in range(steps_per_stage):
+                if not self.ensemble_training_active:
+                    break
+
+                # Each model draws its own independent random mini-batch from
+                # the shared super-batch, which is the primary source of diversity.
+                batch_idx = torch.randint(
+                    0, total_super_samples, (mini_batch_size,), device=self.device
+                )
+                batch_p = super_points_gpu[batch_idx]
+                batch_f = super_features_gpu[batch_idx]
+
+                loss = model.train_step(batch_p, batch_f)
+
+                # Log occasionally, stagger by model index to avoid interleaved spam
+                if loss is not None and self.ensemble_steps[model_idx] % 100 == 0:
+                    print(
+                        f"Ensemble Worker {model_idx} | "
+                        f"Step {self.ensemble_steps[model_idx]:04d} | "
+                        f"Loss: {loss:.5f}"
+                    )
+
+                self.ensemble_steps[model_idx] += 1
+
+                # Small sleep so this thread doesn't starve the GPU for the
+                # main training worker or the renderer
+                time.sleep(0.002)
+
+    def run_exploration(self):
+        """Exploration loop with keyboard controls"""
+        print("\n" + "="*40)
+        print(" COMMANDS:")
+        print("  [w]    : Move Forward")
+        print("  [a]    : Turn Left")
+        print("  [d]    : Turn Right")
+        print("  [t]    : Toggle training on/off")
+        print("  [Q] or [ESC]  : Quit")
+        print("="*40 + "\n")
+
+        self.start_training()
+
+        while True:
+            obs = self.simulator.get_sensor_observations()    
+            rgb = obs["rgb"]
+            depth = obs["depth"]
+            current_matrix = self._get_camera_matrix()
+
+            # Create agent view and telemetry panel
+            cv2_img = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
+            agent_view = cv2.resize(cv2_img, (720, 720))
+            
+            cv2.putText(agent_view, "AGENT VIEW", (10, 30),
+                       cv2.FONT_HERSHEY_TRIPLEX, 0.7, (0, 255, 0), 2)
+            
+            telemetry_panel = self._create_telemetry_panel(width=400, height=720)
+            combined_view = np.hstack([agent_view, telemetry_panel])
+            
+            cv2.imshow("Habitat Explorer - Agent View & Telemetry", combined_view)
+
+            try:
+                if self.frame_count % self.viz_update_interval == 0 and self.camera_on:
+                    self.data_queue.put_nowait((rgb,depth,current_matrix))
+                    
+                    # Save RGB and depth
+                    self.rgb_imgs.append(cv2_img)
+                    self.depth_imgs.append(depth)
+                    self.pose_matrices.append(current_matrix)
+                
+            except queue.Full:
+                print("Queue full, skipping frame")
+            except Exception as e:
+                print(f"Frame processing error: {e}")
+                import traceback
+                traceback.print_exc()
+
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('q') or key == 27:
+                print("Quit requested")
+                break
+            elif key == ord('w'):
+                self.simulator.step("move_forward")
+                print("Action: Move Forward")
+                self.frame_count += 1
+            elif key == ord('a'):
+                self.simulator.step("turn_left")
+                print("Action: Turn Left")
+                self.frame_count += 1
+            elif key == ord('d'):
+                self.simulator.step("turn_right")
+                print("Action: Turn Right")
+                self.frame_count += 1
+            elif key == ord('t'):
+                if self.training_active:
+                    self.stop_training()
+                else:
+                    self.start_training()
+            elif key == ord('c'):
+                if self.camera_on:
+                    self.camera_on = False
+                    print("Camera turned off")
+                else:
+                    self.camera_on = True
+                    print("Camera turned on")
+            else:
+                self.frame_count += 1
+            
+            time.sleep(0.5)
+
 
     def _visualize_score(self):
         pass
@@ -690,19 +793,57 @@ class HabitatSim:
             self.extraction_thread.start()
             self.training_thread = threading.Thread(target=self._training_worker, daemon=True)
             self.training_thread.start()
-            print("Background training started!")
+            print("Training started!")
+
+    def start_ensemble_training(self):
+        """Start one dedicated training thread per ensemble model (runs in parallel)."""
+        if not self.ensemble_training_active:
+            self.ensemble_training_active = True
+            self.ensemble_training_threads = []
+            self.ensemble_steps = [0] * len(self.ensemble_models)
+
+            for model_idx in range(len(self.ensemble_models)):
+                t = threading.Thread(
+                    target=self._ensemble_model_worker,
+                    args=(model_idx,),
+                    name=f"ensemble-worker-{model_idx}",
+                    daemon=True,
+                )
+                t.start()
+                self.ensemble_training_threads.append(t)
+
+            print(f"Ensemble training started! "
+                  f"({len(self.ensemble_training_threads)} parallel workers)")
+            
+            ensemble_target_step = self.cfg.iterations
+
+            while self.ensemble_training_active and max(self.ensemble_steps) < ensemble_target_step:
+                time.sleep(1)
+
+            self.stop_ensemble_training()
 
     def stop_training(self):
         if self.training_active:
             self.training_active = False
             if self.training_thread:
                 self.training_thread.join(timeout=2.0)
-            print("Background training stopped!")
+            print("Training stopped!")
 
     def stop_extraction(self):
         if self.extraction_thread:
             self.extraction_thread.join(timeout=2.0)
-            print("Background extraction stopped!")
+            print("Extraction stopped!")
+
+    def stop_ensemble_training(self):
+        """Signal all ensemble worker threads to stop and wait for them to finish."""
+        if self.ensemble_training_active:
+            self.ensemble_training_active = False
+            for idx, t in enumerate(self.ensemble_training_threads):
+                t.join(timeout=2.0)
+                if t.is_alive():
+                    print(f"Warning: ensemble worker {idx} did not stop within timeout.")
+            self.ensemble_training_threads = []
+            print("Ensemble training stopped!")
 
     def start_viz(self):
         if not self.viz_active:

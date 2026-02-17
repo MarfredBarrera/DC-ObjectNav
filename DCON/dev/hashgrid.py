@@ -87,7 +87,6 @@ class HashGrid(nn.Module):
         if 'scene_bounds' in data and data['scene_bounds'] is not None:
             bounds_min = data['scene_bounds']['min']
             bounds_max = data['scene_bounds']['max']
-            print(f"Loaded scene bounds from {json_path}: min={bounds_min}, max={bounds_max}")
         else:
             print(f"Warning: No scene_bounds found in {json_path}, using default bounds")
             bounds_min = [-5.0, -5.0, -5.0]
