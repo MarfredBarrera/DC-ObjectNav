@@ -79,17 +79,13 @@ class HabitatSim:
         # Training state
         # CHANGED: Replaced deque with a standard list to hold ALL history on CPU
         self.global_point_buffer = [] 
-        self.training_step = 0
         self.training_active = False
         self.extraction_thread = None
-        self.training_thread = None
         self.ensemble_training_active = False
+        # Single thread trains all ensemble models sequentially
         self.ensemble_training_thread = None
-        
-        # One thread per ensemble model (parallel training)
-        self.ensemble_training_threads = []
         self.ensemble_steps = [0] * self.cfg.ensemble_num_models
-
+        
         # Queues
         self.data_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
         self.training_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
@@ -212,18 +208,19 @@ class HabitatSim:
         
         # Training status
         y_pos += 55
-        cv2.putText(panel, "Training Status:", (10, y_pos),
+        cv2.putText(panel, "Ensemble Training:", (10, y_pos),
                    cv2.FONT_HERSHEY_TRIPLEX, 0.6, (200, 200, 200), 1)
-        status_text = "ON" if self.training_active else "OFF"
-        status_color = (0, 255, 0) if self.training_active else (0, 0, 255)
+        status_text = "ON" if self.ensemble_training_active else "OFF"
+        status_color = (0, 255, 0) if self.ensemble_training_active else (0, 0, 255)
         cv2.putText(panel, status_text, (width - 80, y_pos),
                    cv2.FONT_HERSHEY_TRIPLEX, 0.6, status_color, 2)
         
-        # Training step
+        # Ensemble step (show max across all models)
         y_pos += 35
-        cv2.putText(panel, "Training Step:", (10, y_pos),
+        cv2.putText(panel, "Ensemble Step:", (10, y_pos),
                    cv2.FONT_HERSHEY_TRIPLEX, 0.6, (200, 200, 200), 1)
-        cv2.putText(panel, f"{self.training_step}", (width - 120, y_pos),
+        max_step = max(self.ensemble_steps) if self.ensemble_steps else 0
+        cv2.putText(panel, f"{max_step}", (width - 120, y_pos),
                    cv2.FONT_HERSHEY_TRIPLEX, 0.6, (255, 255, 255), 2)
         
         # Queue status
@@ -326,12 +323,8 @@ class HabitatSim:
         
         print(f"Saved transforms.json with {len(frames_data)} frames")
         
-        # Save HashGrid model
-        hashgrid_path = f"{self.output_dir}/hashgrid_model.pt"
-        self.hashgrid.save(hashgrid_path)
-        print(f"Saved HashGrid model to {hashgrid_path}")
-
         # Save ensemble models
+        os.makedirs(f"{self.output_dir}/ensemble", exist_ok=True)
         for i, model in enumerate(self.ensemble_models):
             ensemble_path = f"{self.output_dir}/ensemble/hashgrid_ensemble_{i}.pt"
             model.save(ensemble_path)
@@ -472,184 +465,39 @@ class HabitatSim:
         return batch_points.to(self.device), batch_features.to(self.device)
 
 
-    def _training_worker(self):
+    def _ensemble_training_worker(self):
         """
-        Background thread for continuous training.
-        Optimized with a GPU Staging Buffer (Super-Batch) to reduce CPU-GPU transfer overhead.
+        Trains all ensemble models sequentially on a single thread.
+
+        During ONLINE phase: Ingests new data from training_queue.
+        During OFFLINE phase: Trains on existing global_point_buffer.
+
+        All models train on the SAME super-batch for each cycle, but each
+        model draws DIFFERENT random mini-batches from that super-batch.
+        This ensures diversity while being computationally efficient.
         """
-        print("Training worker started...")
-        
+        print("Ensemble training worker started...")
+
         # Configuration
-        mini_batch_size = self.cfg.hash_train_batch_size
-        steps_per_stage = 50  # How many steps to train on one GPU chunk
-        staging_size = mini_batch_size * steps_per_stage  # Size of the "Super-Batch"
-        
-        while self.training_active:
-            # --- PHASE 1: Ingest New Data (CPU) ---
-            # Always drain the queue first so our history is up to date
-            data_added = 0
-            while not self.training_queue.empty():
-                try:
-                    new_training_data = self.training_queue.get_nowait()
-                    if new_training_data is not None:
-                        with self.buffer_lock:
-                            self.global_point_buffer.append(new_training_data)
-                        data_added += 1
-                except queue.Empty:
-                    break
-        
-
-            # Check if we have enough data to start
-            with self.buffer_lock:
-                buffer_len = len(self.global_point_buffer)
-
-            if buffer_len < 1:
-                time.sleep(0.1)
-                continue
-
-            # --- PHASE 2: Create Super-Batch (CPU -> GPU) ---
-            # We pull a large diversified chunk of history to the GPU.
-            # This is the "expensive" step, but we only do it once every 50 steps.
-            
-            # Note: We sample from many frames (e.g., 32) to ensure the agent 
-            # doesn't forget the past while learning the new room.
-            super_points_gpu, super_features_gpu = self._sample_from_global_history(
-                batch_size=staging_size, 
-                num_frames_to_sample=10 
-            )
-            
-            if super_points_gpu is None:
-                time.sleep(0.1)
-                continue
-
-            # --- PHASE 3: Fast Inner Loop (GPU Only) ---
-            # Train for multiple steps on the resident GPU data.
-            # This loop is extremely fast because there is no PCIe transfer.
-            
-            total_super_samples = super_points_gpu.shape[0]
-            
-            # If we don't have enough data for a full stage, just train once
-            current_stage_steps = steps_per_stage if total_super_samples >= mini_batch_size else 1
-            
-            for _ in range(current_stage_steps):
-                if not self.training_active:
-                    break
-
-                # 1. Randomly slice a mini-batch from the Super-Batch (Instant)
-                # We use randint to pick random indices from the GPU tensor
-                batch_idx = torch.randint(0, total_super_samples, (mini_batch_size,), device=self.device)
-                
-                batch_p = super_points_gpu[batch_idx]
-                batch_f = super_features_gpu[batch_idx]
-                
-                # 2. Train Step
-                loss = self.hashgrid.train_step(batch_p, batch_f)
-                
-                # 3. Logging
-                if loss is not None and self.training_step % 50 == 0:
-                    print(f"Training Step {self.training_step:04d} | Loss: {loss:.5f}")
-                
-                self.training_step += 1
-                
-                # Tiny sleep to allow other GPU operations (like rendering) to sneak in
-                time.sleep(0.002)
-
-        
-    def _offline_training(self):
-        print("Starting offline training...")
-        
-        # Configuration
-        batch_size = self.cfg.hash_train_batch_size
-        # How many training steps to run on one GPU chunk before fetching new CPU data
-        steps_per_stage = 50  
-        # Size of the chunk to move to GPU (amortizes the transfer cost)
-        staging_size = batch_size * steps_per_stage
-        
-        target_step = self.training_step + self.cfg.iterations
-        
-        # Ensure pending data is in global buffer
-        while not self.training_queue.empty():
-            try:
-                self.global_point_buffer.append(self.training_queue.get_nowait())
-            except:
-                break
-                
-        print(f"Total history size: {len(self.global_point_buffer)} frames")
-        if len(self.global_point_buffer) == 0:
-            print("No data to train on!")
-            return
-        
-
-        # Main Loop - continue training original feature field
-        while self.training_step < target_step:
-            
-            # --- PHASE 1: Heavy Lifting (CPU -> GPU) ---
-            # We do this expensive part only once every 'steps_per_stage' iterations
-            
-            # Sample a massive chunk from history
-            # (Reusing the improved sampling logic discussed previously)
-            super_points, super_features = self._sample_from_global_history(
-                batch_size=staging_size,
-                num_frames_to_sample=len(self.global_point_buffer)//3 # Sample from many frames for diversity
-            )
-            
-            if super_points is None:
-                break
-                
-            # Move big chunk to GPU once
-            super_points = super_points.to(self.device)
-            super_features = super_features.to(self.device)
-            
-            total_super_samples = super_points.shape[0]
-            
-            # --- PHASE 2: Fast Training (GPU only) ---
-            # Run multiple steps on this GPU-resident data
-
-            for _ in range(steps_per_stage):
-                if self.training_step >= target_step:
-                    break
-                
-                # Fast GPU slicing (Instant)
-                # Randomly sample indices from our local GPU super-batch
-                batch_idx = torch.randint(0, total_super_samples, (batch_size,), device=self.device)
-                
-                batch_p = super_points[batch_idx]
-                batch_f = super_features[batch_idx]
-                
-                # Train
-                loss = self.hashgrid.train_step(batch_p, batch_f)
-                
-                if loss is not None and self.training_step % 100 == 0:
-                    print(f"Offline Step {self.training_step:04d} | Loss: {loss:.5f}")
-
-                self.training_step += 1
-        
-        # Start ensemble training thread
-        self.start_ensemble_training()
-
-
-    def _ensemble_model_worker(self, model_idx: int):
-        """
-        Trains a single ensemble model in its own dedicated background thread.
-
-        Each model runs independently: it samples its own super-batch from the
-        shared CPU history buffer and trains for `steps_per_stage` GPU steps
-        before re-sampling.  Because every model thread uses a different random
-        seed implicitly (via torch.randint / np.random.choice), the models
-        naturally diverge and provide diverse uncertainty estimates.
-
-        Args:
-            model_idx: Index into self.ensemble_models and self.ensemble_steps.
-        """
-        model = self.ensemble_models[model_idx]
-        print(f"Ensemble worker {model_idx} started...")
-
-        # Configuration (mirrors the layout used in _training_worker)
         mini_batch_size = self.cfg.hash_train_batch_size
         steps_per_stage = 50
         staging_size = mini_batch_size * steps_per_stage
 
         while self.ensemble_training_active:
+            # --- PHASE 1: Ingest New Data (during online training) ---
+            # During online exploration, drain the queue to keep history updated
+            if self.training_active:
+                data_added = 0
+                while not self.training_queue.empty():
+                    try:
+                        new_training_data = self.training_queue.get_nowait()
+                        if new_training_data is not None:
+                            with self.buffer_lock:
+                                self.global_point_buffer.append(new_training_data)
+                            data_added += 1
+                    except queue.Empty:
+                        break
+
             # --- Wait until there is enough history to sample from ---
             with self.buffer_lock:
                 buffer_len = len(self.global_point_buffer)
@@ -658,9 +506,8 @@ class HabitatSim:
                 time.sleep(1.0)
                 continue
 
-            # --- PHASE 1: Sample a Super-Batch from CPU history (CPU -> GPU) ---
-            # Use a slightly larger frame sample than the main worker to encourage
-            # diversity across ensemble members.
+            # --- PHASE 2: Sample a Super-Batch from CPU history (CPU -> GPU) ---
+            # This super-batch is SHARED across all ensemble models
             super_points_gpu, super_features_gpu = self._sample_from_global_history(
                 batch_size=staging_size,
                 num_frames_to_sample=15
@@ -672,33 +519,34 @@ class HabitatSim:
 
             total_super_samples = super_points_gpu.shape[0]
 
-            # --- PHASE 2: Fast Inner Training Loop (GPU Only) ---
+            # --- PHASE 3: Sequential Training Loop (all models on same super-batch) ---
             for _ in range(steps_per_stage):
                 if not self.ensemble_training_active:
                     break
 
-                # Each model draws its own independent random mini-batch from
-                # the shared super-batch, which is the primary source of diversity.
-                batch_idx = torch.randint(
-                    0, total_super_samples, (mini_batch_size,), device=self.device
-                )
-                batch_p = super_points_gpu[batch_idx]
-                batch_f = super_features_gpu[batch_idx]
-
-                loss = model.train_step(batch_p, batch_f)
-
-                # Log occasionally, stagger by model index to avoid interleaved spam
-                if loss is not None and self.ensemble_steps[model_idx] % 100 == 0:
-                    print(
-                        f"Ensemble Worker {model_idx} | "
-                        f"Step {self.ensemble_steps[model_idx]:04d} | "
-                        f"Loss: {loss:.5f}"
+                # Train each model SEQUENTIALLY with DIFFERENT random samples
+                for model_idx, model in enumerate(self.ensemble_models):
+                    # Each model draws its OWN random mini-batch from the shared super-batch
+                    # This is the key source of diversity in the ensemble
+                    batch_idx = torch.randint(
+                        0, total_super_samples, (mini_batch_size,), device=self.device
                     )
+                    batch_p = super_points_gpu[batch_idx]
+                    batch_f = super_features_gpu[batch_idx]
 
-                self.ensemble_steps[model_idx] += 1
+                    loss = model.train_step(batch_p, batch_f)
 
-                # Small sleep so this thread doesn't starve the GPU for the
-                # main training worker or the renderer
+                    # Log occasionally, stagger by model index to avoid spam
+                    if loss is not None and self.ensemble_steps[model_idx] % 100 == 0:
+                        print(
+                            f"Ensemble Model {model_idx} | "
+                            f"Step {self.ensemble_steps[model_idx]:04d} | "
+                            f"Loss: {loss:.5f}"
+                        )
+
+                    self.ensemble_steps[model_idx] += 1
+
+                # Small sleep after training all models once
                 time.sleep(0.002)
 
     def run_exploration(self):
@@ -708,11 +556,13 @@ class HabitatSim:
         print("  [w]    : Move Forward")
         print("  [a]    : Turn Left")
         print("  [d]    : Turn Right")
-        print("  [t]    : Toggle training on/off")
+        print("  [t]    : Toggle ensemble training on/off")
         print("  [Q] or [ESC]  : Quit")
         print("="*40 + "\n")
 
+        # Start ensemble training (online phase)
         self.start_training()
+        self.start_ensemble_training()
 
         while True:
             obs = self.simulator.get_sensor_observations()    
@@ -766,10 +616,10 @@ class HabitatSim:
                 print("Action: Turn Right")
                 self.frame_count += 1
             elif key == ord('t'):
-                if self.training_active:
-                    self.stop_training()
+                if self.ensemble_training_active:
+                    self.stop_ensemble_training()
                 else:
-                    self.start_training()
+                    self.start_ensemble_training()
             elif key == ord('c'):
                 if self.camera_on:
                     self.camera_on = False
@@ -787,47 +637,74 @@ class HabitatSim:
         pass
 
     def start_training(self):
+        """Start the extraction thread for processing new frames."""
         if not self.training_active:
             self.training_active = True
             self.extraction_thread = threading.Thread(target=self._extract_semantics, daemon=True)
             self.extraction_thread.start()
-            self.training_thread = threading.Thread(target=self._training_worker, daemon=True)
-            self.training_thread.start()
-            print("Training started!")
+            print("Extraction started!")
 
     def start_ensemble_training(self):
-        """Start one dedicated training thread per ensemble model (runs in parallel)."""
+        """Start a single thread that trains all ensemble models sequentially."""
         if not self.ensemble_training_active:
             self.ensemble_training_active = True
-            self.ensemble_training_threads = []
             self.ensemble_steps = [0] * len(self.ensemble_models)
 
-            for model_idx in range(len(self.ensemble_models)):
-                t = threading.Thread(
-                    target=self._ensemble_model_worker,
-                    args=(model_idx,),
-                    name=f"ensemble-worker-{model_idx}",
-                    daemon=True,
-                )
-                t.start()
-                self.ensemble_training_threads.append(t)
+            self.ensemble_training_thread = threading.Thread(
+                target=self._ensemble_training_worker,
+                name="ensemble-training-worker",
+                daemon=True,
+            )
+            self.ensemble_training_thread.start()
 
             print(f"Ensemble training started! "
-                  f"({len(self.ensemble_training_threads)} parallel workers)")
-            
-            ensemble_target_step = self.cfg.iterations
-
-            while self.ensemble_training_active and max(self.ensemble_steps) < ensemble_target_step:
-                time.sleep(1)
-
-            self.stop_ensemble_training()
+                  f"(Single thread, {len(self.ensemble_models)} models sequential)")
+    
+    def continue_offline_training(self):
+        """
+        Continue ensemble training offline until target iterations are reached.
+        This is called after exploration ends.
+        """
+        target_step = self.cfg.iterations
+        
+        # Ensure pending data is in global buffer
+        while not self.training_queue.empty():
+            try:
+                new_data = self.training_queue.get_nowait()
+                if new_data is not None:
+                    with self.buffer_lock:
+                        self.global_point_buffer.append(new_data)
+            except:
+                break
+        
+        print(f"\nStarting offline ensemble training...")
+        print(f"Total history size: {len(self.global_point_buffer)} frames")
+        print(f"Current max steps: {max(self.ensemble_steps)}, Target: {target_step}")
+        
+        if len(self.global_point_buffer) == 0:
+            print("No data to train on!")
+            return
+        
+        # If ensemble wasn't started during online phase, start it now
+        if not self.ensemble_training_active:
+            self.start_ensemble_training()
+        
+        # Wait until all models reach target iterations
+        while self.ensemble_training_active and max(self.ensemble_steps) < target_step:
+            current_max = max(self.ensemble_steps)
+            if current_max % 500 == 0 and current_max > 0:
+                print(f"Offline training progress: {current_max}/{target_step}")
+            time.sleep(1.0)
+        
+        # Stop ensemble training
+        self.stop_ensemble_training()
+        print(f"Offline training complete! Final steps: {self.ensemble_steps}")
 
     def stop_training(self):
+        """Stop the extraction process."""
         if self.training_active:
             self.training_active = False
-            if self.training_thread:
-                self.training_thread.join(timeout=2.0)
-            print("Training stopped!")
+            print("Extraction stopped!")
 
     def stop_extraction(self):
         if self.extraction_thread:
@@ -835,14 +712,14 @@ class HabitatSim:
             print("Extraction stopped!")
 
     def stop_ensemble_training(self):
-        """Signal all ensemble worker threads to stop and wait for them to finish."""
+        """Signal the ensemble worker thread to stop and wait for it to finish."""
         if self.ensemble_training_active:
             self.ensemble_training_active = False
-            for idx, t in enumerate(self.ensemble_training_threads):
-                t.join(timeout=2.0)
-                if t.is_alive():
-                    print(f"Warning: ensemble worker {idx} did not stop within timeout.")
-            self.ensemble_training_threads = []
+            if self.ensemble_training_thread:
+                self.ensemble_training_thread.join(timeout=2.0)
+                if self.ensemble_training_thread.is_alive():
+                    print(f"Warning: ensemble worker did not stop within timeout.")
+            self.ensemble_training_thread = None
             print("Ensemble training stopped!")
 
     def start_viz(self):
@@ -867,7 +744,7 @@ def main():
     finally:
         runner.stop_extraction()
         runner.stop_training()
-        runner._offline_training()
+        runner.continue_offline_training()
         runner.save_data()
         runner.cleanup()
         print("\n" + "="*60)
