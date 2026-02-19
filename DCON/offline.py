@@ -326,12 +326,12 @@ if __name__ == "__main__":
     config = Config("config/config.yaml")
     runner = Runner(config)
 
-    # runner.train_feature_field()
-    # runner.hashgrid.save("hashgrid_model.pt")
-    runner.hashgrid.load("output/current_scene/hashgrid_model.pt")
+    runner.train_feature_field()
+    runner.hashgrid.save("hashgrid_model.pt")
+    # runner.hashgrid.load("hashgrid_model.pt")
 
     text_query = "a pillow"
-    clip_idx = 4
+    clip_idx = 12
     # diagnose_hashgrid(runner, clip_idx=clip_idx, text_query=text_query)
     
     visualizer = Visualizer(runner)

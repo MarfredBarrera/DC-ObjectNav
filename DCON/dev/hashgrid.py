@@ -10,6 +10,7 @@ class HashGrid(nn.Module):
     """
     HashGrid-based feature field that maps 3D positions to feature vectors.
     Uses tiny-cuda-nn for efficient hash encoding and MLP.
+    Updated to model aleatoric uncertainty using Negative Log-Likelihood (NLL) loss.
     """
     
     def __init__(self, config, device="cuda", transforms_json=None):
@@ -26,7 +27,7 @@ class HashGrid(nn.Module):
 
         self.scene_bounds = torch.tensor([
             bounds_min,  # min
-            bounds_max      # max
+            bounds_max   # max
         ], device=device, dtype=torch.float32)
         
         # HashGrid encoding configuration
@@ -53,11 +54,15 @@ class HashGrid(nn.Module):
         
         # Feature output dimension (e.g., CLIP dimension)
         self.feature_dim = config.hash_feature_dim
+
+        # Output dims: Mean (feature_dim) + Log Variance (1 scalar)
+        # We use a single scalar for variance (isotropic uncertainty) to improve stability
+        self.output_dim = self.feature_dim + 1
         
         # Create the encoding + network model
         self.model = tcnn.NetworkWithInputEncoding(
             n_input_dims=3,  # 3D positions (x, y, z)
-            n_output_dims=self.feature_dim,
+            n_output_dims=self.output_dim, 
             encoding_config=encoding_config,
             network_config=network_config
         )
@@ -128,21 +133,29 @@ class HashGrid(nn.Module):
         Query features at given 3D positions.
         Args:
             positions: (N, 3) tensor of 3D world positions
-            normalize: whether to L2 normalize output (use False during training)
+            normalize: whether to L2 normalize output mean (use False during training)
         Returns:
-            features: (N, feature_dim) tensor of feature vectors
+            mean: (N, feature_dim) predicted feature vectors
+            log_var: (N, 1) predicted log variance scalar
         """
         # Normalize positions to [0, 1]
         normalized_pos = self.normalize_positions(positions)
         
-        # Query the network
-        features = self.model(normalized_pos.float())
+        # Query the network - returns (N, feature_dim + 1)
+        # Ensure we cast to float32 to avoid half-precision issues in output
+        raw_output = self.model(normalized_pos.float()).float()
         
-        # Only normalize if requested (for inference/similarity computation)
+        # Split into mean and log_variance
+        # [:, :-1] -> Mean prediction (all but last)
+        # [:, -1:] -> Log Variance prediction (last dim only)
+        mean = raw_output[..., :-1]
+        log_var = raw_output[..., -1:]
+        
+        # Only normalize mean if requested (for inference/similarity computation)
         if normalize:
-            features = features / (features.norm(dim=-1, keepdim=True) + 1e-8)
+            mean = mean / (mean.norm(dim=-1, keepdim=True) + 1e-8)
         
-        return features
+        return mean, log_var
 
     def safe_normalize(self, features, dim=-1, eps=1e-6):
         """Safely normalize features, handling zero-norm cases."""
@@ -156,38 +169,61 @@ class HashGrid(nn.Module):
         )
         return normalized
 
-    def  train_step(self, batch_points, batch_gt_features):
+    def train_step(self, batch_points, batch_gt_features):
         """
-        Single training step on a batch of 3D points and their corresponding GT features.
+        Single training step using Negative Log-Likelihood (NLL) Loss with Isotropic Covariance.
         
-        N = batch size
-
         Args:
             batch_points: (N, 3) tensor of 3D points
             batch_gt_features: (N, feature_dim) tensor of ground truth features
 
         Output:
-            loss: scalar tensor representing training loss
+            loss: scalar tensor representing NLL loss
         """
 
-        # Forward pass - NO normalization during training
-        pred_features = self.forward(batch_points, normalize=False)
+        # Forward pass - returns mean (N, D) and log_var (N, 1)
+        pred_mean, pred_log_var = self.forward(batch_points, normalize=False)
         
-        # Normalize BOTH for loss computation
-        pred_norm = self.safe_normalize(pred_features)
+        # Normalize Ground Truth Features
         gt_norm = self.safe_normalize(batch_gt_features)
         
-        # MSE Loss
-        loss = ((pred_norm-gt_norm)**2).sum(dim=-1).mean()
+        # --- Robust Negative Log Likelihood (NLL) Loss ---
+        
+        # 1. Clamp log_var to prevent explosion or division by zero
+        # min=-7 (~0.0009 var) prevents divide by zero
+        # max=7 (~1096 var) prevents huge penalties for small errors
+        pred_log_var = torch.clamp(pred_log_var, min=-7.0, max=7.0)
+        
+        # 2. Compute variance (add epsilon for extra safety)
+        variance = torch.exp(pred_log_var) + 1e-6
+        
+        # 3. Compute Sum of Squared Errors (SSE) across feature dimension
+        # Shape: (N, 1)
+        sse = ((gt_norm - pred_mean) ** 2).sum(dim=-1, keepdim=True)
+        
+        # 4. Compute NLL for Isotropic Gaussian
+        # Loss = 0.5 * (log(2*pi) +  log(sigma^2) + SSE / sigma^2)
+        constant_term = np.log(2 * np.pi)
+        
+        # Note: log_var is log(sigma^2)
+        # We include the constant term to keep loss positive/interpretable
+        nll = 0.5 * (constant_term + pred_log_var + sse / variance)
+        
+        # 5. Average over batch
+        loss = nll.mean()
         
         # Check for NaN loss
         if torch.isnan(loss):
             print(f"NaN loss detected! Skipping step...")
+            # Optional: Debug print to see what exploded
+            # print(f"Max SSE: {sse.max().item()}, Min Var: {variance.min().item()}")
             return None
         
         # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
+        
+        # Gradient clipping is crucial for NLL stability
         total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         if torch.isnan(total_norm):
             print(f"NaN gradients! Skipping step...")
@@ -197,7 +233,7 @@ class HashGrid(nn.Module):
         
         return loss.item() 
     
-    def get_hashgrid_features(self, depth, c2w, intrinsics):
+    def get_hashgrid_features(self, depth, c2w, intrinsics, return_uncertainty=False):
         """
         Get a full feature map for the given depth and camera pose.
 
@@ -205,47 +241,52 @@ class HashGrid(nn.Module):
         depth: (H, W) depth map
         c2w: (4, 4) camera-to-world transform
         intrinsics: tuple (fx, fy, cx, cy, H, W)
+        return_uncertainty: If True, returns (features, uncertainty)
 
         Returns:
         feature_map: (H, W, feature_dim) feature map
-        
+        uncertainty_map (optional): (H, W) scalar uncertainty map (variance)
         """
         fx, fy, cx, cy, H, W = intrinsics
         feature_map = torch.zeros((H, W, self.feature_dim), device=self.device)
+        uncertainty_map = torch.zeros((H, W), device=self.device)
+        
         mask = (depth > 0.1) & (depth < 10.0)
         world_points = unprojection(depth, intrinsics, c2w, self.device, mask=mask)
         
         batch_size = self.cfg.hash_inference_batch_size
         all_features = []
+        all_variances = []
         
         for i in range(0, world_points.shape[0], batch_size):
             batch_points = world_points[i:i+batch_size]
             with torch.no_grad():
-                batch_features = self.forward(batch_points, normalize=True)  # Normalize for inference
-            all_features.append(batch_features)
+                # Get mean and log_var
+                batch_mean, batch_log_var = self.forward(batch_points, normalize=True) 
+                
+                all_features.append(batch_mean)
+                if return_uncertainty:
+                    # Convert log_var to variance
+                    # batch_log_var is (N, 1), we flatten to (N)
+                    batch_var = torch.exp(batch_log_var).squeeze(-1)
+                    all_variances.append(batch_var)
         
         all_features = torch.cat(all_features, dim=0)
         feature_map[mask] = all_features.to(feature_map.dtype)
+        
+        if return_uncertainty:
+            all_variances = torch.cat(all_variances, dim=0)
+            uncertainty_map[mask] = all_variances.to(uncertainty_map.dtype)
+            return feature_map, uncertainty_map
         
         return feature_map
     
     def query_similarity(self, depth, c2w, intrinsics, text_query, clip_processor, clip_model):
         """
         Query semantic similarity using text prompt.
-        
-        Args:
-            depth: (H, W) depth map
-            c2w: (4, 4) camera-to-world transform
-            intrinsics: tuple (fx, fy, cx, cy, H, W)
-            text_query: text string for CLIP query
-            clip_processor: CLIP processor
-            clip_model: CLIP model
-            
-        Returns:
-            similarity_map: (H, W) similarity scores
         """
-        # Get feature map
-        feature_map = self.get_hashgrid_features(depth, c2w, intrinsics)
+        # Get feature map (ignore uncertainty for similarity query)
+        feature_map = self.get_hashgrid_features(depth, c2w, intrinsics, return_uncertainty=False)
         
         # Get text embedding
         inputs = clip_processor(text=[text_query], return_tensors="pt", padding=True).to(self.device)

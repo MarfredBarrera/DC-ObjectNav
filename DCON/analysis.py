@@ -371,5 +371,5 @@ class Runner:
 if __name__ == "__main__":
     config = Config("config/config.yaml")
     runner = Runner(config)
-    runner.plot_similarity_and_uncertainty(img_index=5, text_query="a pillow", save_path="output/current_scene/similarity_uncertainty.png")
+    runner.plot_similarity_and_uncertainty(img_index=27, text_query="a pillow", save_path="output/current_scene/similarity_uncertainty.png")
 
