@@ -10,6 +10,7 @@ from collections import deque
 import queue
 import threading
 import random
+import argparse
 
 # Custom imports
 from dev.config import Config
@@ -29,9 +30,10 @@ os.environ['HABITAT_SIM_LOG'] = 'quiet'
 os.environ['CUDA_VISIBLE_DEVICES'] = '2' 
 
 class HabitatSim:
-    def __init__(self, cfg: Config, scene_path: str):
+    def __init__(self, cfg: Config, scene_path: str, offline: bool = False):
         self.cfg = cfg
         self.scene_path = scene_path
+        self.offline = offline
         
         # Setup device
         os.environ["CUDA_VISIBLE_DEVICES"] = self.cfg.gpu_indices
@@ -59,23 +61,10 @@ class HabitatSim:
         for _ in range(self.cfg.ensemble_num_models):
             self.ensemble_models.append(HashGrid(self.cfg, device=self.device))
 
-        # Initialize Habitat simulator
-        self._init_simulator()
-        
-        # Initialize intrinsics
-        fov_rad = np.deg2rad(self.FOV_DEG)
-        self.fx = (self.IMG_WIDTH / 2) / np.tan(fov_rad / 2)
-        self.fy = self.fx
-        self.cx = self.IMG_WIDTH / 2
-        self.cy = self.IMG_HEIGHT / 2
-        self.intrinsics_tuple = (self.fx, self.fy, self.cx, self.cy, self.IMG_HEIGHT, self.IMG_WIDTH)
-        
-        # Data storage
-        self.rgb_imgs = []
-        self.depth_imgs = []
-        self.pose_matrices = []
-        self.frame_count = 0
-        
+        # Initialize Habitat simulator (only if online)
+        self.simulator = None
+        self.agent = None
+
         # Training state
         # CHANGED: Replaced deque with a standard list to hold ALL history on CPU
         self.global_point_buffer = [] 
@@ -85,22 +74,39 @@ class HabitatSim:
         # Single thread trains all ensemble models sequentially
         self.ensemble_training_thread = None
         self.ensemble_steps = [0] * self.cfg.ensemble_num_models
-        
+        # Thread safety
+        self.buffer_lock = threading.Lock()
+                
+        # Data storage
+        self.rgb_imgs = []
+        self.depth_imgs = []
+        self.pose_matrices = []
+        self.frame_count = 0
+
         # Queues
         self.data_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
         self.training_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
-        
-        # Thread safety
-        self.buffer_lock = threading.Lock()
-        
+            
         # Visualization
         self.viz_active = False
         self.last_viz_update = 0
         self.viz_thread = None
-        self.viz_update_interval = 5 
+        self.viz_update_interval = 2 
         self.camera_on = True
 
-        
+        if not self.offline:
+            self._init_simulator()
+            
+            # Initialize intrinsics
+            fov_rad = np.deg2rad(self.FOV_DEG)
+            self.fx = (self.IMG_WIDTH / 2) / np.tan(fov_rad / 2)
+            self.fy = self.fx
+            self.cx = self.IMG_WIDTH / 2
+            self.cy = self.IMG_HEIGHT / 2
+            self.intrinsics_tuple = (self.fx, self.fy, self.cx, self.cy, self.IMG_HEIGHT, self.IMG_WIDTH)
+        else:
+            self._load_offline_data()
+
         print("\nInitialization complete!")
 
     def _init_simulator(self):
@@ -258,6 +264,70 @@ class HabitatSim:
         
         return panel
     
+    def _load_offline_data(self):
+        print(f"Loading offline data from {self.output_dir}...")
+        json_path = os.path.join(self.output_dir, "transforms.json")
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"transforms.json not found at {json_path}")
+            
+        with open(json_path, 'r') as f:
+            meta = json.load(f)
+            
+        # Load intrinsics
+        self.fx = meta['fl_x']
+        self.fy = meta['fl_y']
+        self.cx = meta['cx']
+        self.cy = meta['cy']
+        self.IMG_WIDTH = meta['w']
+        self.IMG_HEIGHT = meta['h']
+        self.intrinsics_tuple = (self.fx, self.fy, self.cx, self.cy, self.IMG_HEIGHT, self.IMG_WIDTH)
+        
+        # Load bounds if available
+        if 'scene_bounds' in meta:
+            bounds = meta['scene_bounds']
+            self.hashgrid.bounds_min = torch.tensor(bounds['min'], device=self.device, dtype=torch.float32)
+            self.hashgrid.bounds_max = torch.tensor(bounds['max'], device=self.device, dtype=torch.float32)
+            
+        frames = meta['frames']
+        print(f"Found {len(frames)} frames. Loading into buffer...")
+        
+        for i, frame in enumerate(frames):
+            # Load RGB
+            rgb_path = os.path.join(self.output_dir, frame['file_path'])
+            rgb = cv2.imread(rgb_path)
+            if rgb is None:
+                print(f"Warning: Could not load {rgb_path}")
+                continue
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+            
+            # Load Depth
+            depth_name = os.path.basename(frame['file_path']).replace("rgb", "depth").replace(".png", ".npy")
+            depth_path = os.path.join(self.output_dir, "depth_data", depth_name)
+            if not os.path.exists(depth_path):
+                print(f"Warning: Could not load {depth_path}")
+                continue
+            depth = np.load(depth_path)
+            
+            # Pose
+            pose_matrix = np.array(frame['transform_matrix'])
+            
+            # Process and add to buffer
+            world_points, gt_features, _, _, _ = self._process_frame(rgb, depth, pose_matrix)
+            
+            with self.buffer_lock:
+                self.global_point_buffer.append((world_points, gt_features))
+                
+            if i % 10 == 0:
+                print(f"Loaded {i}/{len(frames)} frames", end='\r')
+        print(f"\nLoaded {len(self.global_point_buffer)} frames into global buffer.")
+
+    def save_models(self):
+        """Save only the ensemble models"""
+        os.makedirs(f"{self.output_dir}/ensemble", exist_ok=True)
+        for i, model in enumerate(self.ensemble_models):
+            ensemble_path = f"{self.output_dir}/ensemble/hashgrid_ensemble_{i}.pt"
+            model.save(ensemble_path)
+            print(f"Saved Ensemble Model {i} to {ensemble_path}")
 
     def save_data(self):
         """Save all collected data and models"""
@@ -324,11 +394,7 @@ class HabitatSim:
         print(f"Saved transforms.json with {len(frames_data)} frames")
         
         # Save ensemble models
-        os.makedirs(f"{self.output_dir}/ensemble", exist_ok=True)
-        for i, model in enumerate(self.ensemble_models):
-            ensemble_path = f"{self.output_dir}/ensemble/hashgrid_ensemble_{i}.pt"
-            model.save(ensemble_path)
-            print(f"Saved Ensemble Model {i} to {ensemble_path}")
+        self.save_models()
 
     def _process_frame(self, rgb, depth, pose_matrix):
         """Process and extract features from a frame, strictly returning CPU tensors"""
@@ -523,19 +589,16 @@ class HabitatSim:
             for _ in range(steps_per_stage):
                 if not self.ensemble_training_active:
                     break
-
-                # Train each model SEQUENTIALLY with DIFFERENT random samples
+                # Each model draws its OWN random mini-batch from the shared super-batch
+                # This is the key source of diversity in the ensemble
+                batch_idx = torch.randint(
+                    0, total_super_samples, (mini_batch_size,), device=self.device
+                )
+                batch_p = super_points_gpu[batch_idx]
+                batch_f = super_features_gpu[batch_idx]
+                # Train each model SEQUENTIALLY with the same random samples
                 for model_idx, model in enumerate(self.ensemble_models):
-                    # Each model draws its OWN random mini-batch from the shared super-batch
-                    # This is the key source of diversity in the ensemble
-                    batch_idx = torch.randint(
-                        0, total_super_samples, (mini_batch_size,), device=self.device
-                    )
-                    batch_p = super_points_gpu[batch_idx]
-                    batch_f = super_features_gpu[batch_idx]
-
                     loss = model.train_step(batch_p, batch_f)
-
                     # Log occasionally, stagger by model index to avoid spam
                     if loss is not None and self.ensemble_steps[model_idx] % 100 == 0:
                         print(
@@ -733,19 +796,28 @@ class HabitatSim:
         self.stop_training()
         self.stop_extraction()
         cv2.destroyAllWindows()
-        self.simulator.close()
+        if self.simulator:
+            self.simulator.close()
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--offline", action="store_true", help="Skip exploration and train on existing data")
+    args = parser.parse_args()
+
     config = Config("./config/config.yaml")
-    runner = HabitatSim(config, scene_path="/workspace/DCON/gibson_scenes/Anaheim.glb")
+    runner = HabitatSim(config, scene_path="/workspace/DCON/gibson_scenes/Anaheim.glb", offline=args.offline)
     
     try:
-        runner.run_exploration()
+        if not args.offline:
+            runner.run_exploration()
     finally:
         runner.stop_extraction()
         runner.stop_training()
         runner.continue_offline_training()
-        runner.save_data()
+        if args.offline:
+            runner.save_models()
+        else:
+            runner.save_data()
         runner.cleanup()
         print("\n" + "="*60)
         print("Session complete! Data saved and ready for analysis.")

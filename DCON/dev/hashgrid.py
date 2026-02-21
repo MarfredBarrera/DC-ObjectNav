@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import tinycudann as tcnn
 import numpy as np
 import json
@@ -136,7 +137,7 @@ class HashGrid(nn.Module):
             normalize: whether to L2 normalize output mean (use False during training)
         Returns:
             mean: (N, feature_dim) predicted feature vectors
-            log_var: (N, 1) predicted log variance scalar
+            variance: (N, 1) predicted variance (positive, via softplus)
         """
         # Normalize positions to [0, 1]
         normalized_pos = self.normalize_positions(positions)
@@ -145,17 +146,22 @@ class HashGrid(nn.Module):
         # Ensure we cast to float32 to avoid half-precision issues in output
         raw_output = self.model(normalized_pos.float()).float()
         
-        # Split into mean and log_variance
+        # Split into mean and variance (raw)
         # [:, :-1] -> Mean prediction (all but last)
-        # [:, -1:] -> Log Variance prediction (last dim only)
+        # [:, -1:] -> Variance prediction (last dim, unconstrained)
         mean = raw_output[..., :-1]
-        log_var = raw_output[..., -1:]
+        raw_var = raw_output[..., -1:]
+        
+        # Apply softplus to enforce var > 0 (following Kendall & Gal 2017)
+        # softplus(x) = log(1 + exp(x)), is smooth and always positive
+        # Add minimum variance for numerical stability
+        variance = F.softplus(raw_var) + 1e-6
         
         # Only normalize mean if requested (for inference/similarity computation)
         if normalize:
             mean = mean / (mean.norm(dim=-1, keepdim=True) + 1e-8)
         
-        return mean, log_var
+        return mean, variance
 
     def safe_normalize(self, features, dim=-1, eps=1e-6):
         """Safely normalize features, handling zero-norm cases."""
@@ -181,33 +187,28 @@ class HashGrid(nn.Module):
             loss: scalar tensor representing NLL loss
         """
 
-        # Forward pass - returns mean (N, D) and log_var (N, 1)
-        pred_mean, pred_log_var = self.forward(batch_points, normalize=False)
+        # Forward pass - returns mean (N, D) and variance (N, 1)
+        pred_mean, variance = self.forward(batch_points, normalize=False)
         
         # Normalize Ground Truth Features
         gt_norm = self.safe_normalize(batch_gt_features)
         
         # --- Robust Negative Log Likelihood (NLL) Loss ---
-        
-        # 1. Clamp log_var to prevent explosion or division by zero
-        # min=-7 (~0.0009 var) prevents divide by zero
-        # max=7 (~1096 var) prevents huge penalties for small errors
-        pred_log_var = torch.clamp(pred_log_var, min=-7.0, max=7.0)
-        
-        # 2. Compute variance (add epsilon for extra safety)
-        variance = torch.exp(pred_log_var) + 1e-6
+        # variance is already positive (via softplus) and has min_var added
         
         # 3. Compute Sum of Squared Errors (SSE) across feature dimension
         # Shape: (N, 1)
         sse = ((gt_norm - pred_mean) ** 2).sum(dim=-1, keepdim=True)
         
         # 4. Compute NLL for Isotropic Gaussian
-        # Loss = 0.5 * (log(2*pi) +  log(sigma^2) + SSE / sigma^2)
+        # Loss = 0.5 * (log(2*pi) + log(sigma^2) + SSE / sigma^2)
         constant_term = np.log(2 * np.pi)
         
-        # Note: log_var is log(sigma^2)
-        # We include the constant term to keep loss positive/interpretable
-        nll = 0.5 * (constant_term + pred_log_var + sse / variance)
+        # Compute log(variance) for the NLL formula
+        log_var = torch.log(variance)
+        
+        # Include constant term to keep loss positive/interpretable
+        nll = 0.5 * (constant_term + log_var + sse / variance)
         
         # 5. Average over batch
         loss = nll.mean()
@@ -261,15 +262,13 @@ class HashGrid(nn.Module):
         for i in range(0, world_points.shape[0], batch_size):
             batch_points = world_points[i:i+batch_size]
             with torch.no_grad():
-                # Get mean and log_var
-                batch_mean, batch_log_var = self.forward(batch_points, normalize=True) 
+                # Get mean and variance (variance is already positive via softplus)
+                batch_mean, batch_var = self.forward(batch_points, normalize=True) 
                 
                 all_features.append(batch_mean)
                 if return_uncertainty:
-                    # Convert log_var to variance
-                    # batch_log_var is (N, 1), we flatten to (N)
-                    batch_var = torch.exp(batch_log_var).squeeze(-1)
-                    all_variances.append(batch_var)
+                    # batch_var is (N, 1), we flatten to (N)
+                    all_variances.append(batch_var.squeeze(-1))
         
         all_features = torch.cat(all_features, dim=0)
         feature_map[mask] = all_features.to(feature_map.dtype)

@@ -125,7 +125,7 @@ class Runner:
         vis_data = vis_data / (vis_data.max() + 1e-8)
         
         # Create visualization
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig, axes = plt.subplots(1, 3, figsize=(20, 7))
         
         # Original image
         axes[0].imshow(rgb_image)
@@ -194,41 +194,50 @@ class Runner:
         intrinsics = self.intrinsics_tuple
 
         feature_stack = []
+        var_stack = []
 
         # 1. Query all models
         with torch.no_grad():
             for model in self.ensemble_models:
                 # features shape: (H, W, Feature_Dim)
-                features = model.get_hashgrid_features(depth, c2w, intrinsics)
+                features, var = model.get_hashgrid_features(depth, c2w, intrinsics, return_uncertainty=True)
                 feature_stack.append(features)
+                var_stack.append(var)
+
 
         # Stack shape: (Num_Models, H, W, Feature_Dim)
-        stack = torch.stack(feature_stack, dim=0)
+        stack = torch.stack(feature_stack, dim=0) 
+        # var_stack shape: (Num_Models, H, W)
+        var_stack = torch.stack(var_stack, dim=0)
 
-        # 2. Compute Variance
+        # 2. Compute Epistemic Uncertainty: Var(ensemble_mean)
         # Calculate variance across the ensemble dimension (dim=0)
         # We then take the mean across the feature dimension (dim=-1) to get a scalar per pixel
         # variance_map shape: (H, W)
-        variance_map = torch.var(stack, dim=0).mean(dim=-1)
+        epistemic_map = torch.var(stack, dim=0).mean(dim=-1)
 
-        # 3. Compute Mean
+        # 3. Compute Aleatoric Uncertainty: Mean(predicted_variance)
+        # aleatoric_map shape: (H, W)
+        aleatoric_map = torch.mean(var_stack, dim=0)
+
+        # 3. Compute Mean Feature
         # mean map shape: (H,W,Feature_Dim)
         mean_map = torch.mean(stack, dim=0)
 
-        return variance_map, mean_map
+        return epistemic_map, aleatoric_map, mean_map
 
     def visualize_ensemble_variance(self, img_index, save_path=None, overlay_alpha=0.6):
         """
         Visualizes the uncertainty (variance) of the semantic field.
         """
-        variance_map, mean_map = self.get_ensemble_variance(img_index)
+        epistemic_map, aleatoric_map, mean_map = self.get_ensemble_variance(img_index)
         
-        if variance_map is None:
+        if epistemic_map is None:
             print("Could not compute variance (ensemble not loaded).")
             return
 
         # Prepare for plotting
-        var_np = variance_map.cpu().numpy()
+        var_np = epistemic_map.cpu().numpy()
         rgb_image = self.gt_images[img_index].cpu().numpy()
         
         # Handle outliers for better visualization contrast
@@ -243,7 +252,7 @@ class Runner:
         print(f"Uncertainty Stats | Min: {v_min:.6f} | Max: {v_max:.6f} | Mean: {var_np.mean():.6f}")
 
         # Plotting
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig, axes = plt.subplots(1, 3, figsize=(20, 7))
 
         # 1. RGB
         axes[0].imshow(rgb_image)
@@ -282,7 +291,7 @@ class Runner:
         
 
         ## Mean ensemble plotting
-        variance_map, pred_features_mean = self.get_ensemble_variance(img_index)
+        epistemic_map, aleatoric_map, pred_features_mean = self.get_ensemble_variance(img_index)
 
         # Query similarity
         similarity_map = self.sam_clip.query(pred_features_mean, text_query)
@@ -301,34 +310,21 @@ class Runner:
         vis_data = similarity_np - similarity_np.min()
         vis_data = vis_data / (vis_data.max() + 1e-8)
 
-        ## Single ensemble plotting
-        self.hashgrid.load("output/current_scene/ensemble/hashgrid_ensemble_0.pt")
-        pred_features = self.hashgrid.get_hashgrid_features(depth, c2w, intrinsics)
-        similarity_map_single = self.sam_clip.query(pred_features, text_query)
-        similarity_np_single = similarity_map_single.cpu().numpy()
-        similarity_np_single = np.nan_to_num(similarity_np_single, nan=0.5, posinf=1.0, neginf=0.0)
-        similarity_np_single = np.clip(similarity_np_single, 0.0, 1.0)
-
-        # scaling
-        vis_data_single = similarity_np_single - similarity_np_single.min()
-        vis_data_single = vis_data_single / (vis_data_single.max() + 1e-8)
-
-        ## Variance Plotting
+        ## Epistemic Variance Plotting
         # Prepare for plotting
-        var_np = variance_map.cpu().numpy()
+        epi_var_np = epistemic_map.cpu().numpy()
+        ale_var_np = aleatoric_map.cpu().numpy()
         rgb_image = self.gt_images[img_index].cpu().numpy()
         
         # Handle outliers for better visualization contrast
         # We clip the top 2% of variance values to avoid hot pixels washing out the map
-        v_min = var_np.min()
-        v_max = np.percentile(var_np, 98) 
+        v_min = epi_var_np.min()
+        v_max = np.percentile(epi_var_np, 98) 
         # v_max = var_np.max()
-        var_np_clipped = np.clip(var_np, v_min, v_max)
+        epi_var_np_clipped = np.clip(epi_var_np, v_min, v_max)
+        ale_var_np_clipped = np.clip(ale_var_np, ale_var_np.min(), np.percentile(ale_var_np, 98))
 
-        # Normalize to 0-1 for the overlay
-        var_norm = (var_np_clipped - v_min) / (v_max - v_min + 1e-8)
-
-        print(f"Uncertainty Stats | Min: {v_min:.6f} | Max: {v_max:.6f} | Mean: {var_np.mean():.6f}")
+        print(f"Uncertainty Stats | Min: {v_min:.6f} | Max: {v_max:.6f} | Mean: {epi_var_np.mean():.6f}")
 
         # Plotting
         fig, axes = plt.subplots(2, 2, figsize=(12, 12))
@@ -338,27 +334,27 @@ class Runner:
         axes[0, 0].set_title(f"RGB Input (Frame {img_index})", fontsize=14)
         axes[0, 0].axis('off')
 
-        # 2. Similarity Map (Single Ensemble)
-        im = axes[0, 1].imshow(vis_data_single, cmap='jet', vmin=0.6, vmax=1)
-        axes[0, 1].set_title(f"Similarity Map (Single Ensemble) for '{text_query}'", fontsize=14)
+        # 2. Similarity Map (Mean Ensemble)
+        im = axes[0, 1].imshow(vis_data, cmap='jet', vmin=0.6, vmax=1)
+        axes[0, 1].set_title(rf"Similarity Map (Ensemble Mean $\mu_\varepsilon)$ for '{text_query}'", fontsize=14)
         axes[0, 1].axis('off')
         plt.colorbar(im, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
-        # 2. Similarity Map (Mean Ensemble)
-        im = axes[1, 1].imshow(vis_data, cmap='jet', vmin=0.6, vmax=1)
-        axes[1, 1].set_title(f"Similarity Map (Ensemble Mean) for '{text_query}'", fontsize=14)
+        # 2. Aleatoric Uncertainty
+        im = axes[1, 1].imshow(ale_var_np_clipped, cmap='magma', vmin=ale_var_np_clipped.min(), vmax=ale_var_np_clipped.max())
+        axes[1, 1].set_title(r"Aleatoric Uncertainty: $\mathbb{E}[\sigma^2_\theta]$", fontsize=14)
         axes[1, 1].axis('off')
         plt.colorbar(im, ax=axes[1, 1], fraction=0.046, pad=0.04)
 
-        # 3. Uncertainty (Magma is good for 'intensity/heat')
-        im = axes[1, 0].imshow(var_np_clipped, cmap='magma', vmin=v_min, vmax=v_max)
-        axes[1, 0].set_title("Ensemble Variance (Uncertainty)", fontsize=14)
+        # 3. Epistemic Uncertainty (Magma is good for 'intensity/heat')
+        im = axes[1, 0].imshow(epi_var_np_clipped, cmap='magma', vmin=v_min, vmax=v_max)
+        axes[1, 0].set_title(r"Epistemic Uncertainty: $\mathbb{V}[\mu_\theta]$", fontsize=14)
         axes[1, 0].axis('off')
         plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
 
 
-        plt.tight_layout()
+        plt.tight_layout(pad=2.0)
         
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -369,7 +365,7 @@ class Runner:
 
 # --- Main Block Update ---
 if __name__ == "__main__":
-    config = Config("config/config.yaml")
+    config = Config("./config/config.yaml")
     runner = Runner(config)
-    runner.plot_similarity_and_uncertainty(img_index=27, text_query="a pillow", save_path="output/current_scene/similarity_uncertainty.png")
+    runner.plot_similarity_and_uncertainty(img_index=7, text_query="a pillow", save_path="output/current_scene/similarity_uncertainty.png")
 

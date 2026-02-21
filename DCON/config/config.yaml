@@ -89,4 +89,4 @@ hashgrid:
   warmup_steps: 0
 
 ensemble:
-  num_models: 3
+  num_models: 5
