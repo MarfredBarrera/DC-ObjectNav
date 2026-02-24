@@ -66,7 +66,6 @@ class HabitatSim:
         self.agent = None
 
         # Training state
-        # CHANGED: Replaced deque with a standard list to hold ALL history on CPU
         self.global_point_buffer = [] 
         self.training_active = False
         self.extraction_thread = None
@@ -82,6 +81,8 @@ class HabitatSim:
         self.depth_imgs = []
         self.pose_matrices = []
         self.frame_count = 0
+        self.offline_data_stream = []
+
 
         # Queues
         self.data_queue = queue.Queue(maxsize=self.cfg.data_queue_size)
@@ -289,7 +290,7 @@ class HabitatSim:
             self.hashgrid.bounds_max = torch.tensor(bounds['max'], device=self.device, dtype=torch.float32)
             
         frames = meta['frames']
-        print(f"Found {len(frames)} frames. Loading into buffer...")
+        print(f"Found {len(frames)} frames. Loading into memory...")
         
         for i, frame in enumerate(frames):
             # Load RGB
@@ -311,15 +312,11 @@ class HabitatSim:
             # Pose
             pose_matrix = np.array(frame['transform_matrix'])
             
-            # Process and add to buffer
-            world_points, gt_features, _, _, _ = self._process_frame(rgb, depth, pose_matrix)
-            
-            with self.buffer_lock:
-                self.global_point_buffer.append((world_points, gt_features))
+            self.offline_data_stream.append((rgb, depth, pose_matrix))
                 
             if i % 10 == 0:
                 print(f"Loaded {i}/{len(frames)} frames", end='\r')
-        print(f"\nLoaded {len(self.global_point_buffer)} frames into global buffer.")
+        print(f"\nLoaded {len(self.offline_data_stream)} frames for simulation.")
 
     def save_models(self):
         """Save only the ensemble models"""
@@ -509,25 +506,18 @@ class HabitatSim:
                 pts, fts = self.global_point_buffer[idx]
                 n_available = pts.shape[0]
                 
-                # Calculate how many to take for this frame
                 n_take = points_per_frame + (1 if i < remainder else 0)
-                
-                # If frame has fewer points than we want, take all of them
+
                 if n_available <= n_take:
                     batch_points_list.append(pts)
                     batch_features_list.append(fts)
                 else:
-                    # Randomly sample INDICES on CPU, then slice
-                    # This is faster than concating huge arrays then slicing
                     rand_idx = torch.randperm(n_available)[:n_take]
                     batch_points_list.append(pts[rand_idx])
                     batch_features_list.append(fts[rand_idx])
-        
-        # 3. Concatenate smaller chunks (Much faster)
+     
         batch_points = torch.cat(batch_points_list, dim=0)
         batch_features = torch.cat(batch_features_list, dim=0)
-        
-        # 4. Move to GPU
         return batch_points.to(self.device), batch_features.to(self.device)
 
 
@@ -536,11 +526,7 @@ class HabitatSim:
         Trains all ensemble models sequentially on a single thread.
 
         During ONLINE phase: Ingests new data from training_queue.
-        During OFFLINE phase: Trains on existing global_point_buffer.
-
-        All models train on the SAME super-batch for each cycle, but each
-        model draws DIFFERENT random mini-batches from that super-batch.
-        This ensures diversity while being computationally efficient.
+        During OFFLINE phase: Trains on existing data
         """
         print("Ensemble training worker started...")
 
@@ -589,8 +575,8 @@ class HabitatSim:
             for _ in range(steps_per_stage):
                 if not self.ensemble_training_active:
                     break
-                # Each model draws its OWN random mini-batch from the shared super-batch
-                # This is the key source of diversity in the ensemble
+
+                # Each model uses same random samples
                 batch_idx = torch.randint(
                     0, total_super_samples, (mini_batch_size,), device=self.device
                 )
@@ -695,6 +681,50 @@ class HabitatSim:
             
             time.sleep(0.5)
 
+    def run_offline_simulation(self):
+        """Simulate online exploration using offline data"""
+        print("\n" + "="*40)
+        print(" STARTING OFFLINE SIMULATION")
+        print("="*40 + "\n")
+
+        self.start_training()
+        self.start_ensemble_training()
+        
+        total_frames = len(self.offline_data_stream)
+        
+        for i, (rgb, depth, pose) in enumerate(self.offline_data_stream):
+            # Visualization
+            cv2_img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            
+            # Add info text
+            cv2.putText(cv2_img, f"Offline Stream: {i+1}/{total_frames}", (10, 30), 
+                       cv2.FONT_HERSHEY_TRIPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(cv2_img, f"Queue: {self.data_queue.qsize()}", (10, 60),
+                       cv2.FONT_HERSHEY_TRIPLEX, 0.7, (0, 255, 0), 2)
+            
+            cv2.imshow("Habitat Explorer - Offline Simulation", cv2_img)
+            
+            key = cv2.waitKey(1)
+            if key == ord('q') or key == 27:
+                print("Simulation stopped by user")
+                break
+            
+            # Push to queue (blocking if full to simulate real-time pressure)
+            try:
+                self.data_queue.put((rgb, depth, pose), timeout=5.0)
+            except queue.Full:
+                print("Warning: Data queue full, skipping frame")
+            
+            # Simulate frame interval (e.g. 10 FPS)
+            time.sleep(0.1)
+            
+        print("Finished streaming offline data.")
+        
+        # Wait for data queue to drain
+        while not self.data_queue.empty():
+            time.sleep(0.5)
+            print(f"Waiting for processing... Data Q: {self.data_queue.qsize()}", end='\r')
+        print("\nData queue drained.")
 
     def _visualize_score(self):
         pass
@@ -810,9 +840,11 @@ def main():
     try:
         if not args.offline:
             runner.run_exploration()
+        else:
+            runner.run_offline_simulation()
     finally:
-        runner.stop_extraction()
         runner.stop_training()
+        runner.stop_extraction()
         runner.continue_offline_training()
         if args.offline:
             runner.save_models()
