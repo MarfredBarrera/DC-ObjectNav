@@ -164,7 +164,7 @@ class Runner:
             return
 
         print("Loading Ensemble Models...")
-        for i in range(3):
+        for i in range(self.cfg.ensemble_num_models):
             model_path = os.path.join(ensemble_dir, f"hashgrid_ensemble_{i}.pt")
             if os.path.exists(model_path):
                 # Initialize a new HashGrid instance

@@ -46,6 +46,7 @@ def unprojection(depth, intrinsics, c2w, device, mask=None):
         depth: Depth image (H x W)
         intrinsics: Tuple of (fx, fy, cx, cy, H, W)
         device: PyTorch device
+        mask: dim (H, W) boolean mask to select valid points
     
     Returns:
         x_c, y_c, z: Camera-space coordinates (each of shape H x W)
