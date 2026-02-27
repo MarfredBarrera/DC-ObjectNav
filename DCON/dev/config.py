@@ -39,7 +39,7 @@ class Config:
         # Training Settings
         self.iterations = 10000
         self.device = "cuda"
-        self.gpu_indices = "2,3"
+        self.gpu_indices = "0"
         
         # Camera / Data
         self.near_plane = 0.01

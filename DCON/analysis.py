@@ -9,6 +9,7 @@ import cv2
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from collections import deque
+import pickle
 
 # Custom Imports
 from dev.config import Config
@@ -16,7 +17,8 @@ from dev.gaussians import GaussianSplatting
 from dev.semantics import SAM_CLIP_Semantics
 from dev.utils import unprojection
 from dev.hashgrid import HashGrid
-from dev.visualizer import Visualizer
+from dev.recorder import BEVGrid
+
 
 class Runner:
     def __init__(self, cfg: Config):
@@ -36,12 +38,11 @@ class Runner:
         # 2. Semantics
         self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
 
-        # 3. HashGrid
-        self.hashgrid = HashGrid(self.cfg, device=self.device, transforms_json=os.path.join(self.cfg.output_dir, "transforms.json"))
-        bounds = self.hashgrid.load_scene_bounds_from_json(os.path.join(self.cfg.output_dir, "transforms.json"))
-        self.bounds_min = bounds[0]
-        self.bounds_max = bounds[1]
-        
+        # 3. Ensemble Models
+        self.ensemble_models = self.load_ensemble()
+
+        # 4. BEV Grid
+        self.bev_grid = BEVGrid(self.cfg, self.ensemble_models)
 
     def _load_scene_data(self):
         json_path = os.path.join(self.cfg.output_dir, "transforms.json")
@@ -156,7 +157,7 @@ class Runner:
 
     def load_ensemble(self):
         """Loads the 3 ensemble HashGrid models from the output directory."""
-        self.ensemble_models = []
+        ensemble_models = []
         ensemble_dir = os.path.join(self.cfg.output_dir, "ensemble")
         
         if not os.path.exists(ensemble_dir):
@@ -168,13 +169,15 @@ class Runner:
             model_path = os.path.join(ensemble_dir, f"hashgrid_ensemble_{i}.pt")
             if os.path.exists(model_path):
                 # Initialize a new HashGrid instance
-                model = HashGrid(self.cfg, device=self.device, 
-                               transforms_json=os.path.join(self.cfg.output_dir, "transforms.json"))
+                model = HashGrid(self.cfg, device=self.device)
                 model.load(model_path)
-                self.ensemble_models.append(model)
+                ensemble_models.append(model)
                 print(f"  -> Loaded Ensemble Model {i}")
             else:
                 print(f"  -> Warning: Model {i} not found at {model_path}")
+
+        return ensemble_models
+
 
     def get_ensemble_variance(self, img_index):
         """
@@ -319,7 +322,8 @@ class Runner:
         # Handle outliers for better visualization contrast
         # We clip the top 2% of variance values to avoid hot pixels washing out the map
         v_min = epi_var_np.min()
-        v_max = np.percentile(epi_var_np, 98) 
+        # v_max = np.percentile(epi_var_np, 98) 
+        v_max = epi_var_np.max()
         # v_max = var_np.max()
         epi_var_np_clipped = np.clip(epi_var_np, v_min, v_max)
         ale_var_np_clipped = np.clip(ale_var_np, ale_var_np.min(), np.percentile(ale_var_np, 98))
@@ -363,9 +367,211 @@ class Runner:
         plt.show()
 
 
-# --- Main Block Update ---
+def load_bev_uncertainty_snapshots(pickle_path):
+    """
+    Load BEV uncertainty snapshots from pickle file.
+    
+    Args:
+        pickle_path: Path to the recorder_snapshots.pkl file
+        
+    Returns:
+        snapshots: List of snapshot dictionaries
+    """
+    with open(pickle_path, 'rb') as f:
+        snapshots = pickle.load(f)
+    print(f"Loaded {len(snapshots)} snapshots from {pickle_path}")
+    return snapshots
+
+
+def visualize_bev_uncertainty(pickle_path, snapshot_idx=None, height_filter=None, 
+                               save_path=None, cmap='magma', vmin=None, vmax=None,
+                               show_trajectory=True, config=None):
+    """
+    Visualize BEV uncertainty map from recorded snapshots with optional filtering.
+    
+    Args:
+        pickle_path: Path to the recorder_snapshots.pkl file
+        snapshot_idx: Index of snapshot to visualize (None for last snapshot)
+        height_filter: Tuple (min_height, max_height) to filter by agent height/z-position
+                      If None, no height filtering is applied
+        save_path: Optional path to save the figure
+        cmap: Colormap for uncertainty visualization (default: 'magma')
+        vmin, vmax: Optional colorbar limits
+        show_trajectory: If True, overlay agent trajectory on the map
+        config: Config object to load scene bounds (optional)
+        
+    Returns:
+        uncertainty_map: (H, W) numpy array of the uncertainty map
+    """
+    # Load snapshots
+    snapshots = load_bev_uncertainty_snapshots(pickle_path)
+    
+    if len(snapshots) == 0:
+        print("No snapshots found!")
+        return None
+    
+    # Load scene bounds if config provided
+    bev_resolution = 0.01  # Default
+    bev_min_x, bev_max_x, bev_min_z, bev_max_z = None, None, None, None
+    
+    if config is not None:
+        bev_resolution = config.bev_resolution
+        transforms_path = os.path.join(config.output_dir, "transforms.json")
+        if os.path.exists(transforms_path):
+            with open(transforms_path, 'r') as f:
+                transforms = json.load(f)
+            if 'scene_bounds' in transforms:
+                bounds = transforms['scene_bounds']
+                bev_min_x, bev_max_x = bounds['min'][0], bounds['max'][0]
+                bev_min_z, bev_max_z = bounds['min'][2], bounds['max'][2]
+    
+    # Select snapshot
+    if snapshot_idx is None:
+        snapshot_idx = -1  # Last snapshot by default
+    
+    snapshot = snapshots[snapshot_idx]
+    uncertainty_map = snapshot['uncertainty_map']
+    count_map = snapshot['count_map']
+    step = snapshot['step']
+    agent_mat = snapshot['agent_mat']
+    
+    print(f"\nVisualizing snapshot at step {step}")
+    print(f"  Cells with data: {(count_map > 0).sum()} / {count_map.size}")
+    
+    # Apply height filter if specified
+    if height_filter is not None:
+        min_h, max_h = height_filter
+        # Filter based on agent/camera z-position across snapshots
+        filtered_uncertainty = np.zeros_like(uncertainty_map)
+        filtered_counts = np.zeros_like(count_map)
+        
+        for snap in snapshots:
+            snap_agent_pos = snap['agent_mat']
+            # agent_mat is a 4x4 transformation matrix stored as nested list
+            # Position is in the last column: [x, y, z] = [mat[0][3], mat[1][3], mat[2][3]]
+            # Extract height (y-coordinate) for filtering
+            if isinstance(snap_agent_pos, list) and len(snap_agent_pos) == 4:
+                # It's a 4x4 matrix - extract y position (height) from [1][3]
+                agent_height = snap_agent_pos[1][3]
+            elif isinstance(snap_agent_pos, list) and len(snap_agent_pos) >= 3:
+                # It's a simple [x, y, z] list
+                agent_height = snap_agent_pos[1]
+            else:
+                agent_height = 0.0  # Default if format unknown
+            
+            if min_h <= agent_height <= max_h:
+                filtered_uncertainty += snap['uncertainty_map'] * (snap['count_map'] > 0)
+                filtered_counts += (snap['count_map'] > 0).astype(int)
+        
+        # Average the filtered data
+        mask = filtered_counts > 0
+        uncertainty_map = np.where(mask, filtered_uncertainty / np.maximum(filtered_counts, 1), 0)
+        count_map = filtered_counts
+        print(f"Applied height filter [{min_h}, {max_h}] m")
+    
+    # Mask out unexplored areas (where count_map == 0)
+    masked_uncertainty = np.ma.masked_where(count_map == 0, uncertainty_map)
+    
+    # Auto-scale vmin/vmax if not provided
+    if vmin is None:
+        vmin = np.percentile(uncertainty_map[count_map > 0], 2) if (count_map > 0).any() else 0
+    if vmax is None:
+        vmax = np.percentile(uncertainty_map[count_map > 0], 98) if (count_map > 0).any() else uncertainty_map.max()
+    
+    # Create visualization
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # Set up extent for world coordinates if bounds are available
+    extent = None
+    if bev_min_x is not None:
+        extent = [bev_min_x, bev_max_x, bev_min_z, bev_max_z]
+    
+    # Plot 1: Uncertainty Map
+    im1 = axes[0].imshow(masked_uncertainty, cmap=cmap, vmin=vmin, vmax=vmax, 
+                         origin='lower', interpolation='nearest', extent=extent)
+    axes[0].set_title(f'BEV Uncertainty Map (Step {step})', fontsize=14, fontweight='bold')
+    if extent:
+        axes[0].set_xlabel('X World Coordinate (m)', fontsize=12)
+        axes[0].set_ylabel('Z World Coordinate (m)', fontsize=12)
+        axes[0].axhline(0, color='white', linestyle='--', linewidth=0.5, alpha=0.5)
+        axes[0].axvline(0, color='white', linestyle='--', linewidth=0.5, alpha=0.5)
+    else:
+        axes[0].set_xlabel('X Grid Cell', fontsize=12)
+        axes[0].set_ylabel('Z Grid Cell', fontsize=12)
+    plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04, label='Uncertainty')
+    
+    # Overlay trajectory if requested
+    if show_trajectory and bev_min_x is not None:
+        # Extract agent positions from snapshots and plot them
+        agent_positions = []
+        for snap in snapshots:
+            agent_mat = snap['agent_mat']
+            # Handle both 4x4 matrix (nested list) and [x,y,z] vector (flat list)
+            if isinstance(agent_mat, list) and len(agent_mat) == 4 and isinstance(agent_mat[0], list):
+                # Extract position from 4x4 matrix
+                x, z = agent_mat[0][3], agent_mat[2][3]
+                agent_positions.append([x, z])
+            elif isinstance(agent_mat, (list, np.ndarray)) and len(agent_mat) >= 3:
+                # Extract position from [x, y, z] vector
+                x, z = agent_mat[0], agent_mat[2]
+                agent_positions.append([x, z])
+        
+        if agent_positions:
+            agent_positions = np.array(agent_positions)
+            # Plot trajectory on both maps
+            for ax in axes:
+                ax.plot(agent_positions[:, 0], agent_positions[:, 1], 'c-', 
+                       linewidth=2, alpha=0.7, label='Trajectory')
+                ax.scatter(agent_positions[-1, 0], agent_positions[-1, 1], 
+                          c='cyan', s=150, marker='*', label='Current Position', 
+                          edgecolors='white', linewidths=2, zorder=10)
+                ax.scatter(agent_positions[0, 0], agent_positions[0, 1], 
+                          c='yellow', s=100, marker='o', label='Start Position', 
+                          edgecolors='white', linewidths=2, zorder=10)
+            axes[0].legend(loc='upper right', fontsize=10)
+    
+    # Plot 2: Coverage/Count Map
+    im2 = axes[1].imshow(count_map, cmap='viridis', origin='lower', interpolation='nearest', extent=extent)
+    axes[1].set_title(f'BEV Coverage Map (Observation Counts)', fontsize=14, fontweight='bold')
+    if extent:
+        axes[1].set_xlabel('X World Coordinate (m)', fontsize=12)
+        axes[1].set_ylabel('Z World Coordinate (m)', fontsize=12)
+        axes[1].axhline(0, color='white', linestyle='--', linewidth=0.5, alpha=0.5)
+        axes[1].axvline(0, color='white', linestyle='--', linewidth=0.5, alpha=0.5)
+    else:
+        axes[1].set_xlabel('X Grid Cell', fontsize=12)
+        axes[1].set_ylabel('Z Grid Cell', fontsize=12)
+    plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04, label='Visit Count')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved to {save_path}")
+    
+    plt.show()
+    
+    return uncertainty_map
+
+
 if __name__ == "__main__":
     config = Config("./config/config.yaml")
+    
+    # Example 1: Analyze 2D similarity and uncertainty from a single viewpoint
     runner = Runner(config)
-    runner.plot_similarity_and_uncertainty(img_index=13, text_query="a pillow", save_path="output/current_scene/similarity_uncertainty.png")
-
+    runner.plot_similarity_and_uncertainty(
+        img_index=13, 
+        text_query="a pillow", 
+        save_path="output/current_scene/similarity_uncertainty.png"
+    )
+    
+    # # Example 2: Visualize BEV uncertainty map from recorded snapshots
+    # pickle_path = os.path.join(config.output_dir, "recorder_snapshots.pkl")
+    # visualize_bev_uncertainty(
+    #     pickle_path=pickle_path,
+    #     snapshot_idx=-1,
+    #     config=config,
+    #     height_filter=(0.0,1.75),
+    #     save_path="output/current_scene/bev_uncertainty.png",
+    #     show_trajectory=False
+    # )

@@ -1,3 +1,6 @@
+import os
+from time import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,18 +17,12 @@ class HashGrid(nn.Module):
     Updated to model aleatoric uncertainty using Negative Log-Likelihood (NLL) loss.
     """
     
-    def __init__(self, config, device="cuda", transforms_json=None):
+    def __init__(self, config, device="cuda"):
         super().__init__()
         self.cfg = config
         self.device = device
-        
-        # Scene bounds (will be updated during training or loaded from transforms.json)
-        if transforms_json is not None:
-            bounds_min, bounds_max = self.load_scene_bounds_from_json(transforms_json)
-        else:
-            bounds_min = [-5.0, -5.0, -5.0]
-            bounds_max = [5.0, 5.0, 5.0]
 
+        bounds_min, bounds_max = self.load_scene_bounds(os.path.join(self.cfg.output_dir, "transforms.json"))
         self.scene_bounds = torch.tensor([
             bounds_min,  # min
             bounds_max   # max
@@ -50,14 +47,14 @@ class HashGrid(nn.Module):
             "n_hidden_layers": config.hash_n_hidden_layers,
         }
         
+        # Generate a unique random seed for this instance
+        random_seed = int(time() * 1e9) % (2**32 - 1)
+        
         # Calculate encoding output dimension
         self.encoding_dim = encoding_config["n_levels"] * encoding_config["n_features_per_level"]
-        
-        # Feature output dimension (e.g., CLIP dimension)
         self.feature_dim = config.hash_feature_dim
 
         # Output dims: Mean (feature_dim) + Log Variance (1 scalar)
-        # We use a single scalar for variance (isotropic uncertainty) to improve stability
         self.output_dim = self.feature_dim + 1
         
         # Create the encoding + network model
@@ -65,7 +62,8 @@ class HashGrid(nn.Module):
             n_input_dims=3,  # 3D positions (x, y, z)
             n_output_dims=self.output_dim, 
             encoding_config=encoding_config,
-            network_config=network_config
+            network_config=network_config,
+            seed=random_seed 
         )
         
         self.model.to(device)
@@ -78,7 +76,7 @@ class HashGrid(nn.Module):
             eps=1e-15
         )
     
-    def load_scene_bounds_from_json(self, json_path):
+    def load_scene_bounds(self, json_path):
         """
         Load scene bounds from a transforms.json file.
         Args:
@@ -143,19 +141,14 @@ class HashGrid(nn.Module):
         normalized_pos = self.normalize_positions(positions)
         
         # Query the network - returns (N, feature_dim + 1)
-        # Ensure we cast to float32 to avoid half-precision issues in output
         raw_output = self.model(normalized_pos.float()).float()
-        
-        # Split into mean and variance (raw)
-        # [:, :-1] -> Mean prediction (all but last)
-        # [:, -1:] -> Variance prediction (last dim, unconstrained)
         mean = raw_output[..., :-1]
         raw_var = raw_output[..., -1:]
         
         # Apply softplus to enforce var > 0 (following Kendall & Gal 2017)
         # softplus(x) = log(1 + exp(x)), is smooth and always positive
         # Add minimum variance for numerical stability
-        variance = F.softplus(raw_var) + 1e-6
+        variance = F.softplus(raw_var) + 1e-4
         
         # Only normalize mean if requested (for inference/similarity computation)
         if normalize:
@@ -168,10 +161,12 @@ class HashGrid(nn.Module):
         norms = features.norm(dim=dim, keepdim=True)
         # Only normalize if norm is above threshold, otherwise return small random vector
         mask = norms > eps
+        
+        safe_norms = torch.clamp(norms, min=eps)
         normalized = torch.where(
             mask,
-            features / (norms + eps),
-            torch.randn_like(features) * eps  # Replace zeros with tiny random
+            features / safe_norms,
+            torch.zeros_like(features)
         )
         return normalized
 
@@ -190,41 +185,30 @@ class HashGrid(nn.Module):
         # Forward pass - returns mean (N, D) and variance (N, 1)
         pred_mean, variance = self.forward(batch_points, normalize=False)
         
-        # Normalize Ground Truth Features
         gt_norm = self.safe_normalize(batch_gt_features)
         
         # --- Robust Negative Log Likelihood (NLL) Loss ---
-        # variance is already positive (via softplus) and has min_var added
         
-        # 3. Compute Sum of Squared Errors (SSE) across feature dimension
         # Shape: (N, 1)
         sse = ((gt_norm - pred_mean) ** 2).sum(dim=-1, keepdim=True)
         
         # 4. Compute NLL for Isotropic Gaussian
         # Loss = 0.5 * (log(2*pi) + log(sigma^2) + SSE / sigma^2)
         constant_term = np.log(2 * np.pi)
-        
-        # Compute log(variance) for the NLL formula
         log_var = torch.log(variance)
         
-        # Include constant term to keep loss positive/interpretable
         nll = 0.5 * (constant_term + log_var + sse / variance)
-        
-        # 5. Average over batch
         loss = nll.mean()
         
-        # Check for NaN loss
         if torch.isnan(loss):
             print(f"NaN loss detected! Skipping step...")
-            # Optional: Debug print to see what exploded
-            # print(f"Max SSE: {sse.max().item()}, Min Var: {variance.min().item()}")
             return None
         
         # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
         
-        # Gradient clipping is crucial for NLL stability
+        # Gradient clipping 
         total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         if torch.isnan(total_norm):
             print(f"NaN gradients! Skipping step...")
