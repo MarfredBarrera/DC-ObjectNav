@@ -28,9 +28,9 @@ semantics:
 
 # Training Settings
 training:
-  iterations: 0
+  iterations: 50000
   device: "cuda"
-  gpu_indices: "0"
+  gpu_indices: "1"
   near_plane: 0.01
 
 # Hyperparameters
@@ -83,8 +83,8 @@ hashgrid:
   per_image_batch_size: 518400
   train_batch_size: 8192
   inference_batch_size: 16384
-  replay_buffer_size: 5
-  buffer_refresh_interval: 500
+  replay_buffer_size: 10
+  buffer_refresh_interval: 1000
   train_every_n_steps: 1
   warmup_steps: 0
 

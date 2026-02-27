@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from collections import deque
 
+from dev.recorder import BEVGrid
 from dev.config import Config
 from dev.gaussians import GaussianSplatting
 from dev.semantics import SAM_CLIP_Semantics
@@ -35,6 +36,8 @@ class Runner:
             HashGrid(self.cfg, device=self.device) 
             for _ in range(self.cfg.ensemble_num_models)
         ]
+
+        self.recorder = BEVGrid(cfg, self.ensemble_models)
 
 
     def _load_scene_data(self):
@@ -77,9 +80,10 @@ class Runner:
 
         return torch.stack(gt_images), torch.stack(gt_depths), torch.stack(c2w_matrices), (fx, fy, cx, cy, H, W)
     
-    def sample_rgb(self):
+    def sample_rgb(self, idx=None):
 
-        idx = torch.randint(0, len(self.gt_images), (1,)).item()
+        if idx is None:
+            idx = torch.randint(0, len(self.gt_images), (1,)).item()
         depth = self.gt_depths[idx]
         rgb = self.gt_images[idx]
         c2w_hash = self.c2ws[idx]
@@ -97,7 +101,7 @@ class Runner:
         gt_features = gt_features[valid_mask]
 
         return world_points, gt_features
-
+    
     def train_ensemble(self):
 
         buf_size = self.cfg.hash_replay_buffer_size
@@ -125,6 +129,7 @@ class Runner:
         batch_size = min(self.cfg.hash_train_batch_size, world_points.shape[0])
 
         start_time = time.time()
+
         for step in range(self.cfg.iterations):
             # Sample a batch from concatenated data
             batch_indx = torch.randperm(world_points.shape[0], device=world_points.device)[:batch_size]
@@ -136,11 +141,6 @@ class Runner:
                 loss += model.train_step(batch_points, batch_features)
             avg_loss = loss/self.cfg.ensemble_num_models
 
-
-            # loss = self.hashgrid.train_step(batch_points, batch_features)
-            # if loss is None:
-            #     continue
-            
             # Logging
             if step % 100 == 0:
                 print(f"Step {step:04d} | Train Loss: {avg_loss:.5f} | Time: {time.time()-start_time:.1f}s")
@@ -168,6 +168,19 @@ class Runner:
                 
                 torch.cuda.empty_cache()
                 print(f"Buffer updated")
+
+                ### Save uncertainty map
+                self.uncertainty_snapshot(step)
+
+    def uncertainty_snapshot(self, step):
+        """Save the BEV uncertainty maps at a specific training step."""
+        self.recorder.iteration_num = step
+        self.recorder.forward_pass()
+        self.recorder.save_bev_maps()
+
+
+
+
 
     def save_models(self):
         """Save only the ensemble models."""
