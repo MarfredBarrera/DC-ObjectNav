@@ -73,8 +73,8 @@ class HashGrid(nn.Module):
             self.model.parameters(), 
             lr=config.hash_lr,
             betas=(0.9, 0.99),
-            eps=1e-15
-        )
+            eps=1e-15,
+            weight_decay=1e-6)
     
     def load_scene_bounds(self, json_path):
         """

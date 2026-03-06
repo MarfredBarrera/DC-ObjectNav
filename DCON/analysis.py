@@ -8,6 +8,7 @@ import imageio.v2 as imageio
 import cv2
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+from matplotlib.colors import LogNorm
 from collections import deque
 import pickle
 
@@ -228,58 +229,6 @@ class Visualizer:
 
         return epistemic_map, aleatoric_map, mean_map
 
-    def visualize_ensemble_variance(self, img_index, save_path=None, overlay_alpha=0.6):
-        """
-        Visualizes the uncertainty (variance) of the semantic field.
-        """
-        epistemic_map, aleatoric_map, mean_map = self.get_ensemble_variance(img_index)
-        
-        if epistemic_map is None:
-            print("Could not compute variance (ensemble not loaded).")
-            return
-
-        # Prepare for plotting
-        var_np = epistemic_map.cpu().numpy()
-        rgb_image = self.gt_images[img_index].cpu().numpy()
-        
-        # Handle outliers for better visualization contrast
-        # We clip the top 2% of variance values to avoid hot pixels washing out the map
-        v_min = var_np.min()
-        v_max = np.percentile(var_np, 98) 
-        var_np_clipped = np.clip(var_np, v_min, v_max)
-
-        # Normalize to 0-1 for the overlay
-        var_norm = (var_np_clipped - v_min) / (v_max - v_min + 1e-8)
-
-        print(f"Uncertainty Stats | Min: {v_min:.6f} | Max: {v_max:.6f} | Mean: {var_np.mean():.6f}")
-
-        # Plotting
-        fig, axes = plt.subplots(1, 3, figsize=(20, 7))
-
-        # 1. RGB
-        axes[0].imshow(rgb_image)
-        axes[0].set_title(f"RGB Input (Frame {img_index})", fontsize=14)
-        axes[0].axis('off')
-
-        # 2. Heatmap (Magma is good for 'intensity/heat')
-        im = axes[1].imshow(var_np_clipped, cmap='magma', vmin=v_min, vmax=v_max)
-        axes[1].set_title("Ensemble Variance (Uncertainty)", fontsize=14)
-        axes[1].axis('off')
-        plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
-
-        # 3. Overlay
-        axes[2].imshow(rgb_image)
-        axes[2].imshow(var_norm, cmap='magma', alpha=overlay_alpha)
-        axes[2].set_title("Uncertainty Overlay", fontsize=14)
-        axes[2].axis('off')
-
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Saved variance visualization to {save_path}")
-            
-        plt.show()
 
     def plot_similarity_and_uncertainty(self, img_index, text_query, save_path=None):
         """
@@ -365,6 +314,82 @@ class Visualizer:
             
         plt.show()
 
+    def load_bev_maps(self, step):
+        """Load the BEV uncertainty maps for a specific training step."""
+        umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
+        epi_path = os.path.join(umaps_dir, f"bev_epistemic_uncertainty_{step}.npy")
+        ale_path = os.path.join(umaps_dir, f"bev_aleatoric_uncertainty_{step}.npy")
+        
+        if os.path.exists(epi_path) and os.path.exists(ale_path):
+            bev_epi_umap = np.load(epi_path)
+            bev_ale_umap = np.load(ale_path)
+
+            bev_epi_2d = bev_epi_umap.reshape(self.bev_grid.bev_height, self.bev_grid.bev_width)
+            bev_ale_2d = bev_ale_umap.reshape(self.bev_grid.bev_height, self.bev_grid.bev_width)
+            print(f"Loaded BEV maps for step {step} from {umaps_dir}")
+            return bev_epi_2d, bev_ale_2d
+        else:
+            print(f"BEV maps for step {step} not found in {umaps_dir}")
+            return None, None
+        
+    def visualize_bev_map(self, u_maps):
+        """Visualize the BEV uncertainty maps."""
+        bev_epi_2d, bev_ale_2d = u_maps
+        
+        if bev_epi_2d is not None and bev_ale_2d is not None:
+            # Reshape from flattened (N,) to 2D (bev_height, bev_width)
+            # bev_epi_2d = bev_epi_umap.reshape(self.bev_grid.bev_height, self.bev_grid.bev_width)
+            # bev_ale_2d = bev_ale_umap.reshape(self.bev_grid.bev_height, self.bev_grid.bev_width)
+            
+            fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+            
+            # Epistemic Uncertainty Map
+            im1 = axes[0].imshow(bev_epi_2d, cmap='magma', origin='lower', aspect='equal')
+            axes[0].set_title(r"Epistemic Uncertainty: $\mathbb{V}[\mu_\theta]$", fontsize=10)
+            axes[0].axis('off')
+            plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+
+            # Add statistics text
+            epi_stats_text = (
+                f'Min: {bev_epi_2d.min():.6f}\n'
+                f'Max: {bev_epi_2d.max():.6f}\n'
+                f'Mean: {bev_epi_2d.mean():.6f}\n'
+                f'Std: {bev_epi_2d.std():.6f}'
+            )
+            axes[0].text(
+                0.01, 1.05, epi_stats_text,
+                transform=axes[0].transAxes,
+                fontsize=10,
+                verticalalignment='bottom',
+                horizontalalignment='left',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+            )
+
+            im2 = axes[1].imshow(bev_ale_2d, cmap='magma', origin='lower', aspect='equal')
+            axes[1].set_title(r"Aleatoric Uncertainty: $\mathbb{E}[\sigma^2_\theta]$", fontsize=10)
+            axes[1].axis('off')
+            plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+            # Add statistics text
+            ale_stats_text = (
+                f'Min: {bev_ale_2d.min():.6f}\n'
+                f'Max: {bev_ale_2d.max():.6f}\n'
+                f'Mean: {bev_ale_2d.mean():.6f}\n'
+                f'Std: {bev_ale_2d.std():.6f}'
+            )
+            axes[1].text(
+                0.01, 1.05, ale_stats_text,
+                transform=axes[1].transAxes,
+                fontsize=10,
+                verticalalignment='bottom',
+                horizontalalignment='left',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+            )
+
+            plt.tight_layout()
+            plt.show()
+        else:
+            print("Unable to visualize BEV maps due to missing data.")
 
 
 if __name__ == "__main__":
@@ -373,6 +398,8 @@ if __name__ == "__main__":
     # Example 1: Analyze 2D similarity and uncertainty from a single viewpoint
     visualizer = Visualizer(config)
 
-    visualizer.bev_grid.forward_pass(height_filter=(0.1, 1.5))
-    visualizer.bev_grid.visualize_bev_map(save_path="output/current_scene/bev_uncertainty_5000.png", show=True)
+    bev_maps = visualizer.load_bev_maps(step=50000)
+    visualizer.visualize_bev_map(bev_maps)
+    # visualizer.bev_grid.forward_pass(height_filter=(0.1, 2.0))
+    # visualizer.bev_grid.visualize_bev_map(show=True)
     

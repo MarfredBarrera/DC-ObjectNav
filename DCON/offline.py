@@ -1,4 +1,6 @@
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 import json
 import math
 import time
@@ -20,7 +22,7 @@ from dev.hashgrid import HashGrid
 class Runner:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        os.environ["CUDA_VISIBLE_DEVICES"] = self.cfg.gpu_indices
+        # os.environ["CUDA_VISIBLE_DEVICES"] = self.cfg.gpu_indices
         os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
         self.device = self.cfg.device
 
@@ -130,7 +132,7 @@ class Runner:
 
         start_time = time.time()
 
-        for step in range(self.cfg.iterations):
+        for step in range(self.cfg.iterations+1):
             # Sample a batch from concatenated data
             batch_indx = torch.randperm(world_points.shape[0], device=world_points.device)[:batch_size]
             batch_points = world_points[batch_indx]
@@ -162,21 +164,32 @@ class Runner:
                 replay_buffer.append((sample_points, sample_features))
                 
                 # Refresh concatenated training data from updated buffer
-                world_points = torch.cat([x[0] for x in replay_buffer], dim=0)
-                gt_features = torch.cat([x[1] for x in replay_buffer], dim=0)
+                world_points = torch.cat([x[0] for x in replay_buffer], dim=0).clone()
+                gt_features = torch.cat([x[1] for x in replay_buffer], dim=0).clone()
                 batch_size = min(self.cfg.hash_train_batch_size, world_points.shape[0])
                 
                 torch.cuda.empty_cache()
                 print(f"Buffer updated")
 
-                ### Save uncertainty map
-                self.uncertainty_snapshot(step)
+        #         # save uncertainty map
+        #         self.uncertainty_snapshot(step)
+
+        # # save last step uncertainty map    
+        # self.uncertainty_snapshot(step)
+
 
     def uncertainty_snapshot(self, step):
         """Save the BEV uncertainty maps at a specific training step."""
         self.recorder.iteration_num = step
-        self.recorder.forward_pass()
+        self.recorder.forward_pass(height_filter=(0.1,2.0))
         self.recorder.save_bev_maps()
+
+        # Clear the saved BEV maps from GPU memory since they're already saved to disk
+        self.recorder.bev_epi_umap = None
+        self.recorder.bev_ale_umap = None
+
+        torch.cuda.empty_cache()
+        # torch.cuda.reset_peak_memory_stats()
 
 
 

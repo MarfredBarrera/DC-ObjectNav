@@ -1,7 +1,5 @@
 import torch
 import numpy as np
-import time
-import pickle
 import os
 
 class BEVGrid:
@@ -198,7 +196,7 @@ class BEVGrid:
         
         return epi_grid, ale_grid
     
-    def visualize_bev_map(self, save_path=None, show=False):
+    def visualize_bev_map(self, save_path=None, show=False, height_filter=None):
         """
         Visualize the BEV uncertainty map as a heatmap.
         
@@ -210,7 +208,7 @@ class BEVGrid:
             fig, ax: matplotlib figure and axis objects
         """
         import matplotlib.pyplot as plt
-        from matplotlib.colors import LinearSegmentedColormap
+        from matplotlib.colors import LogNorm
         
 
         # Reshape uncertainty map to 2D grid
@@ -221,20 +219,16 @@ class BEVGrid:
         # Create figure
         fig, ax = plt.subplots(figsize=(12, 10))
         
-        # Create custom colormap (blue=low uncertainty, red=high uncertainty)
-        colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D']
-        n_bins = 256
-        cmap = LinearSegmentedColormap.from_list('uncertainty', colors, N=n_bins)
-        
-        # Plot heatmap
+        # Plot heatmap with log scale
         extent = [self.bev_min_x, self.bev_max_x, self.bev_min_z, self.bev_max_z]
         im = ax.imshow(
             uncertainty_grid, 
             origin='lower',
             aspect='equal',
             extent=extent,
-            cmap='magma',
-            interpolation='nearest'
+            cmap='turbo',
+            interpolation='nearest',
+            norm=LogNorm()
         )
         
         # Add colorbar
@@ -285,11 +279,12 @@ class BEVGrid:
     
     def save_bev_maps(self, save_dir=None):
         """Save the BEV uncertainty maps as numpy files."""
-        os.makedirs(self.cfg.output_dir, exist_ok=True)
-        epi_path = os.path.join(self.cfg.output_dir, f"/umaps/bev_epistemic_uncertainty_{self.iteration_num}.npy")
-        ale_path = os.path.join(self.cfg.output_dir, f"/umaps/bev_aleatoric_uncertainty_{self.iteration_num}.npy")
+        umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
+        os.makedirs(umaps_dir, exist_ok=True)
+        epi_path = os.path.join(umaps_dir, f"bev_epistemic_uncertainty_{self.iteration_num}.npy")
+        ale_path = os.path.join(umaps_dir, f"bev_aleatoric_uncertainty_{self.iteration_num}.npy")
         
         np.save(epi_path, self.bev_epi_umap.cpu().numpy())
         np.save(ale_path, self.bev_ale_umap.cpu().numpy())
         
-        print(f"BEV maps saved to: {self.cfg.output_dir}/umaps")
+        print(f"BEV maps saved to: {umaps_dir}")
