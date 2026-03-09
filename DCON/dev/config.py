@@ -95,6 +95,9 @@ class Config:
 
         # Ensemble
         self.ensemble_num_models = 3
+
+        # Visualization
+        self.viz_interval = 2000
         
         # Load from YAML if path provided
         if yaml_path is not None:

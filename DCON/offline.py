@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+os.environ['CUDA_VISIBLE_DEVICES'] = '6'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 import json
 import math
@@ -39,7 +39,7 @@ class Runner:
             for _ in range(self.cfg.ensemble_num_models)
         ]
 
-        self.recorder = BEVGrid(cfg, self.ensemble_models)
+        self.recorder = BEVGrid(cfg, ensemble=self.ensemble_models)
 
 
     def _load_scene_data(self):
@@ -104,7 +104,9 @@ class Runner:
 
         return world_points, gt_features
     
-    def train_ensemble(self):
+    def train_ensemble(self, save_enabled=False):
+
+        viz_interval = self.cfg.viz_interval
 
         buf_size = self.cfg.hash_replay_buffer_size
         replay_buffer = deque(maxlen=buf_size)
@@ -171,11 +173,17 @@ class Runner:
                 torch.cuda.empty_cache()
                 print(f"Buffer updated")
 
-        #         # save uncertainty map
-        #         self.uncertainty_snapshot(step)
+                # if save_enabled:
+                #     # save uncertainty map
+                #     self.uncertainty_snapshot(step)
+            if save_enabled:
+                if step % viz_interval == 0:
+                    # save uncertainty map
+                    self.uncertainty_snapshot(step)
 
         # # save last step uncertainty map    
-        # self.uncertainty_snapshot(step)
+        # if save_enabled:
+        #     self.uncertainty_snapshot(step)
 
 
     def uncertainty_snapshot(self, step):
@@ -211,6 +219,6 @@ if __name__ == "__main__":
     config = Config("config/config.yaml")
     runner = Runner(config)
 
-    runner.train_ensemble()
+    runner.train_ensemble(save_enabled=True)
     runner.save_models()
 

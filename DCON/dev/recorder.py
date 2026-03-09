@@ -1,3 +1,4 @@
+from sklearn import ensemble
 import torch
 import numpy as np
 import os
@@ -182,19 +183,17 @@ class BEVGrid:
         epi_2d = epi_2d.transpose(0, 1)
         ale_2d = ale_2d.transpose(0, 1)
         
-        # Flatten for internal storage
-        self.bev_epi_umap = epi_2d.flatten()
-        self.bev_ale_umap = ale_2d.flatten()
+        # Store
+        self.bev_epi_umap = epi_2d
+        self.bev_ale_umap = ale_2d
         
-        # Convert to numpy arrays for return
-        epi_grid = epi_2d.numpy()
-        ale_grid = ale_2d.numpy()
+        # # Convert to numpy arrays for return
+        # epi_grid = epi_2d.numpy()
+        # ale_grid = ale_2d.numpy()
         
         print(f"Forward pass complete!")
-        print(f"Epistemic Uncertainty range: [{epi_grid.min():.6f}, {epi_grid.max():.6f}]")
-        print(f"Aleatoric Uncertainty range: [{ale_grid.min():.6f}, {ale_grid.max():.6f}]")
         
-        return epi_grid, ale_grid
+        return
     
     def visualize_bev_map(self, save_path=None, show=False, height_filter=None):
         """
