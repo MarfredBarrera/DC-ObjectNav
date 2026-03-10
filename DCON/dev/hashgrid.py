@@ -148,7 +148,7 @@ class HashGrid(nn.Module):
         # Apply softplus to enforce var > 0 (following Kendall & Gal 2017)
         # softplus(x) = log(1 + exp(x)), is smooth and always positive
         # Add minimum variance for numerical stability
-        variance = F.softplus(raw_var) + 1e-4
+        variance = F.softplus(raw_var,beta=0.5) + 1e-4
         
         # Only normalize mean if requested (for inference/similarity computation)
         if normalize:

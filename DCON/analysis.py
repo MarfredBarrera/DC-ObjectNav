@@ -318,10 +318,10 @@ class Visualizer:
             box_z_size = side_length
             
             from matplotlib.patches import Rectangle
-            rect = Rectangle((center_x - box_x_size/2, center_z - box_z_size/2), 
+            epi_rect = Rectangle((center_x - box_x_size/2, center_z - box_z_size/2), 
                            box_x_size, box_z_size,
                            linewidth=2, edgecolor='red', facecolor='none', linestyle='--')
-            ax_epi.add_patch(rect)
+            ax_epi.add_patch(epi_rect)
 
             epi_explored_rect = Rectangle((center_x_explored - explored_side/2, center_z_explored - explored_side/2),
                                         explored_side, explored_side,
@@ -332,6 +332,12 @@ class Visualizer:
                                         explored_side, explored_side,
                                         linewidth=2, edgecolor='green', facecolor='none', linestyle='--')
             ax_ale.add_patch(ale_explored_rect)
+
+            ale_rect = Rectangle((center_x - box_x_size/2, center_z - box_z_size/2), 
+                           box_x_size, box_z_size,
+                           linewidth=2, edgecolor='red', facecolor='none', linestyle='--')
+
+            ax_ale.add_patch(ale_rect)
             
             # Stats text
             epi_stats_text = (
@@ -432,7 +438,7 @@ class Visualizer:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
         
         # Epistemic uncertainty
-        ax1.plot(epochs, epi_avgs, marker='o', color='red', linewidth=2, markersize=6)
+        ax1.plot(epochs, epi_avgs, marker='o', color='red', linewidth=2, markersize=6, label='Unexplored Patch')
         ax1.plot(epochs, epi_expl_avgs, marker='s', color='green', linewidth=2, markersize=6, label='Explored Patch')
         ax1.set_xlabel('Training Step', fontsize=12)
         ax1.set_ylabel('Average Epistemic Uncertainty', fontsize=12)
@@ -442,7 +448,7 @@ class Visualizer:
 
         
         # Aleatoric uncertainty
-        ax2.plot(epochs, ale_avgs, marker='s', color='blue', linewidth=2, markersize=6)
+        ax2.plot(epochs, ale_avgs, marker='s', color='blue', linewidth=2, markersize=6, label='Unexplored Patch')
         ax2.plot(epochs, ale_expl_avgs, marker='s', color='green', linewidth=2, markersize=6, label='Explored Patch')
         ax2.set_xlabel('Training Step', fontsize=12)
         ax2.set_ylabel('Average Aleatoric Uncertainty', fontsize=12)
@@ -468,7 +474,7 @@ if __name__ == "__main__":
     extent = [visualizer.bev_grid.bev_min_x, visualizer.bev_grid.bev_max_x, 
               visualizer.bev_grid.bev_min_z, visualizer.bev_grid.bev_max_z]
     grid_size = (visualizer.bev_grid.bev_width, visualizer.bev_grid.bev_height)
-    center_x, center_z = 4, -2  # Submap center in meters
+    center_x, center_z = 4, -3 # Submap center in meters
     side_length = 1  # Submap size in meters
     box = (center_x, center_z, side_length)
     grid_params = (extent, grid_size, box)

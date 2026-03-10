@@ -140,23 +140,15 @@ while True:
     rgb = obs["rgb"]
     depth = obs["depth"]
 
-    current_matrix = get_camera_matrix(agent)
-    pose_matrices.append(current_matrix)
+
 
     # window display of RGB
     cv2_img = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
     small_img = cv2.resize(cv2_img, (512, 512))
     cv2.imshow("Habitat Agent View", small_img)
 
-    # save RGB
-    rgb_imgs.append(cv2_img)
-    # save depth as numpy array (meters)
-    depth_imgs.append(depth)
 
-    # save depth as visualization image
-    # Normalize depth to 0-255 for visualization
-    depth_vis = np.clip(depth * 255 / 10.0, 0, 255).astype(np.uint8)  # Assume max 10m range
-    cv2.imwrite(f"{output_dir}/depth_vis/depth_vis_{i:03d}.png", depth_vis)
+
 
     print("Waiting for input...")
     key = cv2.waitKey(0)
@@ -168,7 +160,6 @@ while True:
     elif key == ord('w'):
         sim.step("move_forward")
         print("Action: Move Forward")
-
         
     # Left (Left Arrow or 'a')
     elif key == ord('a'):
@@ -179,6 +170,19 @@ while True:
     elif key == ord('d'):
         sim.step("turn_right")
         print("Action: Right")
+
+    elif key == ord('c'):
+        print("Action: Camera saved")
+        current_matrix = get_camera_matrix(agent)
+        pose_matrices.append(current_matrix)
+        # save RGB
+        rgb_imgs.append(cv2_img)
+        # save depth as numpy array (meters)
+        depth_imgs.append(depth)
+        # save depth as visualization image
+        # Normalize depth to 0-255 for visualization
+        depth_vis = np.clip(depth * 255 / 10.0, 0, 255).astype(np.uint8)  # Assume max 10m range
+        cv2.imwrite(f"{output_dir}/depth_vis/depth_vis_{i:03d}.png", depth_vis)
 
     i += 1
 

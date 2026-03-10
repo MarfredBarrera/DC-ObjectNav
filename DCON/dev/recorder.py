@@ -103,8 +103,8 @@ class BEVGrid:
         else:
             min_y, max_y = height_filter
         
-        print(f"Running forward pass on {self.bev_width}x{self.bev_height} grid...")
-        print(f"Height range: [{min_y:.2f}, {max_y:.2f}]m with {height_samples} samples")
+        # print(f"Running forward pass on {self.bev_width}x{self.bev_height} grid...")
+        # print(f"Height range: [{min_y:.2f}, {max_y:.2f}]m with {height_samples} samples")
         
         # Generate all grid cell centers
         x_coords = np.linspace(
@@ -163,8 +163,8 @@ class BEVGrid:
             epi_uncertainties.append(epistemic_uncertainty.cpu())
             ale_uncertainties.append(aleatoric_uncertainty.cpu())
             
-            if (i + 1) % 10 == 0 or (i + 1) == num_batches:
-                print(f"  Batch {i+1}/{num_batches} complete")
+            # if (i + 1) % 10 == 0 or (i + 1) == num_batches:
+            #     print(f"  Batch {i+1}/{num_batches} complete")
         
         # Concatenate all batches
         epi_uncertainties = torch.cat(epi_uncertainties, dim=0)

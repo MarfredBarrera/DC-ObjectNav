@@ -1,8 +1,11 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
+import gc
 import json
+import tracemalloc
 import math
+import random
 import time
 import torch
 import numpy as np
@@ -40,6 +43,9 @@ class Runner:
         ]
 
         self.recorder = BEVGrid(cfg, ensemble=self.ensemble_models)
+        
+        # Sequential sampling: track current image index
+        self.current_image_idx = 0
 
 
     def _load_scene_data(self):
@@ -65,7 +71,7 @@ class Runner:
             # RGB
             rgb_path = os.path.join(self.cfg.output_dir, frame['file_path'])
             rgb = imageio.imread(rgb_path)
-            gt_images.append(torch.from_numpy(rgb).float().to(self.device) / 255.0)
+            gt_images.append(torch.from_numpy(rgb).float() / 255.0)
 
             # Depth
             depth_name = os.path.basename(frame['file_path']).replace("rgb", "depth").replace(".png", ".npy")
@@ -73,26 +79,33 @@ class Runner:
             depth = np.load(depth_path)
             if depth.shape[:2] != (H, W):
                 depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
-            gt_depths.append(torch.from_numpy(depth).float().to(self.device))
+            gt_depths.append(torch.from_numpy(depth).float())
 
             # Pose
             c2w_hab = np.array(frame['transform_matrix'])
             c2w_cv = c2w_hab @ convert_mat
-            c2w_matrices.append(torch.from_numpy(c2w_cv).float().to(self.device))
+            c2w_matrices.append(torch.from_numpy(c2w_cv).float())
 
         return torch.stack(gt_images), torch.stack(gt_depths), torch.stack(c2w_matrices), (fx, fy, cx, cy, H, W)
     
     def sample_rgb(self, idx=None):
 
         if idx is None:
-            idx = torch.randint(0, len(self.gt_images), (1,)).item()
-        depth = self.gt_depths[idx]
-        rgb = self.gt_images[idx]
-        c2w_hash = self.c2ws[idx]
-        
-        rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
+            # Use sequential sampling instead of random
+            idx = self.current_image_idx
+            self.current_image_idx = (self.current_image_idx + 1) % len(self.gt_images)
+
+        # Move data for current frame to GPU for processing
+        depth = self.gt_depths[idx].to(self.device)
+        rgb = self.gt_images[idx]  # Stays on CPU for sam_clip
+        c2w_hash = self.c2ws[idx].to(self.device)
+
+        rgb_np = (rgb.numpy() * 255).astype(np.uint8)
+
+        # Feature extraction on GPU
         clip_features = self.sam_clip.extract_dense_features(rgb_np)
         
+        # Unprojection on GPU
         mask = (depth > 0.1) & (depth < 10.0)
         world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device, mask=mask)
         gt_features = clip_features[mask]
@@ -102,88 +115,186 @@ class Runner:
         world_points = world_points[valid_mask]
         gt_features = gt_features[valid_mask]
 
-        return world_points, gt_features
+        # Return CPU tensors to save VRAM
+        return world_points.cpu(), gt_features.cpu()
     
     def train_ensemble(self, save_enabled=False):
 
         viz_interval = self.cfg.viz_interval
+        mini_batch_size = self.cfg.hash_train_batch_size
+        
+        # Portion of batch to be sampled from the most recent image
+        recent_sample_portion = 0.2
+        
+        # Use a list to store history on CPU
+        global_point_buffer = []
+        
+        # Limit buffer size to avoid excessive RAM usage
+        max_buffer_frames = self.cfg.hash_replay_buffer_size # Re-using this config value
+        
+        min_frames_to_start = 3
 
-        buf_size = self.cfg.hash_replay_buffer_size
-        replay_buffer = deque(maxlen=buf_size)
-        refresh_interval = self.cfg.hash_buffer_refresh_interval 
-
-        print(f"Initializing replay buffer with {buf_size} samples...")
-        for i in range(buf_size):
+        print(f"Initializing history buffer (start training after {min_frames_to_start} frames)...")
+        for i in range(min_frames_to_start):
+            # sample_rgb returns CPU tensors
             world_points, gt_features = self.sample_rgb()
-            valid_mask = gt_features.norm(dim=-1) > 1e-6  # Remove near-zero norm features
-            world_points = world_points[valid_mask]
-            gt_features = gt_features[valid_mask]
-
-            replay_buffer.append((world_points, gt_features))
-            print(f"  Buffered sample {i+1}/{buf_size}")
             
-            # Free memory after each sample
-            if i % 3 == 2:  # Every 3 samples
-                torch.cuda.empty_cache()
+            global_point_buffer.append((world_points, gt_features))
+            print(f"  Buffered frame {i+1}/{min_frames_to_start}")
+            torch.cuda.empty_cache()
 
-        world_points = torch.cat([x[0] for x in replay_buffer], dim=0)
-        gt_features = torch.cat([x[1] for x in replay_buffer], dim=0)
+        refresh_interval = self.cfg.hash_buffer_refresh_interval
+        staging_size = mini_batch_size * refresh_interval
 
-        torch.cuda.empty_cache()
-        batch_size = min(self.cfg.hash_train_batch_size, world_points.shape[0])
+        super_points_gpu = None
+        super_features_gpu = None
 
+        tracemalloc.start()
+        snapshot_before_refresh = tracemalloc.take_snapshot()
         start_time = time.time()
 
-        for step in range(self.cfg.iterations+1):
-            # Sample a batch from concatenated data
-            batch_indx = torch.randperm(world_points.shape[0], device=world_points.device)[:batch_size]
-            batch_points = world_points[batch_indx]
-            batch_features = gt_features[batch_indx]
+        for step in range(self.cfg.iterations + 1):
+            # --- Staging and Refresh Logic ---
+            if step % refresh_interval == 0:
+                # 1. Refresh CPU buffer (if not the very first step)
+                if step > 0:
+                    print(f"Refreshing history buffer...")
+                    
+                    # If buffer is full, explicitly remove oldest element BEFORE sampling new data
+                    if len(global_point_buffer) >= max_buffer_frames:
+                        old_points, old_features = global_point_buffer.pop(0)
+                        del old_points, old_features
+                        gc.collect() # Force collection of old tensors before new allocation
+                        torch.cuda.empty_cache() # Clear GPU cache if any GPU tensors were involved in old_points/features
 
+                    new_points, new_features = self.sample_rgb()
+                    global_point_buffer.append((new_points, new_features))
+                    gc.collect()
+                    torch.cuda.empty_cache() # Clear GPU cache again
+                    
+                    buffer_status = f"{len(global_point_buffer)}/{max_buffer_frames}"
+                    print(f"Buffer updated (frames: {buffer_status}, total frames processed: {self.current_image_idx})")
+
+                # 2. Stage a new super-batch to the GPU
+                if super_points_gpu is not None:
+                    del super_points_gpu, super_features_gpu
+                    torch.cuda.empty_cache()
+                
+                print(f"\n--- Staging new super-batch for steps {step}-{step+refresh_interval-1} ---")
+
+                # --- New memory-efficient staging ---
+                # A. First, calculate the total size of the super-batch without moving anything to GPU
+                total_points_to_stage = 0
+                
+                # From recent frame
+                recent_points, recent_features = global_point_buffer[-1]
+                staging_size_recent = int(staging_size * recent_sample_portion)
+                if recent_points.shape[0] > 0:
+                    num_samples_recent = min(staging_size_recent, recent_points.shape[0])
+                    total_points_to_stage += num_samples_recent
+
+                # From historical frames
+                staging_size_history = staging_size - staging_size_recent
+                history_buffer = global_point_buffer[:-1]
+                frames_to_sample_from = []
+                points_per_frame = 0
+                k = 0
+                if history_buffer and staging_size_history > 0:
+                    num_frames_to_sample = 5
+                    k = min(len(history_buffer), num_frames_to_sample)
+                    if k > 0:
+                        points_per_frame = staging_size_history // k
+                        frames_to_sample_from = random.sample(history_buffer, k)
+                        for pts, fts in frames_to_sample_from:
+                            if pts.shape[0] > 0:
+                                num_to_sample = min(points_per_frame, pts.shape[0])
+                                total_points_to_stage += num_to_sample
+                
+                if total_points_to_stage == 0:
+                    print("Warning: Cannot create super-batch, not enough data. Skipping stage.")
+                    super_points_gpu = None
+                    super_features_gpu = None
+                else:
+                    # B. Pre-allocate the final tensors on the GPU
+                    super_points_gpu = torch.empty(total_points_to_stage, 3, device=self.device, dtype=torch.float32)
+                    super_features_gpu = torch.empty(total_points_to_stage, self.cfg.hash_feature_dim, device=self.device, dtype=torch.float32)
+                    
+                    current_pos = 0
+
+                    # C. Iterate again, sample, move chunk to GPU, copy, and delete chunk
+                    # From recent frame
+                    if recent_points.shape[0] > 0:
+                        num_samples = min(staging_size_recent, recent_points.shape[0])
+                        indices = torch.randint(0, recent_points.shape[0], (num_samples,))
+                        
+                        points_chunk_gpu = recent_points[indices].to(self.device)
+                        features_chunk_gpu = recent_features[indices].to(self.device)
+                        
+                        super_points_gpu[current_pos : current_pos + num_samples] = points_chunk_gpu
+                        super_features_gpu[current_pos : current_pos + num_samples] = features_chunk_gpu
+                        current_pos += num_samples
+                        
+                        del points_chunk_gpu, features_chunk_gpu
+
+                    # From historical frames
+                    if history_buffer and staging_size_history > 0 and k > 0:
+                        for pts, fts in frames_to_sample_from:
+                            if pts.shape[0] > 0:
+                                num_to_sample = min(points_per_frame, pts.shape[0])
+                                indices = torch.randint(0, pts.shape[0], (num_to_sample,))
+                                
+                                points_chunk_gpu = pts[indices].to(self.device)
+                                features_chunk_gpu = fts[indices].to(self.device)
+
+                                super_points_gpu[current_pos : current_pos + num_to_sample] = points_chunk_gpu
+                                super_features_gpu[current_pos : current_pos + num_to_sample] = features_chunk_gpu
+                                current_pos += num_to_sample
+
+                                del points_chunk_gpu, features_chunk_gpu
+                    
+                    print(f"Staged {super_points_gpu.shape[0]} points to GPU.")
+
+                # 4. Clean up and empty cache
+                gc.collect()
+
+                # --- Memory Profiling with tracemalloc ---
+                # Snapshot AFTER the entire refresh process (CPU and GPU staging)
+                if step > 0: # Only compare if it's not the first refresh
+                    snapshot_after_refresh = tracemalloc.take_snapshot()
+                    top_stats = snapshot_after_refresh.compare_to(snapshot_before_refresh, 'lineno')
+                    print("\n[ Top 10 CPU memory differences during this refresh cycle ]")
+                    for stat in top_stats[:10]:
+                        print(stat)
+                    snapshot_before_refresh = snapshot_after_refresh # Update baseline for next cycle
+                # --- GPU Memory Profiling ---
+                print("\n--- GPU Memory Summary after Staging ---")
+                print(torch.cuda.memory_summary(device=self.device))
+                # ----------------------------
+                torch.cuda.empty_cache()
+
+            # --- Batch Sampling from GPU Super-batch ---
+            if super_points_gpu is None or super_points_gpu.shape[0] < mini_batch_size:
+                continue
+
+            batch_idx = torch.randint(0, super_points_gpu.shape[0], (mini_batch_size,), device=self.device)
+            batch_points = super_points_gpu[batch_idx]
+            batch_features = super_features_gpu[batch_idx]
+
+            # --- Training ---
             loss = 0
             for model in self.ensemble_models:
-                loss += model.train_step(batch_points, batch_features)
-            avg_loss = loss/self.cfg.ensemble_num_models
+                train_loss = model.train_step(batch_points, batch_features)
+                if train_loss is not None:
+                    loss += train_loss
+            avg_loss = loss / self.cfg.ensemble_num_models
 
             # Logging
             if step % 100 == 0:
                 print(f"Step {step:04d} | Train Loss: {avg_loss:.5f} | Time: {time.time()-start_time:.1f}s")
-            
-            # Buffer refresh
-            if step > 0 and step % refresh_interval == 0:
-                
-                # Free old concatenated tensors before refresh
-                del world_points, gt_features
-                torch.cuda.empty_cache()
-                
-                # Sample new data and add to buffer
-                sample_points, sample_features = self.sample_rgb()
-                valid_mask = sample_features.norm(dim=-1) > 1e-6
-                sample_points = sample_points[valid_mask]
-                sample_features = sample_features[valid_mask]
-                
-                # Add to buffer - oldest entry automatically removed due to maxlen
-                replay_buffer.append((sample_points, sample_features))
-                
-                # Refresh concatenated training data from updated buffer
-                world_points = torch.cat([x[0] for x in replay_buffer], dim=0).clone()
-                gt_features = torch.cat([x[1] for x in replay_buffer], dim=0).clone()
-                batch_size = min(self.cfg.hash_train_batch_size, world_points.shape[0])
-                
-                torch.cuda.empty_cache()
-                print(f"Buffer updated")
 
-                # if save_enabled:
-                #     # save uncertainty map
-                #     self.uncertainty_snapshot(step)
-            if save_enabled:
-                if step % viz_interval == 0:
-                    # save uncertainty map
-                    self.uncertainty_snapshot(step)
-
-        # # save last step uncertainty map    
-        # if save_enabled:
-        #     self.uncertainty_snapshot(step)
+            # --- Visualization/Saving ---
+            if save_enabled and step > 0 and step % viz_interval == 0:
+                self.uncertainty_snapshot(step)
 
 
     def uncertainty_snapshot(self, step):
@@ -221,4 +332,3 @@ if __name__ == "__main__":
 
     runner.train_ensemble(save_enabled=True)
     runner.save_models()
-
