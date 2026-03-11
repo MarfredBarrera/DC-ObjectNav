@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 import gc
 import json
@@ -130,7 +130,7 @@ class Runner:
         global_point_buffer = []
         
         # Limit buffer size to avoid excessive RAM usage
-        max_buffer_frames = self.cfg.hash_replay_buffer_size # Re-using this config value
+        max_buffer_frames = self.cfg.hash_replay_buffer_size
         
         min_frames_to_start = 3
 
@@ -149,8 +149,6 @@ class Runner:
         super_points_gpu = None
         super_features_gpu = None
 
-        tracemalloc.start()
-        snapshot_before_refresh = tracemalloc.take_snapshot()
         start_time = time.time()
 
         for step in range(self.cfg.iterations + 1):
@@ -193,18 +191,17 @@ class Runner:
                     num_samples_recent = min(staging_size_recent, recent_points.shape[0])
                     total_points_to_stage += num_samples_recent
 
-                # From historical frames
+                # From historical frames (sample from ALL frames)
                 staging_size_history = staging_size - staging_size_recent
                 history_buffer = global_point_buffer[:-1]
                 frames_to_sample_from = []
                 points_per_frame = 0
                 k = 0
                 if history_buffer and staging_size_history > 0:
-                    num_frames_to_sample = 5
-                    k = min(len(history_buffer), num_frames_to_sample)
+                    k = len(history_buffer)  # Use all historical frames
                     if k > 0:
                         points_per_frame = staging_size_history // k
-                        frames_to_sample_from = random.sample(history_buffer, k)
+                        frames_to_sample_from = history_buffer  # Sample from all frames
                         for pts, fts in frames_to_sample_from:
                             if pts.shape[0] > 0:
                                 num_to_sample = min(points_per_frame, pts.shape[0])
@@ -256,20 +253,6 @@ class Runner:
 
                 # 4. Clean up and empty cache
                 gc.collect()
-
-                # --- Memory Profiling with tracemalloc ---
-                # Snapshot AFTER the entire refresh process (CPU and GPU staging)
-                if step > 0: # Only compare if it's not the first refresh
-                    snapshot_after_refresh = tracemalloc.take_snapshot()
-                    top_stats = snapshot_after_refresh.compare_to(snapshot_before_refresh, 'lineno')
-                    print("\n[ Top 10 CPU memory differences during this refresh cycle ]")
-                    for stat in top_stats[:10]:
-                        print(stat)
-                    snapshot_before_refresh = snapshot_after_refresh # Update baseline for next cycle
-                # --- GPU Memory Profiling ---
-                print("\n--- GPU Memory Summary after Staging ---")
-                print(torch.cuda.memory_summary(device=self.device))
-                # ----------------------------
                 torch.cuda.empty_cache()
 
             # --- Batch Sampling from GPU Super-batch ---

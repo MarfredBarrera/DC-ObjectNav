@@ -148,7 +148,7 @@ class HashGrid(nn.Module):
         # Apply softplus to enforce var > 0 (following Kendall & Gal 2017)
         # softplus(x) = log(1 + exp(x)), is smooth and always positive
         # Add minimum variance for numerical stability
-        variance = F.softplus(raw_var,beta=0.5) + 1e-4
+        variance = F.softplus(raw_var,beta=0.25) + 1e-4
         
         # Only normalize mean if requested (for inference/similarity computation)
         if normalize:
@@ -199,6 +199,8 @@ class HashGrid(nn.Module):
         
         nll = 0.5 * (constant_term + log_var + sse / variance)
         loss = nll.mean()
+
+        torch.nan_to_num(loss, nan=0.0, posinf=1e6, neginf=-1e6)
         
         if torch.isnan(loss):
             print(f"NaN loss detected! Skipping step...")

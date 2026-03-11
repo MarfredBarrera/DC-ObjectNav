@@ -8,8 +8,8 @@ paths:
 
 habitat:
   scene_path: "/workspace/DCON/gibson_scenes/Anaheim.glb"
-  img_width: 720
-  img_height: 720
+  img_width: 512
+  img_height: 512
   fov: 90
   data_queue_size: 30
   training_queue_size: 20
