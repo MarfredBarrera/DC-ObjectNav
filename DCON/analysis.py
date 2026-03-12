@@ -14,12 +14,12 @@ from matplotlib.colors import LogNorm
 from collections import deque
 
 # Custom Imports
-from dev.config import Config
-from dev.gaussians import GaussianSplatting
-from dev.semantics import SAM_CLIP_Semantics
-from dev.utils import unprojection
-from dev.hashgrid import HashGrid
-from dev.recorder import BEVGrid
+from src.config import Config
+from src.gaussians import GaussianSplatting
+from src.semantics import SAM_CLIP_Semantics
+from src.utils import unprojection
+from src.hashgrid import HashGrid
+from src.recorder import BEVGrid
 
 class Visualizer:
     def __init__(self, cfg: Config):
@@ -259,10 +259,20 @@ class Visualizer:
         ale_expl_avgs = []
         frames_data = []
         
+        # Track shapes to debug inhomogeneous arrays
+        shapes_seen = {}
+        
         for step in epochs:
             bev_maps = self.load_bev_maps(step)
             if bev_maps[0] is not None:
                 epi_map, ale_map = bev_maps
+                
+                # Track shapes
+                epi_shape = epi_map.shape
+                if epi_shape not in shapes_seen:
+                    shapes_seen[epi_shape] = []
+                shapes_seen[epi_shape].append(step)
+                
                 epi_avg = self.get_submap_avg(epi_map, extent, center_x, center_z, side_length)
                 ale_avg = self.get_submap_avg(ale_map, extent, center_x, center_z, side_length)
                 epi_expl_avg = self.get_submap_avg(epi_map, extent, center_x_explored, center_z_explored, explored_side)
@@ -275,21 +285,30 @@ class Visualizer:
                 ale_expl_avgs.append(ale_expl_avg)
                 frames_data.append((step, epi_map, ale_map))
         
+        # Report shape inconsistencies
+        if len(shapes_seen) > 1:
+            print(f"\nWARNING: Found {len(shapes_seen)} different shapes across BEV maps:")
+            for shape, steps in shapes_seen.items():
+                print(f"  Shape {shape}: steps {steps}")
+        else:
+            print(f"\nAll BEV maps have consistent shape: {list(shapes_seen.keys())[0]}")
+        
         if not frames_data:
             print("No BEV maps found!")
             return
         
         # Calculate global color scale limits for consistent visualization
-        all_epi_maps = np.array([epi_map for _, epi_map, _ in frames_data])
-        all_ale_maps = np.array([ale_map for _, _, ale_map in frames_data])
+        # Concatenate flattened arrays to handle maps with different shapes
+        all_epi_values = np.concatenate([epi_map.flatten() for _, epi_map, _ in frames_data])
+        all_ale_values = np.concatenate([ale_map.flatten() for _, _, ale_map in frames_data])
         
         # Use log scale for both epistemic and aleatoric for consistency
         # Avoid zero/negative values by using a small epsilon or percentile floor
-        epi_vmin = max(np.percentile(all_epi_maps, 1), 1e-10)  # Use 1st percentile to avoid zeros
-        epi_vmax = np.percentile(all_epi_maps, 90)
+        epi_vmin = max(np.percentile(all_epi_values, 1), 1e-10)  # Use 1st percentile to avoid zeros
+        epi_vmax = np.percentile(all_epi_values, 90)
         
-        ale_vmin = max(np.percentile(all_ale_maps, 1), 1e-10)  # Use 1st percentile to avoid zeros
-        ale_vmax = np.percentile(all_ale_maps, 98)
+        ale_vmin = max(np.percentile(all_ale_values, 1), 1e-10)  # Use 1st percentile to avoid zeros
+        ale_vmax = np.percentile(all_ale_values, 98)
         
         print(f"Epistemic scale: [{epi_vmin:.6e}, {epi_vmax:.6e}] (1st-95th percentile)")
         print(f"Aleatoric scale: [{ale_vmin:.6e}, {ale_vmax:.6e}] (1st-98th percentile)")
@@ -466,7 +485,7 @@ if __name__ == "__main__":
     visualizer = Visualizer(config)
     
     # # Example 1: Visualize a single BEV map
-    # bev_maps = visualizer.load_bev_maps(step=50000)
+    # bev_maps = visualizer.load_bev_maps(step=8000)
     # visualizer.visualize_bev_map(bev_maps)
     
     # Example 2: Create animated history of BEV maps over training

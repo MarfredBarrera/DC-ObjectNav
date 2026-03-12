@@ -11,19 +11,21 @@ import torch
 import numpy as np
 import cv2
 import magnum as mn
+import matplotlib.pyplot as plt
+
+# User Dev Imports
+from src.recorder import BEVGrid
+from src.config import Config
+from src.gaussians import GaussianSplatting
+from src.semantics import SAM_CLIP_Semantics
+from src.utils import unprojection
+from src.hashgrid import HashGrid
 
 # Habitat Imports
 import habitat_sim
 import habitat_sim.utils.common as utils
 import habitat_sim.physics as physics
 
-# User Dev Imports
-from dev.recorder import BEVGrid
-from dev.config import Config
-from dev.gaussians import GaussianSplatting
-from dev.semantics import SAM_CLIP_Semantics
-from dev.utils import unprojection
-from dev.hashgrid import HashGrid
 
 # Silence habitat-sim warnings and logs
 os.environ['GLOG_minloglevel'] = '2'
@@ -79,10 +81,8 @@ def make_cfg(scene_filepath):
     return habitat_sim.Configuration(sim_cfg, [agent_cfg])
 
 
-# --------------------------------------------------------
-# Online Runner Class
-# --------------------------------------------------------
-class OnlineRunner:
+
+class Planner:
     def __init__(self, cfg: Config, sim, agent):
         self.cfg = cfg
         self.device = self.cfg.device
@@ -116,8 +116,89 @@ class OnlineRunner:
         ]
 
         self.recorder = BEVGrid(cfg, ensemble=self.ensemble_models)
+        self.umap = None
 
-    def step_simulator(self, u, dt=0.5):
+    def set_umap(self, step=20000):
+        epi_map, _ = self.load_umap(step=step)
+        self.umap = epi_map
+    
+    def load_umap(self, step=20000):
+        umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
+        epi_path = os.path.join(umaps_dir, f"bev_epistemic_uncertainty_{step}.npy")
+        ale_path = os.path.join(umaps_dir, f"bev_aleatoric_uncertainty_{step}.npy")
+        
+        if os.path.exists(epi_path) and os.path.exists(ale_path):
+            bev_epi_umap = np.load(epi_path)
+            bev_ale_umap = np.load(ale_path)
+            return bev_epi_umap, bev_ale_umap
+        else:
+            print(f"BEV maps for step {step} not found in {umaps_dir}")
+            return None, None
+        
+    def load_ensemble(self):
+        """Loads the ensemble HashGrid models from the output directory."""
+        ensemble_models = []
+        ensemble_dir = os.path.join(self.cfg.output_dir, "ensemble")
+        
+        if not os.path.exists(ensemble_dir):
+            print(f"Error: Ensemble directory not found at {ensemble_dir}")
+            return
+
+        print("Loading Ensemble Models...")
+        for i in range(self.cfg.ensemble_num_models):
+            model_path = os.path.join(ensemble_dir, f"hashgrid_ensemble_{i}.pt")
+            if os.path.exists(model_path):
+                # Initialize a new HashGrid instance
+                model = HashGrid(self.cfg, device=self.device)
+                model.load(model_path)
+                ensemble_models.append(model)
+                print(f"  -> Loaded Ensemble Model {i}")
+            else:
+                print(f"  -> Warning: Model {i} not found at {model_path}")
+
+        return ensemble_models
+
+    def viz_umap(self):
+
+        bev_epi_2d = self.umap
+        if bev_epi_2d is not None:
+            fig, axes = plt.subplots(figsize=(12,6))
+            extent = [self.recorder.bev_min_x, self.recorder.bev_max_x, self.recorder.bev_min_z, self.recorder.bev_max_z]
+
+            # Epistemic Uncertainty Map
+            im1 = axes.imshow(bev_epi_2d, cmap='magma', origin='lower', aspect='equal', extent=extent)
+            axes.set_xlabel('X Position (m)', fontsize=12)
+            axes.set_ylabel('Z Position (m)', fontsize=12)
+            axes.set_title(r"Epistemic Uncertainty: $\mathbb{V}[\mu_\theta]$", fontsize=10)
+            plt.colorbar(im1, ax=axes, fraction=0.046, pad=0.04)
+
+            # Add statistics text
+            epi_stats_text = (
+                f'Min: {bev_epi_2d.min():.6f}\n'
+                f'Max: {bev_epi_2d.max():.6f}\n'
+                f'Mean: {bev_epi_2d.mean():.6f}\n'
+                f'Std: {bev_epi_2d.std():.6f}'
+            )
+            axes.text(
+                0.01, 1.05, epi_stats_text,
+                transform=axes.transAxes,
+                fontsize=10,
+                verticalalignment='bottom',
+                horizontalalignment='left',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+            )
+            axes.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+            plt.tight_layout()
+            plt.show()
+        else:
+            print("Unable to visualize BEV maps due to missing data.")
+
+    def get_ensemble_mean(self):
+        
+        return
+
+
+    def step_simulator(self, u, dt=0.1):
         """
         Advances the agent kinematically using the control input u.
         u: [forward_velocity, yaw_angular_velocity]
@@ -161,185 +242,14 @@ class OnlineRunner:
 
         return rgb_tensor, depth_tensor, c2w_tensor
 
-    def sample_rgb(self):
-        """Extracts features and unprojects points from the current agent observation."""
-        # 1. Fetch current frame from Habitat
-        rgb, depth, c2w_hash = self.get_observations()
 
-        # 2. Move specific tensors to GPU for processing
-        depth = depth.to(self.device)
-        c2w_hash = c2w_hash.to(self.device)
 
-        rgb_np = (rgb.numpy() * 255).astype(np.uint8)
-
-        # 3. Feature extraction on GPU
-        clip_features = self.sam_clip.extract_dense_features(rgb_np)
         
-        # 4. Unprojection on GPU
-        mask = (depth > 0.1) & (depth < 10.0)
-        world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device, mask=mask)
-        gt_features = clip_features[mask]
 
-        # 5. Filter zero-norm features
-        valid_mask = gt_features.norm(dim=-1) > 1e-6
-        world_points = world_points[valid_mask]
-        gt_features = gt_features[valid_mask]
 
-        # Return CPU tensors to save VRAM
-        return world_points.cpu(), gt_features.cpu()
 
-    def _super_batch(self, global_point_buffer, staging_size, recent_sample_portion):
-        """
-        Prepare a super-batch for training by sampling from the global point buffer.
-        
-        Args:
-            global_point_buffer: List of (points, features) tuples from observation history
-            staging_size: Total number of points to stage on GPU
-            recent_sample_portion: Fraction of staging_size to sample from most recent frame
-            
-        Returns:
-            super_points_gpu: Concatenated points tensor on GPU (or None if insufficient data)
-            super_features_gpu: Concatenated features tensor on GPU (or None if insufficient data)
-        """
-        gpu_points_chunks = []
-        gpu_features_chunks = []
-        
-        # A. Sample from the most recent frame
-        recent_points, recent_features = global_point_buffer[-1]
-        staging_size_recent = int(staging_size * recent_sample_portion)
-        
-        if recent_points.shape[0] > 0:
-            num_samples_recent = min(staging_size_recent, recent_points.shape[0])
-            indices = torch.randint(0, recent_points.shape[0], (num_samples_recent,))
-            
-            gpu_points_chunks.append(recent_points[indices].to(self.device))
-            gpu_features_chunks.append(recent_features[indices].to(self.device))
 
-        # B. Sample from historical frames
-        staging_size_history = staging_size - staging_size_recent
-        history_buffer = global_point_buffer[:-1]
-        
-        if history_buffer and staging_size_history > 0:
-            points_per_frame = staging_size_history // len(history_buffer)
-            for pts, fts in history_buffer:
-                if pts.shape[0] > 0:
-                    num_to_sample = min(points_per_frame, pts.shape[0])
-                    indices = torch.randint(0, pts.shape[0], (num_to_sample,))
-                    
-                    gpu_points_chunks.append(pts[indices].to(self.device))
-                    gpu_features_chunks.append(fts[indices].to(self.device))
-        
-        # C. Concatenate into GPU super-batch
-        if not gpu_points_chunks:
-            print("Warning: Cannot create super-batch, not enough data.")
-            return None, None
-        else:
-            super_points_gpu = torch.cat(gpu_points_chunks, dim=0)
-            super_features_gpu = torch.cat(gpu_features_chunks, dim=0)
-            print(f"Staged {super_points_gpu.shape[0]} points to GPU.")
-            return super_points_gpu, super_features_gpu
 
-    def train_ensemble(self, save_enabled=False):
-        viz_interval = self.cfg.viz_interval
-        mini_batch_size = self.cfg.hash_train_batch_size
-        
-        recent_sample_portion = 0.2
-        global_point_buffer = []
-        max_buffer_frames = self.cfg.hash_replay_buffer_size
-        min_frames_to_start = 3
-
-        print(f"Initializing history buffer (start training after {min_frames_to_start} frames)...")
-        for i in range(min_frames_to_start):
-            # Advance Simulator: Spinning in a circle test [lin_vel=0, ang_vel=2.5]
-            u = [0.0, 2.5]
-            self.step_simulator(u)
-            
-            # Gather state observations
-            world_points, gt_features = self.sample_rgb()
-            global_point_buffer.append((world_points, gt_features))
-            print(f"  Buffered frame {i+1}/{min_frames_to_start}")
-            torch.cuda.empty_cache()
-
-        refresh_interval = self.cfg.hash_buffer_refresh_interval
-        staging_size = mini_batch_size * refresh_interval
-
-        super_points_gpu = None
-        super_features_gpu = None
-
-        start_time = time.time()
-
-        for step in range(self.cfg.iterations + 1):
-            if step % refresh_interval == 0:
-                if step > 0:
-                    print(f"Refreshing history buffer...")
-                    if len(global_point_buffer) >= max_buffer_frames:
-                        old_points, old_features = global_point_buffer.pop(0)
-                        del old_points, old_features
-                        gc.collect() 
-                        torch.cuda.empty_cache() 
-
-                    # Control Policy Query (Spinning for now)
-                    u = [0.0, 2.5]
-                    self.step_simulator(u)
-                    
-                    new_points, new_features = self.sample_rgb()
-                    global_point_buffer.append((new_points, new_features))
-                    gc.collect()
-                    torch.cuda.empty_cache() 
-                    
-                    buffer_status = f"{len(global_point_buffer)}/{max_buffer_frames}"
-                    print(f"Buffer updated (frames: {buffer_status}, total frames processed: {self.frames_processed})")
-
-                if super_points_gpu is not None:
-                    del super_points_gpu, super_features_gpu
-                    torch.cuda.empty_cache()
-                
-                print(f"\n--- Staging new super-batch for steps {step}-{step+refresh_interval-1} ---")
-                
-                # Prepare super-batch
-                super_points_gpu, super_features_gpu = self._super_batch(
-                    global_point_buffer, staging_size, recent_sample_portion
-                )
-
-                gc.collect()
-                torch.cuda.empty_cache()
-
-            if super_points_gpu is None or super_points_gpu.shape[0] < mini_batch_size:
-                continue
-
-            # Batch Sampling from GPU Super-batch
-            batch_idx = torch.randint(0, super_points_gpu.shape[0], (mini_batch_size,), device=self.device)
-            batch_points = super_points_gpu[batch_idx]
-            batch_features = super_features_gpu[batch_idx]
-
-            # Forward / Train Step
-            loss = 0
-            for model in self.ensemble_models:
-                train_loss = model.train_step(batch_points, batch_features)
-                if train_loss is not None:
-                    loss += train_loss
-            avg_loss = loss / self.cfg.ensemble_num_models
-
-            if step % 100 == 0:
-                print(f"Step {step:04d} | Train Loss: {avg_loss:.5f} | Time: {time.time()-start_time:.1f}s")
-
-            if save_enabled and step > 0 and step % viz_interval == 0:
-                self.uncertainty_snapshot(step)
-
-    def uncertainty_snapshot(self, step):
-        self.recorder.iteration_num = step
-        self.recorder.forward_pass(height_filter=(0.1,2.0))
-        self.recorder.save_bev_maps()
-        self.recorder.bev_epi_umap = None
-        self.recorder.bev_ale_umap = None
-        torch.cuda.empty_cache()
-
-    def save_models(self):
-        for i, model in enumerate(self.ensemble_models):
-            ensemble_path = os.path.join(self.cfg.output_dir, f"ensemble/hashgrid_ensemble_{i}.pt")
-            os.makedirs(os.path.dirname(ensemble_path), exist_ok=True)
-            model.save(ensemble_path)
-            print(f"Saved Ensemble Model {i} to {ensemble_path}")
 
 # --------------------------------------------------------
 # Main Execution
@@ -368,16 +278,9 @@ if __name__ == "__main__":
         print("Warning: No navmesh found. Agent spawned at origin.")
 
     # 2. Init runner
-    runner_config = Config("config/config.yaml")
-    runner = OnlineRunner(runner_config, sim, agent)
+    cfg = Config("config/config.yaml")
+    planner = Planner(cfg, sim, agent)
+    planner.set_umap(step=30000)
+    planner.viz_umap()
 
-    print("\nStarting Online Training. The agent will spin and sample frames automatically...")
-    
-    # 3. Train
-    runner.train_ensemble(save_enabled=True)
-    runner.save_models()
-
-    # Cleanup
-    cv2.destroyAllWindows()
     sim.close()
-    print("Simulation and Training Complete.")

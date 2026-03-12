@@ -15,12 +15,12 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from collections import deque
 
-from dev.recorder import BEVGrid
-from dev.config import Config
-from dev.gaussians import GaussianSplatting
-from dev.semantics import SAM_CLIP_Semantics
-from dev.utils import unprojection
-from dev.hashgrid import HashGrid
+from src.recorder import BEVGrid
+from src.config import Config
+from src.gaussians import GaussianSplatting
+from src.semantics import SAM_CLIP_Semantics
+from src.utils import unprojection
+from src.hashgrid import HashGrid
 
 class Runner:
     def __init__(self, cfg: Config):
@@ -277,21 +277,21 @@ class Runner:
 
             # --- Visualization/Saving ---
             if save_enabled and step > 0 and step % viz_interval == 0:
-                self.uncertainty_snapshot(step)
+                self.save_uncertainty_snapshot(step)
 
 
-    def uncertainty_snapshot(self, step):
-        """Save the BEV uncertainty maps at a specific training step."""
-        self.recorder.iteration_num = step
-        self.recorder.forward_pass(height_filter=(0.1,2.0))
-        self.recorder.save_bev_maps()
-
-        # Clear the saved BEV maps from GPU memory since they're already saved to disk
-        self.recorder.bev_epi_umap = None
-        self.recorder.bev_ale_umap = None
-
-        torch.cuda.empty_cache()
-        # torch.cuda.reset_peak_memory_stats()
+    def save_uncertainty_snapshot(self, step):
+        """
+        Compute and save uncertainty maps at the current training step.
+        
+        Args:
+            step: Current training iteration number
+        """
+        elapsed = self.recorder.compute_and_save_uncertainty_snapshot(
+            iteration=step,
+            height_filter=(0.1, 2.0)
+        )
+        print(f"Uncertainty snapshot time: {elapsed:.6f}s")
 
 
 
