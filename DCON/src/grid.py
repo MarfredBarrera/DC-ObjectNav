@@ -5,33 +5,16 @@ import os
 
 class BEVGrid:
     """
-    Maintains a 2D Bird's Eye View Grid representing the spatial layout of 
-    features and model uncertainty.
-    
-        - compute_and_save_uncertainty_snapshot(): All-in-one pipeline
-        - forward_pass(): Generate points, run ensemble, compute & store uncertainties
-    
-        1. generate_bev_sample_points(): Create 3D sampling grid
-        2. forward_single(): Run one ensemble member
-        3. forward_ensemble(): Run all ensemble members
-        4. compute_epistemic_uncertainty(): Variance across ensemble
-        5. compute_aleatoric_uncertainty(): Mean predicted variance
-        6. aggregate_height_samples(): Reshape and average along height
-    
+    Base class for 2D Bird's Eye View Grids.
+    Handles grid initialization, dimensions, and coordinate transforms.
     """
-    def __init__(self, config, ensemble):
+    def __init__(self, config, scene_bounds=None, device=None):
         self.cfg = config
-        self.ensemble = ensemble
-        self.device = config.device
+        self.device = device if device else config.device
     
         # BEV Map
         self.bev_resolution = 0.05
         self.bev_initialized = False
-        self.bev_update_active = False
-        
-        # Core Tensors
-        self.bev_epi_umap = None
-        self.bev_ale_umap = None
         
         # Dimensions
         self.bev_width = 0
@@ -41,22 +24,17 @@ class BEVGrid:
         self.bev_min_z = 0.0
         self.bev_max_z = 0.0
         
+        if scene_bounds is not None:
+            self.initialize_from_bounds(scene_bounds)
 
-        self.iteration_num = 0
-
-        self.initialize_bev()
-
-    def initialize_bev(self):
-        """Extracts scene bounds from the ensemble and calculates grid dimensions."""
-        model = self.ensemble[0]
-        
-        # Robustly extract bounds depending on how your HashGrid stores them
-        if hasattr(model, 'scene_bounds'):
-            min_b = model.scene_bounds[0].cpu().numpy()
-            max_b = model.scene_bounds[1].cpu().numpy()
+    def initialize_from_bounds(self, scene_bounds):
+        """Calculates grid dimensions from scene bounds."""
+        if isinstance(scene_bounds, torch.Tensor):
+            min_b = scene_bounds[0].cpu().numpy()
+            max_b = scene_bounds[1].cpu().numpy()
         else:
-            print("Warning: Bounds not found on ensemble. BEV uninitialized.")
-            return
+            min_b = scene_bounds[0]
+            max_b = scene_bounds[1]
         
         # Extract bounds (assuming Y is up, X is left-right, Z is forward-back)
         self.bev_min_x = float(min_b[0])
@@ -77,15 +55,86 @@ class BEVGrid:
         print(f"  X: [{self.bev_min_x:.2f}, {self.bev_max_x:.2f}] m (span: {x_span:.2f} m)")
         print(f"  Z: [{self.bev_min_z:.2f}, {self.bev_max_z:.2f}] m (span: {z_span:.2f} m)")
         print(f"BEV Grid Initialized: {self.bev_width} x {self.bev_height} cells ({self.bev_resolution}m/cell)")
-        
-        # Initialize single-channel map tensors (count and uncertainty)
-        total_cells = self.bev_height * self.bev_width
-        self.bev_uncertainty_map = torch.zeros((total_cells,), device=self.device, dtype=torch.float32)
-        self.bev_count_map = torch.zeros((total_cells,), device=self.device, dtype=torch.int32)
-        
-        print(f"Total cells: {total_cells:,}")
         self.bev_initialized = True
 
+
+class OccupancyGrid(BEVGrid):
+    """
+    Subclass for Binary Occupancy Mapping.
+    Records visited areas on the grid.
+    """
+    def __init__(self, config, scene_bounds, device=None):
+        super().__init__(config, scene_bounds, device)
+        self.occupancy_map = None
+        if self.bev_initialized:
+            self._init_map()
+
+    def initialize_from_bounds(self, scene_bounds):
+        super().initialize_from_bounds(scene_bounds)
+        self._init_map()
+        
+    def _init_map(self):
+        # Initialize zero map (0 = free/unknown, 1 = occupied/visited)
+        # Shape: (Height/Z, Width/X)
+        self.occupancy_map = torch.zeros((self.bev_height, self.bev_width), device=self.device, dtype=torch.uint8)
+
+    def update(self, points):
+        """
+        Update occupancy map with observed points.
+        Args:
+             points: (N, 3) tensor of points in world coordinates.
+        """
+        if not self.bev_initialized: return
+        
+        # Filter points within X/Z bounds
+        mask = (points[:, 0] >= self.bev_min_x) & (points[:, 0] < self.bev_max_x) & \
+               (points[:, 2] >= self.bev_min_z) & (points[:, 2] < self.bev_max_z)
+        valid_points = points[mask]
+        
+        if valid_points.shape[0] == 0: return
+
+        # Map to grid indices
+        x_indices = ((valid_points[:, 0] - self.bev_min_x) / self.bev_resolution).long()
+        z_indices = ((valid_points[:, 2] - self.bev_min_z) / self.bev_resolution).long()
+        
+        # Clamp to be safe
+        x_indices = torch.clamp(x_indices, 0, self.bev_width - 1)
+        z_indices = torch.clamp(z_indices, 0, self.bev_height - 1)
+        
+        # Set occupancy (1 for occupied)
+        self.occupancy_map[z_indices, x_indices] = 1
+
+    def save(self, step):
+        """Save occupancy map to disk."""
+        if self.occupancy_map is not None:
+            occ_maps_dir = os.path.join(self.cfg.output_dir, "occ_maps")
+            os.makedirs(occ_maps_dir, exist_ok=True)
+            path = os.path.join(occ_maps_dir, f"bev_occupancy_{step}.npy")
+            np.save(path, self.occupancy_map.cpu().numpy())
+            print(f"Occupancy map saved to {path}")
+
+
+class UncertaintyGrid(BEVGrid):
+    """
+    Subclass for Uncertainty Mapping (Epistemic & Aleatoric).
+    Maintains a 2D Bird's Eye View Grid representing feature field uncertainty.
+    """
+    def __init__(self, config, ensemble):
+        # Extract bounds from the first model in the ensemble
+        model = ensemble[0]
+        bounds = None
+        if hasattr(model, 'scene_bounds'):
+            bounds = model.scene_bounds
+        else:
+            print("Warning: Bounds not found on ensemble. BEV uninitialized.")
+        
+        super().__init__(config, scene_bounds=bounds, device=config.device)
+        self.ensemble = ensemble
+        self.iteration_num = 0
+        
+        # Core Tensors
+        self.bev_epi_umap = None
+        self.bev_ale_umap = None
     
     def generate_bev_sample_points(self, height_filter=None, height_samples=10):
         """

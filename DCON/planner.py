@@ -14,12 +14,12 @@ import magnum as mn
 import matplotlib.pyplot as plt
 
 # User Dev Imports
-from src.recorder import BEVGrid
+from DCON.src.grid import UncertaintyGrid
 from src.config import Config
 from src.gaussians import GaussianSplatting
 from src.semantics import SAM_CLIP_Semantics
 from src.utils import unprojection
-from src.hashgrid import HashGrid
+from src.featurefield import FeatureField
 
 # Habitat Imports
 import habitat_sim
@@ -111,11 +111,11 @@ class Planner:
         # Semantics and Ensemble Models
         self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
         self.ensemble_models = [
-            HashGrid(self.cfg, device=self.device) 
+            FeatureField(self.cfg, device=self.device) 
             for _ in range(self.cfg.ensemble_num_models)
         ]
 
-        self.recorder = BEVGrid(cfg, ensemble=self.ensemble_models)
+        self.ugrid = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
         self.umap = None
 
     def set_umap(self, step=20000):
@@ -136,7 +136,7 @@ class Planner:
             return None, None
         
     def load_ensemble(self):
-        """Loads the ensemble HashGrid models from the output directory."""
+        """Loads the ensemble FeatureField models from the output directory."""
         ensemble_models = []
         ensemble_dir = os.path.join(self.cfg.output_dir, "ensemble")
         
@@ -146,10 +146,10 @@ class Planner:
 
         print("Loading Ensemble Models...")
         for i in range(self.cfg.ensemble_num_models):
-            model_path = os.path.join(ensemble_dir, f"hashgrid_ensemble_{i}.pt")
+            model_path = os.path.join(ensemble_dir, f"featurefield_ensemble_{i}.pt")
             if os.path.exists(model_path):
-                # Initialize a new HashGrid instance
-                model = HashGrid(self.cfg, device=self.device)
+                # Initialize a new FeatureField instance
+                model = FeatureField(self.cfg, device=self.device)
                 model.load(model_path)
                 ensemble_models.append(model)
                 print(f"  -> Loaded Ensemble Model {i}")
@@ -163,7 +163,7 @@ class Planner:
         bev_epi_2d = self.umap
         if bev_epi_2d is not None:
             fig, axes = plt.subplots(figsize=(12,6))
-            extent = [self.recorder.bev_min_x, self.recorder.bev_max_x, self.recorder.bev_min_z, self.recorder.bev_max_z]
+            extent = [self.ugrid.bev_min_x, self.ugrid.bev_max_x, self.ugrid.bev_min_z, self.ugrid.bev_max_z]
 
             # Epistemic Uncertainty Map
             im1 = axes.imshow(bev_epi_2d, cmap='magma', origin='lower', aspect='equal', extent=extent)

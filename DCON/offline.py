@@ -15,12 +15,12 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from collections import deque
 
-from src.recorder import BEVGrid
+from DCON.src.grid import UncertaintyGrid
 from src.config import Config
 from src.gaussians import GaussianSplatting
 from src.semantics import SAM_CLIP_Semantics
 from src.utils import unprojection
-from src.hashgrid import HashGrid
+from src.featurefield import FeatureField
 
 class Runner:
     def __init__(self, cfg: Config):
@@ -38,11 +38,11 @@ class Runner:
         # Semantics and Ensemble Models
         self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
         self.ensemble_models = [
-            HashGrid(self.cfg, device=self.device) 
+            FeatureField(self.cfg, device=self.device) 
             for _ in range(self.cfg.ensemble_num_models)
         ]
 
-        self.recorder = BEVGrid(cfg, ensemble=self.ensemble_models)
+        self.recorder = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
         
         # Sequential sampling: track current image index
         self.current_image_idx = 0

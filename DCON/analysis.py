@@ -18,8 +18,8 @@ from src.config import Config
 from src.gaussians import GaussianSplatting
 from src.semantics import SAM_CLIP_Semantics
 from src.utils import unprojection
-from src.hashgrid import HashGrid
-from src.recorder import BEVGrid
+from src.featurefield import FeatureField
+from src.grid import UncertaintyGrid
 
 class Visualizer:
     def __init__(self, cfg: Config):
@@ -43,7 +43,7 @@ class Visualizer:
         self.ensemble_models = self.load_ensemble()
 
         # 4. BEV Grid
-        self.bev_grid = BEVGrid(cfg, ensemble=self.ensemble_models)
+        self.bev_grid = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
 
     def _load_scene_data(self):
         json_path = os.path.join(self.cfg.output_dir, "transforms.json")
@@ -97,10 +97,10 @@ class Visualizer:
 
         print("Loading Ensemble Models...")
         for i in range(self.cfg.ensemble_num_models):
-            model_path = os.path.join(ensemble_dir, f"hashgrid_ensemble_{i}.pt")
+            model_path = os.path.join(ensemble_dir, f"featurefield_ensemble_{i}.pt")
             if os.path.exists(model_path):
-                # Initialize a new HashGrid instance
-                model = HashGrid(self.cfg, device=self.device)
+                # Initialize a new FeatureField instance
+                model = FeatureField(self.cfg, device=self.device)
                 model.load(model_path)
                 ensemble_models.append(model)
                 print(f"  -> Loaded Ensemble Model {i}")
@@ -500,5 +500,3 @@ if __name__ == "__main__":
     
     # Create animation (MP4 or GIF)
     visualizer.viz_map_history(grid_params, save_path='bev_history.mp4', fps=2, format='mp4')
-
-

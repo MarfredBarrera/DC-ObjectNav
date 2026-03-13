@@ -10,9 +10,9 @@ import json
 from src.utils import unprojection
 
 
-class HashGrid(nn.Module):
+class FeatureField(nn.Module):
     """
-    HashGrid-based feature field that maps 3D positions to feature vectors.
+    Feature field that maps 3D positions to feature vectors.
     Uses tiny-cuda-nn for efficient hash encoding and MLP.
     Updated to model aleatoric uncertainty using Negative Log-Likelihood (NLL) loss.
     """
@@ -295,7 +295,7 @@ class HashGrid(nn.Module):
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scene_bounds': self.scene_bounds,
         }, path)
-        print(f"HashGrid saved to {path}")
+        print(f"FeatureField saved to {path}")
     
     def load(self, path):
         """Load model state."""
@@ -303,4 +303,4 @@ class HashGrid(nn.Module):
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scene_bounds = checkpoint['scene_bounds']
-        print(f"HashGrid loaded from {path}")
+        print(f"FeatureField loaded from {path}")

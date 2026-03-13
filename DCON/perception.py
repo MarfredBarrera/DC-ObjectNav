@@ -18,12 +18,12 @@ import habitat_sim.utils.common as utils
 import habitat_sim.physics as physics
 
 # User Dev Imports
-from src.recorder import BEVGrid
+from src.grid import UncertaintyGrid
 from src.config import Config
 from src.gaussians import GaussianSplatting
 from src.semantics import SAM_CLIP_Semantics
 from src.utils import unprojection
-from src.hashgrid import HashGrid
+from src.featurefield import FeatureField
 
 # Silence habitat-sim warnings and logs
 os.environ['GLOG_minloglevel'] = '2'
@@ -109,11 +109,11 @@ class Runner:
         # Semantics and Ensemble Models
         self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
         self.ensemble_models = [
-            HashGrid(self.cfg, device=self.device) 
+            FeatureField(self.cfg, device=self.device) 
             for _ in range(self.cfg.ensemble_num_models)
         ]
 
-        self.recorder = BEVGrid(cfg, ensemble=self.ensemble_models)
+        self.ugrid = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
 
     def step_simulator(self, u, dt=0.1):
         """
@@ -331,7 +331,7 @@ class Runner:
         Args:
             step: Current training iteration number
         """
-        elapsed = self.recorder.compute_and_save_uncertainty_snapshot(
+        elapsed = self.ugrid.compute_and_save_uncertainty_snapshot(
             iteration=step,
             height_filter=(0.1, 2.0)
         )
@@ -339,7 +339,7 @@ class Runner:
 
     def save_models(self):
         for i, model in enumerate(self.ensemble_models):
-            ensemble_path = os.path.join(self.cfg.output_dir, f"ensemble/hashgrid_ensemble_{i}.pt")
+            ensemble_path = os.path.join(self.cfg.output_dir, f"ensemble/featurefield_ensemble_{i}.pt")
             os.makedirs(os.path.dirname(ensemble_path), exist_ok=True)
             model.save(ensemble_path)
             print(f"Saved Ensemble Model {i} to {ensemble_path}")
