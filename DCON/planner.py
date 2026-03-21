@@ -14,7 +14,7 @@ import magnum as mn
 import matplotlib.pyplot as plt
 
 # User Dev Imports
-from DCON.src.grid import UncertaintyGrid
+from src.grid import UncertaintyGrid, SimilarityGrid
 from src.config import Config
 from src.gaussians import GaussianSplatting
 from src.semantics import SAM_CLIP_Semantics
@@ -116,11 +116,11 @@ class Planner:
         ]
 
         self.ugrid = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
-        self.umap = None
+        self.sim_map = SimilarityGrid(cfg, ensemble=self.ensemble_models, sam_clip=self.sam_clip)
 
     def set_umap(self, step=20000):
         epi_map, _ = self.load_umap(step=step)
-        self.umap = epi_map
+        self.ugrid.bev_epi_umap = epi_map
     
     def load_umap(self, step=20000):
         umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
@@ -134,6 +134,12 @@ class Planner:
         else:
             print(f"BEV maps for step {step} not found in {umaps_dir}")
             return None, None
+    
+    def get_sim_map(self):
+        return self.sim_map.compute_similarity_map("a photo of a pillow", height_filter = (0.1,1.5))
+    
+    def set_sim_map(self, sim_map):
+        self.sim_map.bev_similarity_map = sim_map
         
     def load_ensemble(self):
         """Loads the ensemble FeatureField models from the output directory."""
@@ -160,7 +166,7 @@ class Planner:
 
     def viz_umap(self):
 
-        bev_epi_2d = self.umap
+        bev_epi_2d = self.ugrid.bev_epi_umap
         if bev_epi_2d is not None:
             fig, axes = plt.subplots(figsize=(12,6))
             extent = [self.ugrid.bev_min_x, self.ugrid.bev_max_x, self.ugrid.bev_min_z, self.ugrid.bev_max_z]
@@ -193,9 +199,46 @@ class Planner:
         else:
             print("Unable to visualize BEV maps due to missing data.")
 
-    def get_ensemble_mean(self):
-        
-        return
+    def viz_sim_map(self):
+        bev_sim_2d = self.sim_map.bev_similarity_map
+        if bev_sim_2d is not None:
+            fig, axes = plt.subplots(figsize=(12,6))
+            extent = [self.sim_map.bev_min_x, self.sim_map.bev_max_x, self.sim_map.bev_min_z, self.sim_map.bev_max_z]
+
+            # Normalize for visualization, excluding bottom 10%
+            if bev_sim_2d.size > 0:
+                vmin = np.percentile(bev_sim_2d, 10)
+                vmax = bev_sim_2d.max()
+            else:
+                vmin, vmax = 0, 1
+
+            # Similarity Map
+            im1 = axes.imshow(bev_sim_2d, cmap='viridis', origin='lower', aspect='equal', extent=extent, vmin=vmin, vmax=vmax)
+            axes.set_xlabel('X Position (m)', fontsize=12)
+            axes.set_ylabel('Z Position (m)', fontsize=12)
+            axes.set_title(r"Similarity Map: $sim_\theta(x)$", fontsize=10)
+            plt.colorbar(im1, ax=axes, fraction=0.046, pad=0.04)
+
+            # Add statistics text
+            sim_stats_text = (
+                f'Min: {bev_sim_2d.min():.6f}\n'
+                f'Max: {bev_sim_2d.max():.6f}\n'
+                f'Mean: {bev_sim_2d.mean():.6f}\n'
+                f'Std: {bev_sim_2d.std():.6f}'
+            )
+            axes.text(
+                0.01, 1.05, sim_stats_text,
+                transform=axes.transAxes,
+                fontsize=10,
+                verticalalignment='bottom',
+                horizontalalignment='left',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+            )
+            axes.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+            plt.tight_layout()
+            plt.show()
+        else:
+            print("Unable to visualize BEV maps due to missing data.")
 
 
     def step_simulator(self, u, dt=0.1):
@@ -280,7 +323,11 @@ if __name__ == "__main__":
     # 2. Init runner
     cfg = Config("config/config.yaml")
     planner = Planner(cfg, sim, agent)
-    planner.set_umap(step=30000)
-    planner.viz_umap()
+    planner.load_ensemble()
+    # planner.set_umap(step=30000)
+    # planner.viz_umap()
+    planner.set_sim_map(planner.get_sim_map())
+    planner.viz_sim_map()
+    
 
     sim.close()

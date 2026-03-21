@@ -478,25 +478,117 @@ class Visualizer:
         plt.tight_layout()
         plt.show()
 
+    def visualize_cam_similarity(self, image_idx, text_query, save_path=None):
+        """
+        Visualize 2D similarity map from a specific camera view using the ensemble.
+        """
+        # 1. Get Data
+        gt_image = self.gt_images[image_idx].cpu().numpy()
+        depth = self.gt_depths[image_idx] # (H, W)
+        c2w = self.c2ws[image_idx]
+        
+        # 2. Unproject to 3D
+        mask = (depth > 0.1) & (depth < 10.0)
+        # unprojection returns (N, 3) when mask is provided
+        world_points = unprojection(depth, self.intrinsics_tuple, c2w, self.device, mask=mask)
+        
+        if world_points.shape[0] == 0:
+            print("No valid points in this view.")
+            return
+
+        # 3. Text Embedding
+        inputs = self.sam_clip.clip_processor(text=[text_query], return_tensors="pt", padding=True).to(self.device)
+        with torch.no_grad():
+            text_embed = self.sam_clip.clip_model.get_text_features(**inputs)
+            text_embed /= text_embed.norm(dim=-1, keepdim=True)
+
+        # 4. Ensemble Query
+        batch_size = 50000
+        total_points = world_points.shape[0]
+        sim_values = torch.zeros(total_points, device=self.device)
+        
+        num_batches = int(np.ceil(total_points / batch_size))
+        
+        print(f"Computing camera-view similarity for '{text_query}' ({total_points} points)...")
+
+        with torch.no_grad():
+            for i in range(num_batches):
+                start = i * batch_size
+                end = min((i + 1) * batch_size, total_points)
+                batch_pts = world_points[start:end]
+                
+                # Get mean features from each model
+                batch_means = []
+                for model in self.ensemble_models:
+                    mean, _ = model.forward(batch_pts, normalize=True)
+                    batch_means.append(mean)
+                
+                # Average across ensemble (Mean of Means)
+                ensemble_mean = torch.stack(batch_means, dim=0).mean(dim=0)
+                ensemble_mean = ensemble_mean / (ensemble_mean.norm(dim=-1, keepdim=True) + 1e-8)
+                
+                # Compute Similarity
+                sim = torch.matmul(ensemble_mean, text_embed.T).squeeze(-1)
+                sim = (sim + 1.0) / 2.0
+                sim_values[start:end] = sim
+
+        # 5. Reconstruct 2D Map
+        H, W = self.H, self.W
+        sim_map = torch.zeros((H, W), device=self.device)
+        sim_map[mask] = sim_values
+        sim_map_np = sim_map.cpu().numpy()
+
+        # 6. Normalize for visualization, excluding bottom 10%
+        valid_scores = sim_map_np[mask.cpu().numpy()]
+        if valid_scores.shape[0] > 0:
+            vmin = np.percentile(valid_scores, 10)
+            vmax = valid_scores.max()
+        else:
+            vmin, vmax = 0, 1
+        
+        # 7. Visualize
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        axes[0].imshow(gt_image)
+        axes[0].set_title(f"RGB View {image_idx}")
+        axes[0].axis('off')
+        
+        im = axes[1].imshow(sim_map_np, cmap='jet', vmin=vmin, vmax=vmax)
+        axes[1].set_title(f"Ensemble Sim: '{text_query}'")
+        axes[1].axis('off')
+        
+        plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+            print(f"Saved to {save_path}")
+            
+        plt.show()
 
 if __name__ == "__main__":
     config = Config("./config/config.yaml")
     
     visualizer = Visualizer(config)
+
+    visualizer.visualize_cam_similarity(image_idx=11, text_query="a pillow", save_path='cam_similarity.png')
     
-    # # Example 1: Visualize a single BEV map
-    # bev_maps = visualizer.load_bev_maps(step=8000)
-    # visualizer.visualize_bev_map(bev_maps)
+    # Example 1: Visualize a single BEV map
+    bev_maps = visualizer.load_bev_maps(step=40000)
+    visualizer.visualize_bev_map(bev_maps)
     
-    # Example 2: Create animated history of BEV maps over training
-    # Setup grid and submap bounds
-    extent = [visualizer.bev_grid.bev_min_x, visualizer.bev_grid.bev_max_x, 
-              visualizer.bev_grid.bev_min_z, visualizer.bev_grid.bev_max_z]
-    grid_size = (visualizer.bev_grid.bev_width, visualizer.bev_grid.bev_height)
-    center_x, center_z = 4, -3 # Submap center in meters
-    side_length = 1  # Submap size in meters
-    box = (center_x, center_z, side_length)
-    grid_params = (extent, grid_size, box)
+    # # Example 2: Create animated history of BEV maps over training
+    # # Setup grid and submap bounds
+    # extent = [visualizer.bev_grid.bev_min_x, visualizer.bev_grid.bev_max_x, 
+    #           visualizer.bev_grid.bev_min_z, visualizer.bev_grid.bev_max_z]
+    # grid_size = (visualizer.bev_grid.bev_width, visualizer.bev_grid.bev_height)
+    # center_x, center_z = 4, -3 # Submap center in meters
+    # side_length = 1  # Submap size in meters
+    # box = (center_x, center_z, side_length)
+    # grid_params = (extent, grid_size, box)
     
-    # Create animation (MP4 or GIF)
-    visualizer.viz_map_history(grid_params, save_path='bev_history.mp4', fps=2, format='mp4')
+    # # Create animation (MP4 or GIF)
+    # visualizer.viz_map_history(grid_params, save_path='bev_history.mp4', fps=2, format='mp4')
+
+    # # Example 3: Visualize camera view similarity
+    # visualizer.visualize_cam_similarity(image_idx=10, text_query="a chair")

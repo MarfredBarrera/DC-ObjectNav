@@ -57,6 +57,124 @@ class BEVGrid:
         print(f"BEV Grid Initialized: {self.bev_width} x {self.bev_height} cells ({self.bev_resolution}m/cell)")
         self.bev_initialized = True
 
+    def generate_bev_sample_points(self, height_filter=None, height_samples=10):
+        """
+        Generate 3D sample points for BEV evaluation.
+        
+        Args:
+            height_filter: Tuple of (min_y, max_y) coordinates (height) to sample. 
+                          If None, uses scene bounds.
+            height_samples: Number of height levels to sample (default: 10)
+            
+        Returns:
+            points: numpy array of shape (N, 3) where N = bev_width * height_samples * bev_height
+            grid_shape: Tuple (bev_width, height_samples, bev_height) for reshaping
+        """
+        if not self.bev_initialized:
+            raise RuntimeError("BEV grid not initialized!")
+        
+        # Use scene bounds if not specified
+        if height_filter is None:
+            min_y = self.bev_min_y
+            max_y = self.bev_max_y
+        else:
+            min_y, max_y = height_filter
+        
+        # Generate all grid cell centers
+        x_coords = np.linspace(self.bev_min_x + self.bev_resolution/2, self.bev_max_x - self.bev_resolution/2, self.bev_width)
+        y_coords = np.linspace(min_y, max_y, height_samples)
+        z_coords = np.linspace(self.bev_min_z + self.bev_resolution/2, self.bev_max_z - self.bev_resolution/2, self.bev_height)
+        
+        # Create 3D meshgrid
+        X, Y, Z = np.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
+        
+        # Stack into (N, 3) array of 3D points
+        points = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=-1)
+        grid_shape = (self.bev_width, height_samples, self.bev_height)
+        
+        return points, grid_shape
+
+
+class SimilarityGrid(BEVGrid):
+    """
+    Subclass for Semantic Similarity Mapping.
+    Computes 2D BEV map of similarity between ensemble features and text query.
+    """
+    def __init__(self, config, ensemble, sam_clip):
+        # Extract bounds from the first model in the ensemble
+        model = ensemble[0]
+        bounds = None
+        if hasattr(model, 'scene_bounds'):
+            bounds = model.scene_bounds
+        
+        super().__init__(config, scene_bounds=bounds, device=config.device)
+        self.ensemble = ensemble
+        self.sam_clip = sam_clip
+        self.bev_sim_map = None
+
+    def compute_similarity_map(self, text_query, height_filter=None, height_samples=200, batch_size=100000):
+        if not self.bev_initialized:
+            print("BEV grid not initialized!")
+            return None
+
+        # 1. Embed Text
+        inputs = self.sam_clip.clip_processor(text=[text_query], return_tensors="pt", padding=True).to(self.device)
+        with torch.no_grad():
+            text_embed = self.sam_clip.clip_model.get_text_features(**inputs)
+            text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
+
+        # 2. Generate Sample Points
+        points, grid_shape = self.generate_bev_sample_points(height_filter, height_samples)
+        total_points = points.shape[0]
+        points_tensor = torch.from_numpy(points).float().to(self.device)
+        
+        # 3. Ensemble Forward Pass (Mean Feature)
+        all_sims = []
+        num_batches = int(np.ceil(total_points / batch_size))
+        
+        print(f"Computing similarity for '{text_query}' over {total_points:,} points...")
+        
+        with torch.no_grad():
+            for i in range(num_batches):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, total_points)
+                batch_points = points_tensor[start_idx:end_idx]
+                
+                # Get mean feature from each model and average them
+                batch_means = []
+                for model in self.ensemble:
+                    # forward returns (mean, variance). We want normalized mean.
+                    mean, _ = model.forward(batch_points, normalize=True)
+                    batch_means.append(mean)
+                
+                # Stack and Average: (Num_Models, B, D) -> (B, D)
+                ensemble_mean = torch.stack(batch_means, dim=0).mean(dim=0)
+                
+                # Re-normalize the ensemble mean for Cosine Similarity
+                ensemble_mean = ensemble_mean / (ensemble_mean.norm(dim=-1, keepdim=True) + 1e-8)
+                
+                # 4. Compute Similarity
+                # (B, D) @ (1, D).T -> (B, 1)
+                sim = torch.matmul(ensemble_mean, text_embed.T).squeeze(-1)
+                
+                # Normalize [-1, 1] -> [0, 1]
+                sim = (sim + 1.0) / 2.0
+                all_sims.append(sim)
+        
+        all_sims = torch.cat(all_sims, dim=0) # (N,)
+
+        # 5. Aggregate Height (Max)
+        bev_width, height_samples, bev_height = grid_shape
+        grid_3d = all_sims.reshape(bev_width, height_samples, bev_height)
+        
+        # Max over height samples
+        grid_2d, _ = grid_3d.max(dim=1)
+        
+        # Transpose to (H, W) for standard map orientation
+        self.bev_sim_map = grid_2d.transpose(0, 1)
+        
+        return self.bev_sim_map.cpu().numpy()
+    
 
 class OccupancyGrid(BEVGrid):
     """
@@ -135,51 +253,6 @@ class UncertaintyGrid(BEVGrid):
         # Core Tensors
         self.bev_epi_umap = None
         self.bev_ale_umap = None
-    
-    def generate_bev_sample_points(self, height_filter=None, height_samples=10):
-        """
-        Generate 3D sample points for BEV uncertainty evaluation.
-        
-        Args:
-            height_filter: Tuple of (min_y, max_y) coordinates (height) to sample. 
-                          If None, uses scene bounds.
-            height_samples: Number of height levels to sample (default: 10)
-            
-        Returns:
-            points: numpy array of shape (N, 3) where N = bev_width * height_samples * bev_height
-            grid_shape: Tuple (bev_width, height_samples, bev_height) for reshaping
-        """
-        if not self.bev_initialized:
-            raise RuntimeError("BEV grid not initialized!")
-        
-        # Use scene bounds if not specified
-        if height_filter is None:
-            min_y = self.bev_min_y
-            max_y = self.bev_max_y
-        else:
-            min_y, max_y = height_filter
-        
-        # Generate all grid cell centers
-        x_coords = np.linspace(
-            self.bev_min_x + self.bev_resolution/2, 
-            self.bev_max_x - self.bev_resolution/2, 
-            self.bev_width
-        )
-        y_coords = np.linspace(min_y, max_y, height_samples)
-        z_coords = np.linspace(
-            self.bev_min_z + self.bev_resolution/2, 
-            self.bev_max_z - self.bev_resolution/2, 
-            self.bev_height
-        )
-        
-        # Create 3D meshgrid
-        X, Y, Z = np.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
-        
-        # Stack into (N, 3) array of 3D points
-        points = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=-1)
-        grid_shape = (self.bev_width, height_samples, self.bev_height)
-        
-        return points, grid_shape
 
     def forward_single(self, model, points, batch_size=100000):
         """
@@ -269,6 +342,7 @@ class UncertaintyGrid(BEVGrid):
         # Average across ensemble (dim=0), then average across features (dim=-1)
         aleatoric = ensemble_variances.mean(dim=0).mean(dim=-1)
         return aleatoric
+
     
     def aggregate_height_samples(self, uncertainties, grid_shape):
         """
@@ -330,7 +404,7 @@ class UncertaintyGrid(BEVGrid):
         # Step 4: Move to CPU and aggregate height samples
         epi_2d = self.aggregate_height_samples(epistemic_uncertainty.cpu(), grid_shape)
         ale_2d = self.aggregate_height_samples(aleatoric_uncertainty.cpu(), grid_shape)
-        
+
         # Step 5: Store results
         self.set_umaps(epi_2d, ale_2d)
         

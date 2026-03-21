@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from collections import deque
 
-from DCON.src.grid import UncertaintyGrid
+from src.grid import UncertaintyGrid
 from src.config import Config
 from src.gaussians import GaussianSplatting
 from src.semantics import SAM_CLIP_Semantics
