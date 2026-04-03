@@ -566,16 +566,134 @@ class Visualizer:
             
         plt.show()
 
+    def visualize_occupancy(self, step, height_range=None):
+        """
+        Visualize the occupancy map for a specific training step.
+        
+        Args:
+            step: Training iteration number
+            height_range: Optional tuple (min_height, max_height) for reference/display.
+                         If None, uses full scene height bounds.
+        """
+        # Load occupancy map
+        occ_maps_dir = os.path.join(self.cfg.output_dir, "occ_maps")
+        occ_path = os.path.join(occ_maps_dir, f"bev_occupancy_{step}.npy")
+        
+        if not os.path.exists(occ_path):
+            print(f"Occupancy map for step {step} not found at {occ_path}")
+            return
+        
+        occupancy_map = np.load(occ_path)
+        print(f"Loaded occupancy map: {occupancy_map.shape}")
+        
+        # Get grid extent from BEV grid
+        extent = [self.bev_grid.bev_min_x, self.bev_grid.bev_max_x, 
+                  self.bev_grid.bev_min_z, self.bev_grid.bev_max_z]
+        
+        # Determine height range for display
+        if height_range is None:
+            height_range = (self.bev_grid.bev_min_y, self.bev_grid.bev_max_y)
+        
+        # Visualize
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Use binary colormap (white for free/unknown, black for occupied)
+        im = ax.imshow(occupancy_map, cmap='binary_r', origin='lower', aspect='equal', extent=extent)
+        ax.set_xlabel('X Position (m)', fontsize=12)
+        ax.set_ylabel('Z Position (m)', fontsize=12)
+        ax.set_title(f"Occupancy Map (Step {step})\nHeight Range: [{height_range[0]:.2f}, {height_range[1]:.2f}] m", fontsize=14)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        
+        # Add statistics
+        occupied_cells = np.sum(occupancy_map == 1)
+        total_cells = occupancy_map.size
+        occupancy_rate = occupied_cells / total_cells * 100 if total_cells > 0 else 0
+        
+        stats_text = (
+            f'Occupied Cells: {occupied_cells:,}\n'
+            f'Total Cells: {total_cells:,}\n'
+            f'Occupancy Rate: {occupancy_rate:.2f}%\n'
+            f'Resolution: {self.bev_grid.bev_resolution}m/cell\n'
+            f'Grid Size: {occupancy_map.shape[1]} × {occupancy_map.shape[0]}'
+        )
+        ax.text(
+            0.02, 0.98, stats_text,
+            transform=ax.transAxes,
+            fontsize=10,
+            verticalalignment='top',
+            horizontalalignment='left',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+        )
+        
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Occupancy (0=Free, 1=Occupied)')
+        plt.tight_layout()
+        plt.show()
+        
+        return occupancy_map
+    
+    def visualize_sim_map(self, step):
+        """
+        Visualize the similarity map for a specific training step.
+        """
+        sim_maps_dir = os.path.join(self.cfg.output_dir, "sim_maps")
+        sim_path = os.path.join(sim_maps_dir, f"bev_similarity_{step}.npy")
+        
+        if not os.path.exists(sim_path):
+            print(f"Similarity map for step {step} not found at {sim_path}")
+            return
+        
+        sim_map = np.load(sim_path)
+        print(f"Loaded similarity map: {sim_map.shape}")
+
+        # Exclude all zero scores and normalize
+        non_zero_mask = sim_map > 0
+        if np.any(non_zero_mask):
+            vmin_orig = sim_map[non_zero_mask].min()
+            vmax_orig = sim_map[non_zero_mask].max()
+            num_zeros = np.sum(~non_zero_mask)
+            
+            # Normalize non-zero scores to [0, 1]
+            sim_map_normalized = np.zeros_like(sim_map)
+            sim_map_normalized[non_zero_mask] = (sim_map[non_zero_mask] - vmin_orig) / (vmax_orig - vmin_orig)
+            vmin = 0
+            vmax = 1
+        else:
+            sim_map_normalized = sim_map
+            vmin = 0
+            vmax = 1
+            print("All scores are zero!")
+        
+        # Get grid extent from BEV grid
+        extent = [self.bev_grid.bev_min_x, self.bev_grid.bev_max_x, 
+                  self.bev_grid.bev_min_z, self.bev_grid.bev_max_z]
+        
+        # Visualize
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        im = ax.imshow(sim_map_normalized, cmap='jet', origin='lower', aspect='equal', extent=extent, vmin=vmin, vmax=vmax)
+        ax.set_xlabel('X Position (m)', fontsize=12)
+        ax.set_ylabel('Z Position (m)', fontsize=12)
+        ax.set_title(f"Similarity Map (Step {step})", fontsize=14)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Normalized Similarity Score')
+        plt.tight_layout()
+        plt.show()
+        
+        return sim_map_normalized
+
+
 if __name__ == "__main__":
     config = Config("./config/config.yaml")
     
     visualizer = Visualizer(config)
+    # visualizer.visualize_occupancy(step=40000, height_range=(0.0, 2.0))
+    visualizer.visualize_sim_map(step=40000)
 
-    visualizer.visualize_cam_similarity(image_idx=11, text_query="a pillow", save_path='cam_similarity.png')
-    
-    # Example 1: Visualize a single BEV map
-    bev_maps = visualizer.load_bev_maps(step=40000)
-    visualizer.visualize_bev_map(bev_maps)
+    # visualizer.visualize_cam_similarity(image_idx=11, text_query="a pillow", save_path='cam_similarity.png')
+    # # Example 1: Visualize a single BEV map
+    # bev_maps = visualizer.load_bev_maps(step=40000)
+    # visualizer.visualize_bev_map(bev_maps)
     
     # # Example 2: Create animated history of BEV maps over training
     # # Setup grid and submap bounds

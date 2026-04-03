@@ -57,14 +57,14 @@ class BEVGrid:
         print(f"BEV Grid Initialized: {self.bev_width} x {self.bev_height} cells ({self.bev_resolution}m/cell)")
         self.bev_initialized = True
 
-    def generate_bev_sample_points(self, height_filter=None, height_samples=10):
+    def generate_bev_sample_points(self, height_filter=None, height_samples=50):
         """
         Generate 3D sample points for BEV evaluation.
         
         Args:
             height_filter: Tuple of (min_y, max_y) coordinates (height) to sample. 
                           If None, uses scene bounds.
-            height_samples: Number of height levels to sample (default: 10)
+            height_samples: Number of height levels to sample (default: 50)
             
         Returns:
             points: numpy array of shape (N, 3) where N = bev_width * height_samples * bev_height
@@ -110,9 +110,9 @@ class SimilarityGrid(BEVGrid):
         super().__init__(config, scene_bounds=bounds, device=config.device)
         self.ensemble = ensemble
         self.sam_clip = sam_clip
-        self.bev_sim_map = None
+        self.bev_sim_map_3d = None
 
-    def compute_similarity_map(self, text_query, height_filter=None, height_samples=200, batch_size=100000):
+    def compute_similarity_map(self, text_query, height_samples=200, batch_size=100000, occupancy_grid=None):
         if not self.bev_initialized:
             print("BEV grid not initialized!")
             return None
@@ -123,16 +123,41 @@ class SimilarityGrid(BEVGrid):
             text_embed = self.sam_clip.clip_model.get_text_features(**inputs)
             text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
 
-        # 2. Generate Sample Points
-        points, grid_shape = self.generate_bev_sample_points(height_filter, height_samples)
+        min_y, max_y = self.bev_min_y, self.bev_max_y
+        points, grid_shape = self.generate_bev_sample_points(height_filter=(min_y, max_y), height_samples=height_samples)
         total_points = points.shape[0]
-        points_tensor = torch.from_numpy(points).float().to(self.device)
+
+        # Filter points by occupancy if grid is provided
+        mask = None
+        if occupancy_grid is not None and occupancy_grid.occupancy_map is not None:
+            x_indices_np = ((points[:, 0] - self.bev_min_x) / self.bev_resolution).astype(np.int64)
+            z_indices_np = ((points[:, 2] - self.bev_min_z) / self.bev_resolution).astype(np.int64)
+            y_indices_np = ((points[:, 1] - min_y) / (max_y - min_y + 1e-6) * (occupancy_grid.height_samples - 1)).astype(np.int64)
+            x_indices_np = np.clip(x_indices_np, 0, self.bev_width - 1)
+            z_indices_np = np.clip(z_indices_np, 0, self.bev_height - 1)
+            y_indices_np = np.clip(y_indices_np, 0, occupancy_grid.height_samples - 1)
+
+            x_indices = torch.from_numpy(x_indices_np).to(self.device)
+            z_indices = torch.from_numpy(z_indices_np).to(self.device)
+            y_indices = torch.from_numpy(y_indices_np).to(self.device)
+
+            occ_map = occupancy_grid.occupancy_map
+            mask = (occ_map[y_indices, z_indices, x_indices] == 1)
+            query_points = points[mask.cpu().numpy()]
+        else:
+            query_points = points
+
+        total_query_points = query_points.shape[0]
+        if total_query_points == 0:
+            return np.zeros((self.bev_height, self.bev_width))
+            
+        points_tensor = torch.from_numpy(query_points).float().to(self.device)
         
         # 3. Ensemble Forward Pass (Mean Feature)
-        all_sims = []
-        num_batches = int(np.ceil(total_points / batch_size))
+        all_query_sims = []
+        num_batches = int(np.ceil(total_query_points / batch_size))
         
-        print(f"Computing similarity for '{text_query}' over {total_points:,} points...")
+        print(f"Computing similarity for '{text_query}' over {total_query_points:,} points...")
         
         with torch.no_grad():
             for i in range(num_batches):
@@ -159,54 +184,71 @@ class SimilarityGrid(BEVGrid):
                 
                 # Normalize [-1, 1] -> [0, 1]
                 sim = (sim + 1.0) / 2.0
-                all_sims.append(sim)
+                all_query_sims.append(sim)
         
-        all_sims = torch.cat(all_sims, dim=0) # (N,)
+        all_query_sims = torch.cat(all_query_sims, dim=0) # (total_query_points,)
 
-        # 5. Aggregate Height (Max)
+        # 4. Reconstruct full 3D similarity grid
+        full_sims = torch.zeros(total_points, device=self.device)
+        if mask is not None:
+            full_sims[mask] = all_query_sims
+        else:
+            full_sims = all_query_sims
+            
         bev_width, height_samples, bev_height = grid_shape
-        grid_3d = all_sims.reshape(bev_width, height_samples, bev_height)
-        
-        # Max over height samples
-        grid_2d, _ = grid_3d.max(dim=1)
-        
-        # Transpose to (H, W) for standard map orientation
-        self.bev_sim_map = grid_2d.transpose(0, 1)
-        
-        return self.bev_sim_map.cpu().numpy()
+        self.bev_sim_map_3d = full_sims.reshape(bev_width, height_samples, bev_height)
+
+        return 
     
+    def get_2d_map(self):
+        """Returns 2D BEV similarity map (max similarity across height)."""
+        if self.bev_sim_map_3d is None:
+            return None
+        # Max over height samples (dim 1)
+        grid_2d, _ = self.bev_sim_map_3d.max(dim=1)
+        # Transpose to (H, W) for standard map orientation
+        return grid_2d.transpose(0, 1)
+    
+    def save(self, step):
+        """Save similarity map to disk."""
+        sim_2d = self.get_2d_map()
+        if sim_2d is not None:
+            sim_maps_dir = os.path.join(self.cfg.output_dir, "sim_maps")
+            os.makedirs(sim_maps_dir, exist_ok=True)
+            path = os.path.join(sim_maps_dir, f"bev_similarity_{step}.npy")
+            np.save(path, sim_2d.cpu().numpy())
+            print(f"Similarity map saved to {path}")
 
 class OccupancyGrid(BEVGrid):
     """
     Subclass for Binary Occupancy Mapping.
     Records visited areas on the grid.
     """
-    def __init__(self, config, scene_bounds, device=None):
-        super().__init__(config, scene_bounds, device)
+    def __init__(self, config, scene_bounds, device=None, height_samples=100):
+        self.height_samples = height_samples
         self.occupancy_map = None
+        super().__init__(config, scene_bounds, device)
         if self.bev_initialized:
-            self._init_map()
+            if self.occupancy_map is None:
+                self._init_map()
 
     def initialize_from_bounds(self, scene_bounds):
         super().initialize_from_bounds(scene_bounds)
         self._init_map()
         
     def _init_map(self):
-        # Initialize zero map (0 = free/unknown, 1 = occupied/visited)
-        # Shape: (Height/Z, Width/X)
-        self.occupancy_map = torch.zeros((self.bev_height, self.bev_width), device=self.device, dtype=torch.uint8)
+        # Initialize 3D zero map (0 = free/unknown, 1 = occupied/visited)
+        # Shape: (Y/Height_Samples, Z/Height, X/Width)
+        self.occupancy_map = torch.zeros((self.height_samples, self.bev_height, self.bev_width), device=self.device, dtype=torch.uint8)
 
-    def update(self, points):
-        """
-        Update occupancy map with observed points.
-        Args:
-             points: (N, 3) tensor of points in world coordinates.
-        """
+    def update(self, points, min_y=0.1, max_y=2.0):
         if not self.bev_initialized: return
         
-        # Filter points within X/Z bounds
+        # Now explicitly filtering out the floor (Y < min_y) and ceiling (Y > max_y)
         mask = (points[:, 0] >= self.bev_min_x) & (points[:, 0] < self.bev_max_x) & \
-               (points[:, 2] >= self.bev_min_z) & (points[:, 2] < self.bev_max_z)
+            (points[:, 2] >= self.bev_min_z) & (points[:, 2] < self.bev_max_z) & \
+            (points[:, 1] >= min_y) & (points[:, 1] < max_y)
+            
         valid_points = points[mask]
         
         if valid_points.shape[0] == 0: return
@@ -214,21 +256,38 @@ class OccupancyGrid(BEVGrid):
         # Map to grid indices
         x_indices = ((valid_points[:, 0] - self.bev_min_x) / self.bev_resolution).long()
         z_indices = ((valid_points[:, 2] - self.bev_min_z) / self.bev_resolution).long()
+        y_indices = ((valid_points[:, 1] - min_y) / (max_y - min_y + 1e-6) * (self.height_samples - 1)).long()
         
         # Clamp to be safe
         x_indices = torch.clamp(x_indices, 0, self.bev_width - 1)
         z_indices = torch.clamp(z_indices, 0, self.bev_height - 1)
+        y_indices = torch.clamp(y_indices, 0, self.height_samples - 1)
         
         # Set occupancy (1 for occupied)
-        self.occupancy_map[z_indices, x_indices] = 1
+        self.occupancy_map[y_indices, z_indices, x_indices] = 1
+
+    def get_2d_map(self, min_y=0.1, max_y=2.0):
+        """Returns 2D BEV occupancy map (1 if any cell in column is occupied)."""
+        if self.occupancy_map is None: return None
+
+        # Filter height range
+        min_y_idx = int((min_y - 0.0) / (2.0 - 0.0) * (self.height_samples - 1))
+        max_y_idx = int((max_y - 0.0) / (2.0 - 0.0) * (self.height_samples - 1))
+        min_y_idx = max(0, min_y_idx)
+        max_y_idx = min(self.height_samples - 1, max_y_idx)
+        occ_slice = self.occupancy_map[min_y_idx:max_y_idx+1, :, :]
+        # Max over height samples
+        occ_2d, _ = occ_slice.max(dim=0)
+        return occ_2d
 
     def save(self, step):
         """Save occupancy map to disk."""
         if self.occupancy_map is not None:
+            occ_2d = self.get_2d_map()
             occ_maps_dir = os.path.join(self.cfg.output_dir, "occ_maps")
             os.makedirs(occ_maps_dir, exist_ok=True)
             path = os.path.join(occ_maps_dir, f"bev_occupancy_{step}.npy")
-            np.save(path, self.occupancy_map.cpu().numpy())
+            np.save(path, occ_2d.cpu().numpy())
             print(f"Occupancy map saved to {path}")
 
 
@@ -253,6 +312,10 @@ class UncertaintyGrid(BEVGrid):
         # Core Tensors
         self.bev_epi_umap = None
         self.bev_ale_umap = None
+
+        # 3D maps
+        self.bev_epi_umap_3d = None
+        self.bev_ale_umap_3d = None
 
     def forward_single(self, model, points, batch_size=100000):
         """
@@ -401,6 +464,10 @@ class UncertaintyGrid(BEVGrid):
         epistemic_uncertainty = self.compute_epistemic_uncertainty(ensemble_predictions)
         aleatoric_uncertainty = self.compute_aleatoric_uncertainty(ensemble_variances)
         
+        # Step 3b: Store 3D
+        self.bev_epi_umap_3d = epistemic_uncertainty
+        self.bev_ale_umap_3d = aleatoric_uncertainty
+
         # Step 4: Move to CPU and aggregate height samples
         epi_2d = self.aggregate_height_samples(epistemic_uncertainty.cpu(), grid_shape)
         ale_2d = self.aggregate_height_samples(aleatoric_uncertainty.cpu(), grid_shape)
@@ -423,6 +490,8 @@ class UncertaintyGrid(BEVGrid):
     def clear_umaps(self):
         self.bev_epi_umap = None
         self.bev_ale_umap = None
+        self.bev_epi_umap_3d = None
+        self.bev_ale_umap_3d = None
         torch.cuda.empty_cache()
     
     def compute_and_save_uncertainty_snapshot(self, iteration, height_filter=(0.1, 2.0), 

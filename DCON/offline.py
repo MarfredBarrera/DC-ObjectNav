@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from collections import deque
 
-from src.grid import UncertaintyGrid
+from src.grid import UncertaintyGrid, OccupancyGrid, SimilarityGrid
 from src.config import Config
 from src.gaussians import GaussianSplatting
 from src.semantics import SAM_CLIP_Semantics
@@ -41,8 +41,15 @@ class Runner:
             FeatureField(self.cfg, device=self.device) 
             for _ in range(self.cfg.ensemble_num_models)
         ]
+        # Extract scene bounds from ensemble models for occupancy grid
+        scene_bounds = None
+        if hasattr(self.ensemble_models[0], 'scene_bounds'):
+            scene_bounds = self.ensemble_models[0].scene_bounds
 
-        self.recorder = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
+
+        self.u_grid = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
+        self.occupancy_grid = OccupancyGrid(cfg, scene_bounds=scene_bounds)
+        self.sim_grid = SimilarityGrid(cfg, ensemble=self.ensemble_models, sam_clip=self.sam_clip)
         
         # Sequential sampling: track current image index
         self.current_image_idx = 0
@@ -263,6 +270,9 @@ class Runner:
             batch_points = super_points_gpu[batch_idx]
             batch_features = super_features_gpu[batch_idx]
 
+            # record to occupancy grid
+            self.occupancy_grid.update(batch_points)
+
             # --- Training ---
             loss = 0
             for model in self.ensemble_models:
@@ -278,7 +288,10 @@ class Runner:
             # --- Visualization/Saving ---
             if save_enabled and step > 0 and step % viz_interval == 0:
                 self.save_uncertainty_snapshot(step)
-
+                self.occupancy_grid.save(step)
+                self.sim_grid.compute_similarity_map("a pillow",
+                                                     occupancy_grid=self.occupancy_grid)
+                self.sim_grid.save(step)
 
     def save_uncertainty_snapshot(self, step):
         """
@@ -287,15 +300,11 @@ class Runner:
         Args:
             step: Current training iteration number
         """
-        elapsed = self.recorder.compute_and_save_uncertainty_snapshot(
+        elapsed = self.u_grid.compute_and_save_uncertainty_snapshot(
             iteration=step,
             height_filter=(0.1, 2.0)
         )
         print(f"Uncertainty snapshot time: {elapsed:.6f}s")
-
-
-
-
 
     def save_models(self):
         """Save only the ensemble models."""
@@ -304,9 +313,6 @@ class Runner:
             os.makedirs(os.path.dirname(ensemble_path), exist_ok=True)
             model.save(ensemble_path)
             print(f"Saved Ensemble Model {i} to {ensemble_path}")
-
-
-        
 
 
 if __name__ == "__main__":
