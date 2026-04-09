@@ -17,12 +17,14 @@ class FeatureField(nn.Module):
     Updated to model aleatoric uncertainty using Negative Log-Likelihood (NLL) loss.
     """
     
-    def __init__(self, config, device="cuda"):
+    def __init__(self, config, scene_bounds, device="cuda"):
         super().__init__()
         self.cfg = config
         self.device = device
 
-        bounds_min, bounds_max = self.load_scene_bounds(os.path.join(self.cfg.output_dir, "transforms.json"))
+        # Scene bounds are now mandatory to ensure consistency
+        bounds_min = scene_bounds[0]
+        bounds_max = scene_bounds[1]
         self.scene_bounds = torch.tensor([
             bounds_min,  # min
             bounds_max   # max
@@ -75,47 +77,7 @@ class FeatureField(nn.Module):
             betas=(0.9, 0.99),
             eps=1e-15,
             weight_decay=1e-6)
-    
-    def load_scene_bounds(self, json_path):
-        """
-        Load scene bounds from a transforms.json file.
-        Args:
-            json_path: Path to transforms.json file containing scene_bounds
-        Returns:
-            bounds_min: List of [x_min, y_min, z_min]
-            bounds_max: List of [x_max, y_max, z_max]
-        """
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        
-        if 'scene_bounds' in data and data['scene_bounds'] is not None:
-            bounds_min = data['scene_bounds']['min']
-            bounds_max = data['scene_bounds']['max']
-        else:
-            print(f"Warning: No scene_bounds found in {json_path}, using default bounds")
-            bounds_min = [-5.0, -5.0, -5.0]
-            bounds_max = [5.0, 5.0, 5.0]
 
-        return bounds_min, bounds_max
-        
-    def update_scene_bounds(self, points):
-        """
-        Update scene bounds based on observed 3D points.
-        Args:
-            points: (N, 3) tensor of 3D points
-        """
-        mins = points.min(dim=0)[0]
-        maxs = points.max(dim=0)[0]
-        
-        # Add some padding
-        padding = (maxs - mins) * 0.1
-        mins = mins - padding
-        maxs = maxs + padding
-        
-        # Update bounds
-        self.scene_bounds[0] = torch.min(self.scene_bounds[0], mins)
-        self.scene_bounds[1] = torch.max(self.scene_bounds[1], maxs)
-        
     def normalize_positions(self, positions):
         """
         Normalize positions to [0, 1] based on scene bounds.

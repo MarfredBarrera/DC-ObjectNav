@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '4'
+os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 import gc
 import json
@@ -31,25 +31,20 @@ class Runner:
 
         # Data Loading
         print(f"Loading data from {self.cfg.output_dir}...")
-        self.gt_images, self.gt_depths, self.c2ws, self.intrinsics_tuple = self._load_scene_data()
+        self.gt_images, self.gt_depths, self.c2ws, self.intrinsics_tuple, self.scene_bounds = self._load_scene_data()
         self.fx, self.fy, self.cx, self.cy, self.H, self.W = self.intrinsics_tuple
         self.num_cameras = len(self.gt_images)
 
         # Semantics and Ensemble Models
         self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
         self.ensemble_models = [
-            FeatureField(self.cfg, device=self.device) 
+            FeatureField(self.cfg, scene_bounds=self.scene_bounds, device=self.device) 
             for _ in range(self.cfg.ensemble_num_models)
         ]
-        # Extract scene bounds from ensemble models for occupancy grid
-        scene_bounds = None
-        if hasattr(self.ensemble_models[0], 'scene_bounds'):
-            scene_bounds = self.ensemble_models[0].scene_bounds
-
-
-        self.u_grid = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
-        self.occupancy_grid = OccupancyGrid(cfg, scene_bounds=scene_bounds)
-        self.sim_grid = SimilarityGrid(cfg, ensemble=self.ensemble_models, sam_clip=self.sam_clip)
+        
+        self.u_grid = UncertaintyGrid(self.cfg, ensemble=self.ensemble_models, scene_bounds=self.scene_bounds)
+        self.occupancy_grid = OccupancyGrid(self.cfg, scene_bounds=self.scene_bounds)
+        self.sim_grid = SimilarityGrid(self.cfg, ensemble=self.ensemble_models, sam_clip=self.sam_clip, scene_bounds=self.scene_bounds)
         
         # Sequential sampling: track current image index
         self.current_image_idx = 0
@@ -64,6 +59,9 @@ class Runner:
         img_0 = imageio.imread(os.path.join(self.cfg.output_dir, frames[0]['file_path']))
         H, W = img_0.shape[:2]
         
+        # Load scene bounds from metadata
+        scene_bounds = [meta['scene_bounds']['min'], meta['scene_bounds']['max']]
+
         fov_x = meta['camera_angle_x']
         fx = 0.5 * W / math.tan(0.5 * fov_x)
         fy = fx
@@ -93,7 +91,7 @@ class Runner:
             c2w_cv = c2w_hab @ convert_mat
             c2w_matrices.append(torch.from_numpy(c2w_cv).float())
 
-        return torch.stack(gt_images), torch.stack(gt_depths), torch.stack(c2w_matrices), (fx, fy, cx, cy, H, W)
+        return torch.stack(gt_images), torch.stack(gt_depths), torch.stack(c2w_matrices), (fx, fy, cx, cy, H, W), scene_bounds
     
     def sample_rgb(self, idx=None):
 
@@ -309,7 +307,7 @@ class Runner:
     def save_models(self):
         """Save only the ensemble models."""
         for i, model in enumerate(self.ensemble_models):
-            ensemble_path = os.path.join(self.cfg.output_dir, f"ensemble/hashgrid_ensemble_{i}.pt")
+            ensemble_path = os.path.join(self.cfg.output_dir, f"ensemble/featurefield_ensemble_{i}.pt")
             os.makedirs(os.path.dirname(ensemble_path), exist_ok=True)
             model.save(ensemble_path)
             print(f"Saved Ensemble Model {i} to {ensemble_path}")

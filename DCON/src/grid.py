@@ -8,7 +8,7 @@ class BEVGrid:
     Base class for 2D Bird's Eye View Grids.
     Handles grid initialization, dimensions, and coordinate transforms.
     """
-    def __init__(self, config, scene_bounds=None, device=None):
+    def __init__(self, config, scene_bounds, device=None):
         self.cfg = config
         self.device = device if device else config.device
     
@@ -23,9 +23,7 @@ class BEVGrid:
         self.bev_max_x = 0.0
         self.bev_min_z = 0.0
         self.bev_max_z = 0.0
-        
-        if scene_bounds is not None:
-            self.initialize_from_bounds(scene_bounds)
+        self.initialize_from_bounds(scene_bounds)
 
     def initialize_from_bounds(self, scene_bounds):
         """Calculates grid dimensions from scene bounds."""
@@ -82,15 +80,15 @@ class BEVGrid:
         
         # Generate all grid cell centers
         x_coords = np.linspace(self.bev_min_x + self.bev_resolution/2, self.bev_max_x - self.bev_resolution/2, self.bev_width)
-        y_coords = np.linspace(min_y, max_y, height_samples)
+        y_coords = np.linspace(min_y, max_y, height_samples) # Vertical dimension
         z_coords = np.linspace(self.bev_min_z + self.bev_resolution/2, self.bev_max_z - self.bev_resolution/2, self.bev_height)
         
-        # Create 3D meshgrid
-        X, Y, Z = np.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
+        # Create 3D meshgrid in (Y, Z, X) order to match memory-efficient layouts
+        Y, Z, X = np.meshgrid(y_coords, z_coords, x_coords, indexing='ij')
         
         # Stack into (N, 3) array of 3D points
         points = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=-1)
-        grid_shape = (self.bev_width, height_samples, self.bev_height)
+        grid_shape = (height_samples, self.bev_height, self.bev_width)
         
         return points, grid_shape
 
@@ -100,14 +98,8 @@ class SimilarityGrid(BEVGrid):
     Subclass for Semantic Similarity Mapping.
     Computes 2D BEV map of similarity between ensemble features and text query.
     """
-    def __init__(self, config, ensemble, sam_clip):
-        # Extract bounds from the first model in the ensemble
-        model = ensemble[0]
-        bounds = None
-        if hasattr(model, 'scene_bounds'):
-            bounds = model.scene_bounds
-        
-        super().__init__(config, scene_bounds=bounds, device=config.device)
+    def __init__(self, config, ensemble, sam_clip, scene_bounds):
+        super().__init__(config, scene_bounds, device=config.device)
         self.ensemble = ensemble
         self.sam_clip = sam_clip
         self.bev_sim_map_3d = None
@@ -130,16 +122,17 @@ class SimilarityGrid(BEVGrid):
         # Filter points by occupancy if grid is provided
         mask = None
         if occupancy_grid is not None and occupancy_grid.occupancy_map is not None:
-            x_indices_np = ((points[:, 0] - self.bev_min_x) / self.bev_resolution).astype(np.int64)
-            z_indices_np = ((points[:, 2] - self.bev_min_z) / self.bev_resolution).astype(np.int64)
-            y_indices_np = ((points[:, 1] - min_y) / (max_y - min_y + 1e-6) * (occupancy_grid.height_samples - 1)).astype(np.int64)
-            x_indices_np = np.clip(x_indices_np, 0, self.bev_width - 1)
-            z_indices_np = np.clip(z_indices_np, 0, self.bev_height - 1)
-            y_indices_np = np.clip(y_indices_np, 0, occupancy_grid.height_samples - 1)
-
-            x_indices = torch.from_numpy(x_indices_np).to(self.device)
-            z_indices = torch.from_numpy(z_indices_np).to(self.device)
-            y_indices = torch.from_numpy(y_indices_np).to(self.device)
+            x_idx = ((points[:, 0] - self.bev_min_x) / self.bev_resolution).astype(np.int64)
+            z_idx = ((points[:, 2] - self.bev_min_z) / self.bev_resolution).astype(np.int64)
+            y_idx = ((points[:, 1] - self.bev_min_y) / (self.bev_max_y - self.bev_min_y + 1e-6) * (occupancy_grid.height_samples - 1)).astype(np.int64)
+            
+            x_idx = np.clip(x_idx, 0, self.bev_width - 1)
+            z_idx = np.clip(z_idx, 0, self.bev_height - 1)
+            y_idx = np.clip(y_idx, 0, occupancy_grid.height_samples - 1)
+            
+            x_indices = torch.from_numpy(x_idx).to(self.device)
+            z_indices = torch.from_numpy(z_idx).to(self.device)
+            y_indices = torch.from_numpy(y_idx).to(self.device)
 
             occ_map = occupancy_grid.occupancy_map
             mask = (occ_map[y_indices, z_indices, x_indices] == 1)
@@ -157,12 +150,10 @@ class SimilarityGrid(BEVGrid):
         all_query_sims = []
         num_batches = int(np.ceil(total_query_points / batch_size))
         
-        print(f"Computing similarity for '{text_query}' over {total_query_points:,} points...")
-        
         with torch.no_grad():
             for i in range(num_batches):
                 start_idx = i * batch_size
-                end_idx = min((i + 1) * batch_size, total_points)
+                end_idx = min((i + 1) * batch_size, total_query_points)
                 batch_points = points_tensor[start_idx:end_idx]
                 
                 # Get mean feature from each model and average them
@@ -195,8 +186,7 @@ class SimilarityGrid(BEVGrid):
         else:
             full_sims = all_query_sims
             
-        bev_width, height_samples, bev_height = grid_shape
-        self.bev_sim_map_3d = full_sims.reshape(bev_width, height_samples, bev_height)
+        self.bev_sim_map_3d = full_sims.reshape(grid_shape) # (Y, Z, X)
 
         return 
     
@@ -204,10 +194,9 @@ class SimilarityGrid(BEVGrid):
         """Returns 2D BEV similarity map (max similarity across height)."""
         if self.bev_sim_map_3d is None:
             return None
-        # Max over height samples (dim 1)
-        grid_2d, _ = self.bev_sim_map_3d.max(dim=1)
-        # Transpose to (H, W) for standard map orientation
-        return grid_2d.transpose(0, 1)
+        # Max over height samples (dim 0) -> (Z, X)
+        grid_2d, _ = self.bev_sim_map_3d.max(dim=0)
+        return grid_2d
     
     def save(self, step):
         """Save similarity map to disk."""
@@ -227,10 +216,7 @@ class OccupancyGrid(BEVGrid):
     def __init__(self, config, scene_bounds, device=None, height_samples=100):
         self.height_samples = height_samples
         self.occupancy_map = None
-        super().__init__(config, scene_bounds, device)
-        if self.bev_initialized:
-            if self.occupancy_map is None:
-                self._init_map()
+        super().__init__(config, scene_bounds, device=device)
 
     def initialize_from_bounds(self, scene_bounds):
         super().initialize_from_bounds(scene_bounds)
@@ -239,15 +225,20 @@ class OccupancyGrid(BEVGrid):
     def _init_map(self):
         # Initialize 3D zero map (0 = free/unknown, 1 = occupied/visited)
         # Shape: (Y/Height_Samples, Z/Height, X/Width)
-        self.occupancy_map = torch.zeros((self.height_samples, self.bev_height, self.bev_width), device=self.device, dtype=torch.uint8)
+        if self.bev_width > 0 and self.bev_height > 0:
+            self.occupancy_map = torch.zeros((self.height_samples, self.bev_height, self.bev_width), device=self.device, dtype=torch.uint8)
 
-    def update(self, points, min_y=0.1, max_y=2.0):
+    def update(self, points, min_y=None, max_y=None):
+        """Update occupancy map from 3D points within the specified height range."""
         if not self.bev_initialized: return
-        
-        # Now explicitly filtering out the floor (Y < min_y) and ceiling (Y > max_y)
+
+        # Use provided filter range or fall back to scene bounds
+        f_min_y = min_y if min_y is not None else self.bev_min_y
+        f_max_y = max_y if max_y is not None else self.bev_max_y
+
         mask = (points[:, 0] >= self.bev_min_x) & (points[:, 0] < self.bev_max_x) & \
             (points[:, 2] >= self.bev_min_z) & (points[:, 2] < self.bev_max_z) & \
-            (points[:, 1] >= min_y) & (points[:, 1] < max_y)
+            (points[:, 1] >= f_min_y) & (points[:, 1] < f_max_y)
             
         valid_points = points[mask]
         
@@ -256,7 +247,8 @@ class OccupancyGrid(BEVGrid):
         # Map to grid indices
         x_indices = ((valid_points[:, 0] - self.bev_min_x) / self.bev_resolution).long()
         z_indices = ((valid_points[:, 2] - self.bev_min_z) / self.bev_resolution).long()
-        y_indices = ((valid_points[:, 1] - min_y) / (max_y - min_y + 1e-6) * (self.height_samples - 1)).long()
+        # Map world Y coordinate to grid index based on the full vertical range [bev_min_y, bev_max_y]
+        y_indices = ((valid_points[:, 1] - self.bev_min_y) / (self.bev_max_y - self.bev_min_y + 1e-6) * (self.height_samples - 1)).long()
         
         # Clamp to be safe
         x_indices = torch.clamp(x_indices, 0, self.bev_width - 1)
@@ -266,13 +258,17 @@ class OccupancyGrid(BEVGrid):
         # Set occupancy (1 for occupied)
         self.occupancy_map[y_indices, z_indices, x_indices] = 1
 
-    def get_2d_map(self, min_y=0.1, max_y=2.0):
+    def get_2d_map(self, min_y=None, max_y=None):
         """Returns 2D BEV occupancy map (1 if any cell in column is occupied)."""
         if self.occupancy_map is None: return None
 
-        # Filter height range
-        min_y_idx = int((min_y - 0.0) / (2.0 - 0.0) * (self.height_samples - 1))
-        max_y_idx = int((max_y - 0.0) / (2.0 - 0.0) * (self.height_samples - 1))
+        # Use provided height slice or default to full scene range
+        f_min_y = min_y if min_y is not None else self.bev_min_y
+        f_max_y = max_y if max_y is not None else self.bev_max_y
+
+        # Map world height to grid indices based on the grid's Y range [bev_min_y, bev_max_y]
+        min_y_idx = int((f_min_y - self.bev_min_y) / (self.bev_max_y - self.bev_min_y + 1e-6) * (self.height_samples - 1))
+        max_y_idx = int((f_max_y - self.bev_min_y) / (self.bev_max_y - self.bev_min_y + 1e-6) * (self.height_samples - 1))
         min_y_idx = max(0, min_y_idx)
         max_y_idx = min(self.height_samples - 1, max_y_idx)
         occ_slice = self.occupancy_map[min_y_idx:max_y_idx+1, :, :]
@@ -296,18 +292,9 @@ class UncertaintyGrid(BEVGrid):
     Subclass for Uncertainty Mapping (Epistemic & Aleatoric).
     Maintains a 2D Bird's Eye View Grid representing feature field uncertainty.
     """
-    def __init__(self, config, ensemble):
-        # Extract bounds from the first model in the ensemble
-        model = ensemble[0]
-        bounds = None
-        if hasattr(model, 'scene_bounds'):
-            bounds = model.scene_bounds
-        else:
-            print("Warning: Bounds not found on ensemble. BEV uninitialized.")
-        
-        super().__init__(config, scene_bounds=bounds, device=config.device)
+    def __init__(self, config, ensemble, scene_bounds):
+        super().__init__(config, scene_bounds, device=config.device)
         self.ensemble = ensemble
-        self.iteration_num = 0
         
         # Core Tensors
         self.bev_epi_umap = None
@@ -413,22 +400,17 @@ class UncertaintyGrid(BEVGrid):
         
         Args:
             uncertainties: Tensor of shape (N,) on CPU
-            grid_shape: Tuple (bev_width, height_samples, bev_height)
+            grid_shape: Tuple (height_samples, bev_height, bev_width)
             
         Returns:
             bev_2d: Tensor of shape (bev_height, bev_width) - BEV uncertainty map
         """
-        bev_width, height_samples, bev_height = grid_shape
+        # uncertainties are flat, reshape to (Y, Z, X)
+        grid_3d = uncertainties.reshape(grid_shape)
         
-        # Reshape to 3D grid: (bev_width, height_samples, bev_height)
-        grid_3d = uncertainties.reshape(bev_width, height_samples, bev_height)
-        
-        # Average along height dimension (axis 1) -> (bev_width, bev_height)
-        grid_2d = grid_3d.mean(dim=1)
-        
-        # Transpose to (bev_height, bev_width) for standard BEV representation
-        bev_2d = grid_2d.transpose(0, 1)
-        
+        # Average along height dimension (axis 0) -> (Z, X)
+        bev_2d = grid_3d.mean(dim=0)
+
         return bev_2d
     
     # ========== High-Level Pipeline Function ==========
@@ -475,7 +457,6 @@ class UncertaintyGrid(BEVGrid):
         # Step 5: Store results
         self.set_umaps(epi_2d, ale_2d)
         
-        print(f"Forward pass complete!")
         return
 
     # ========== Utility Functions ==========
@@ -493,32 +474,6 @@ class UncertaintyGrid(BEVGrid):
         self.bev_epi_umap_3d = None
         self.bev_ale_umap_3d = None
         torch.cuda.empty_cache()
-    
-    def compute_and_save_uncertainty_snapshot(self, iteration, height_filter=(0.1, 2.0), 
-                                             height_samples=10, batch_size=100000):
-        """
-        Args:
-            iteration: Current training iteration/step number
-            height_filter: Height range to sample (default: 0.1-2.0m)
-            height_samples: Number of height levels to sample
-            batch_size: Batch size for forward pass
-            
-        Returns:
-            elapsed_time: Time taken to compute uncertainties (seconds)
-        """
-        import time
-        self.iteration_num = iteration
-        
-        start_time = time.time()
-        self.forward_pass(height_filter=height_filter, 
-                         height_samples=height_samples, 
-                         batch_size=batch_size)
-        elapsed = time.time() - start_time
-        
-        self.save_bev_maps()
-        self.clear_umaps()
-        
-        return elapsed
     
     def visualize_bev_map(self, save_path=None, show=False, height_filter=None):
         """
@@ -599,12 +554,12 @@ class UncertaintyGrid(BEVGrid):
         
         return fig, ax
     
-    def save_bev_maps(self, save_dir=None):
+    def save(self, step, save_dir=None):
         """Save the BEV uncertainty maps as numpy files."""
         umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
         os.makedirs(umaps_dir, exist_ok=True)
-        epi_path = os.path.join(umaps_dir, f"bev_epistemic_uncertainty_{self.iteration_num}.npy")
-        ale_path = os.path.join(umaps_dir, f"bev_aleatoric_uncertainty_{self.iteration_num}.npy")
+        epi_path = os.path.join(umaps_dir, f"bev_epistemic_uncertainty_{step}.npy")
+        ale_path = os.path.join(umaps_dir, f"bev_aleatoric_uncertainty_{step}.npy")
         
         epi_array = self.bev_epi_umap.cpu().numpy()
         ale_array = self.bev_ale_umap.cpu().numpy()
@@ -612,4 +567,4 @@ class UncertaintyGrid(BEVGrid):
         np.save(epi_path, epi_array)
         np.save(ale_path, ale_array)
         
-        print(f"BEV maps saved (step {self.iteration_num}, shape {epi_array.shape}) to: {umaps_dir}")
+        print(f"BEV maps saved (step {step}, shape {epi_array.shape}) to: {umaps_dir}")

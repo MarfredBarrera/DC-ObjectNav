@@ -1,5 +1,7 @@
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+import matplotlib
+matplotlib.use('Agg')
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 import json
 import math
@@ -13,6 +15,11 @@ import matplotlib.cm as cm
 from matplotlib.colors import LogNorm
 from collections import deque
 
+# Habitat Imports
+import habitat_sim
+import habitat_sim.utils.common as utils
+import habitat_sim.physics as physics
+
 # Custom Imports
 from src.config import Config
 from src.gaussians import GaussianSplatting
@@ -20,6 +27,21 @@ from src.semantics import SAM_CLIP_Semantics
 from src.utils import unprojection
 from src.featurefield import FeatureField
 from src.grid import UncertaintyGrid
+
+
+def get_scene_bounds(scene_path):
+    sim_cfg = habitat_sim.SimulatorConfiguration()
+    sim_cfg.scene_id = scene_path
+    sim_cfg.enable_physics = False
+    sim_cfg.load_semantic_mesh = False
+    agent_cfg = habitat_sim.agent.AgentConfiguration()
+
+    sim = habitat_sim.Simulator(habitat_sim.Configuration(sim_cfg, [agent_cfg]))
+    try:
+        bounds = sim.pathfinder.get_bounds()
+        return [np.array(bounds[0]).tolist(), np.array(bounds[1]).tolist()]
+    finally:
+        sim.close()
 
 class Visualizer:
     def __init__(self, cfg: Config):
@@ -29,6 +51,7 @@ class Visualizer:
         os.environ["CUDA_VISIBLE_DEVICES"] = self.cfg.gpu_indices
         os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
         self.device = self.cfg.device
+        self.scene_bounds = get_scene_bounds(self.cfg.scene_path)
 
         # 1. Load Data
         print(f"Loading data from {self.cfg.output_dir}...")
@@ -43,7 +66,7 @@ class Visualizer:
         self.ensemble_models = self.load_ensemble()
 
         # 4. BEV Grid
-        self.bev_grid = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
+        self.bev_grid = UncertaintyGrid(cfg, ensemble=self.ensemble_models, scene_bounds=self.scene_bounds)
 
     def _load_scene_data(self):
         json_path = os.path.join(self.cfg.output_dir, "transforms.json")
@@ -100,7 +123,7 @@ class Visualizer:
             model_path = os.path.join(ensemble_dir, f"featurefield_ensemble_{i}.pt")
             if os.path.exists(model_path):
                 # Initialize a new FeatureField instance
-                model = FeatureField(self.cfg, device=self.device)
+                model = FeatureField(self.cfg, self.scene_bounds, device=self.device)
                 model.load(model_path)
                 ensemble_models.append(model)
                 print(f"  -> Loaded Ensemble Model {i}")
@@ -125,6 +148,22 @@ class Visualizer:
         else:
             print(f"BEV maps for step {step} not found in {umaps_dir}")
             return None, None
+
+    def _align_map_to_grid(self, map_2d, map_name="map"):
+        """Ensure map is shaped as (bev_height, bev_width) for plotting."""
+        expected = (self.bev_grid.bev_height, self.bev_grid.bev_width)
+        swapped = (self.bev_grid.bev_width, self.bev_grid.bev_height)
+
+        if map_2d.shape == expected:
+            return map_2d
+        if map_2d.shape == swapped:
+            print(f"Transposing {map_name} to match BEV grid orientation.")
+            return map_2d.T
+
+        raise ValueError(
+            f"{map_name} shape {map_2d.shape} does not match BEV grid "
+            f"{expected} (or swapped {swapped})"
+        )
         
     def visualize_bev_map(self, u_maps):
         """Visualize the BEV uncertainty maps."""
@@ -314,135 +353,74 @@ class Visualizer:
         print(f"Aleatoric scale: [{ale_vmin:.6e}, {ale_vmax:.6e}] (1st-98th percentile)")
         
         # Create frames
+        fig = plt.figure(figsize=(14, 10))
+        gs = fig.add_gridspec(2, 2, height_ratios=[2, 1], hspace=0.3, wspace=0.3)
+        
+        ax_epi = fig.add_subplot(gs[0, 0])
+        ax_ale = fig.add_subplot(gs[0, 1])
+        ax_epi_time = fig.add_subplot(gs[1, 0])
+        ax_ale_time = fig.add_subplot(gs[1, 1])
+
+        from matplotlib.patches import Rectangle
+        box_x_size = box_z_size = side_length
+        
+        # Initialize plot objects with dummy data
+        im_epi = ax_epi.imshow(np.zeros((10, 10)), cmap='magma', origin='lower', extent=extent, vmin=epi_vmin, vmax=epi_vmax)
+        im_ale = ax_ale.imshow(np.zeros((10, 10)), cmap='magma', origin='lower', extent=extent, vmin=ale_vmin, vmax=ale_vmax)
+        
+        rect_epi_unexpl = Rectangle((center_x - box_x_size/2, center_z - box_z_size/2), box_x_size, box_z_size, linewidth=2, edgecolor='red', facecolor='none', linestyle='--')
+        rect_epi_expl = Rectangle((center_x_explored - explored_side/2, center_z_explored - explored_side/2), explored_side, explored_side, linewidth=2, edgecolor='green', facecolor='none', linestyle='--')
+        ax_epi.add_patch(rect_epi_unexpl)
+        ax_epi.add_patch(rect_epi_expl)
+
+        rect_ale_unexpl = Rectangle((center_x - box_x_size/2, center_z - box_z_size/2), box_x_size, box_z_size, linewidth=2, edgecolor='red', facecolor='none', linestyle='--')
+        rect_ale_expl = Rectangle((center_x_explored - explored_side/2, center_z_explored - explored_side/2), explored_side, explored_side, linewidth=2, edgecolor='green', facecolor='none', linestyle='--')
+        ax_ale.add_patch(rect_ale_unexpl)
+        ax_ale.add_patch(rect_ale_expl)
+
+        line_epi_unexpl, = ax_epi_time.plot([], [], marker='o', color='red', linewidth=2, markersize=6)
+        line_epi_expl, = ax_epi_time.plot([], [], marker='s', color='green', linewidth=2, markersize=6, label='Explored Patch')
+        line_ale_unexpl, = ax_ale_time.plot([], [], marker='s', color='blue', linewidth=2, markersize=6)
+        line_ale_expl, = ax_ale_time.plot([], [], marker='s', color='green', linewidth=2, markersize=6, label='Explored Patch')
+
+        # Static labels/configs
+        ax_epi.set_title(r"Epistemic Uncertainty: $\mathbb{V}[\mu_\theta]$")
+        ax_ale.set_title(r"Aleatoric Uncertainty: $\mathbb{E}[\sigma^2_\theta]$")
+        plt.colorbar(im_epi, ax=ax_epi, fraction=0.046, pad=0.04)
+        plt.colorbar(im_ale, ax=ax_ale, fraction=0.046, pad=0.04)
+        
+        ax_epi_time.set_xlim(epochs[0], epochs[-1])
+        ax_ale_time.set_xlim(epochs[0], epochs[-1])
+        epi_min, epi_max = min(epi_avgs), max(epi_avgs)
+        ale_min, ale_max = min(ale_avgs), max(ale_avgs)
+        ax_epi_time.set_ylim(epi_min - (epi_max-epi_min)*0.1 - 0.1, epi_max + (epi_max-epi_min)*0.1 + 0.1)
+        ax_ale_time.set_ylim(ale_min - (ale_max-ale_min)*0.1 - 0.1, ale_max + (ale_max-ale_min)*0.1 + 0.1)
+        
+        epi_text = ax_epi.text(0.01, 1.05, '', transform=ax_epi.transAxes, fontsize=9, verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        ale_text = ax_ale.text(0.01, 1.05, '', transform=ax_ale.transAxes, fontsize=9, verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
         frames = []
         for idx, (step, epi_map, ale_map) in enumerate(frames_data):
-            fig = plt.figure(figsize=(14, 10))
-            gs = fig.add_gridspec(2, 2, height_ratios=[2, 1], hspace=0.3, wspace=0.3)
+            im_epi.set_data(epi_map)
+            im_ale.set_data(ale_map)
             
-            # Top row: BEV maps
-            ax_epi = fig.add_subplot(gs[0, 0])
-            ax_ale = fig.add_subplot(gs[0, 1])
+            line_epi_unexpl.set_data(epochs[:idx+1], epi_avgs[:idx+1])
+            line_epi_expl.set_data(epochs[:idx+1], epi_expl_avgs[:idx+1])
+            line_ale_unexpl.set_data(epochs[:idx+1], ale_avgs[:idx+1])
+            line_ale_expl.set_data(epochs[:idx+1], ale_expl_avgs[:idx+1])
             
-            # Epistemic map (with logarithmic scale for better color distribution)
-            im1 = ax_epi.imshow(epi_map, cmap='magma', origin='lower', aspect='equal', extent=extent,
-                               vmin=epi_vmin, vmax=epi_vmax)
-            ax_epi.set_xlabel('X Position (m)', fontsize=12)
-            ax_epi.set_ylabel('Z Position (m)', fontsize=12)
-            ax_epi.set_title(r"Epistemic Uncertainty: $\mathbb{V}[\mu_\theta]$", fontsize=10)
-            plt.colorbar(im1, ax=ax_epi, fraction=0.046, pad=0.04)
-            ax_epi.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-            
-            # Draw submap box (side_length is in meters, same units as extent)
-            box_x_size = side_length
-            box_z_size = side_length
-            
-            from matplotlib.patches import Rectangle
-            epi_rect = Rectangle((center_x - box_x_size/2, center_z - box_z_size/2), 
-                           box_x_size, box_z_size,
-                           linewidth=2, edgecolor='red', facecolor='none', linestyle='--')
-            ax_epi.add_patch(epi_rect)
+            epi_text.set_text(f'Step: {step}\nMin: {epi_map.min():.6f}\nMax: {epi_map.max():.6f}\nMean: {epi_map.mean():.6f}')
+            ale_text.set_text(f'Step: {step}\nMin: {ale_map.min():.6f}\nMax: {ale_map.max():.6f}\nMean: {ale_map.mean():.6f}')
 
-            epi_explored_rect = Rectangle((center_x_explored - explored_side/2, center_z_explored - explored_side/2),
-                                        explored_side, explored_side,
-                                        linewidth=2, edgecolor='green', facecolor='none', linestyle='--')
-            ax_epi.add_patch(epi_explored_rect)
-
-            ale_explored_rect = Rectangle((center_x_explored - explored_side/2, center_z_explored - explored_side/2),
-                                        explored_side, explored_side,
-                                        linewidth=2, edgecolor='green', facecolor='none', linestyle='--')
-            ax_ale.add_patch(ale_explored_rect)
-
-            ale_rect = Rectangle((center_x - box_x_size/2, center_z - box_z_size/2), 
-                           box_x_size, box_z_size,
-                           linewidth=2, edgecolor='red', facecolor='none', linestyle='--')
-
-            ax_ale.add_patch(ale_rect)
-            
-            # Stats text
-            epi_stats_text = (
-                f'Step: {step}\n'
-                f'Min: {epi_map.min():.6f}\n'
-                f'Max: {epi_map.max():.6f}\n'
-                f'Mean: {epi_map.mean():.6f}'
-            )
-            ax_epi.text(0.01, 1.05, epi_stats_text,
-                       transform=ax_epi.transAxes, fontsize=9,
-                       verticalalignment='bottom', horizontalalignment='left',
-                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            
-            # Aleatoric map (with logarithmic scale for better color distribution)
-            im2 = ax_ale.imshow(ale_map, cmap='magma', origin='lower', aspect='equal', extent=extent,
-                               vmin=ale_vmin, vmax=ale_vmax)
-            ax_ale.set_xlabel('X Position (m)', fontsize=12)
-            ax_ale.set_ylabel('Z Position (m)', fontsize=12)
-            ax_ale.set_title(r"Aleatoric Uncertainty: $\mathbb{E}[\sigma^2_\theta]$", fontsize=10)
-            plt.colorbar(im2, ax=ax_ale, fraction=0.046, pad=0.04)
-            ax_ale.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-            
-            ale_stats_text = (
-                f'Step: {step}\n'
-                f'Min: {ale_map.min():.6f}\n'
-                f'Max: {ale_map.max():.6f}\n'
-                f'Mean: {ale_map.mean():.6f}'
-            )
-            ax_ale.text(0.01, 1.05, ale_stats_text,
-                       transform=ax_ale.transAxes, fontsize=9,
-                       verticalalignment='bottom', horizontalalignment='left',
-                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            
-            # Bottom row: Time series plots (separate for epistemic and aleatoric)
-            ax_epi_time = fig.add_subplot(gs[1, 0])
-            ax_ale_time = fig.add_subplot(gs[1, 1])
-            
-            # Plot up to current step
-            current_epochs = epochs[:idx+1]
-            current_epi_avgs = epi_avgs[:idx+1]
-            current_ale_avgs = ale_avgs[:idx+1]
-            current_epi_expl_avgs = epi_expl_avgs[:idx+1]
-            current_ale_expl_avgs = ale_expl_avgs[:idx+1]
-            
-            # Epistemic uncertainty time series
-            ax_epi_time.plot(current_epochs, current_epi_avgs, 
-                            marker='o', color='red', linewidth=2, markersize=6)
-            ax_epi_time.plot(current_epochs, current_epi_expl_avgs, 
-                            marker='s', color='green', linewidth=2, markersize=6, label='Explored Patch')
-            ax_epi_time.set_xlabel('Training Step', fontsize=12)
-            ax_epi_time.set_ylabel('Avg Epistemic Uncertainty', fontsize=12)
-            ax_epi_time.set_title(f'Epistemic (Submap at [{center_x:.1f}, {center_z:.1f}])', fontsize=10)
-            ax_epi_time.grid(True, alpha=0.3)
-            ax_epi_time.set_xlim(epochs[0], epochs[-1])
-            
-            # Set y-limits based on epistemic data range for consistency
-            epi_min, epi_max = min(epi_avgs), max(epi_avgs)
-            epi_margin = (epi_max - epi_min) * 0.1 if epi_max > epi_min else 0.1
-            ax_epi_time.set_ylim(epi_min - epi_margin, epi_max + epi_margin)
-            
-            # Aleatoric uncertainty time series
-            ax_ale_time.plot(current_epochs, current_ale_avgs, 
-                            marker='s', color='blue', linewidth=2, markersize=6)
-            ax_ale_time.plot(current_epochs, current_ale_expl_avgs, 
-                            marker='s', color='green', linewidth=2, markersize=6, label='Explored Patch')
-            ax_ale_time.set_xlabel('Training Step', fontsize=12)
-            ax_ale_time.set_ylabel('Avg Aleatoric Uncertainty', fontsize=12)
-            ax_ale_time.set_title(f'Aleatoric (Submap at [{center_x:.1f}, {center_z:.1f}])', fontsize=10)
-            ax_ale_time.grid(True, alpha=0.3)
-            ax_ale_time.set_xlim(epochs[0], epochs[-1])
-            ax_ale_time.legend(loc='upper right', fontsize=9)
-            
-            # Set y-limits based on aleatoric data range for consistency
-            ale_min, ale_max = min(ale_avgs), max(ale_avgs)
-            ale_margin = (ale_max - ale_min) * 0.1 if ale_max > ale_min else 0.1
-            ax_ale_time.set_ylim(ale_min - ale_margin, ale_max + ale_margin)
-            
-            # Render frame to numpy array
             fig.canvas.draw()
             frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
             frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
             frames.append(frame)
             
-            plt.close(fig)
             print(f"  Rendered frame {idx+1}/{len(frames_data)} (step {step})")
         
+        plt.close(fig)
+
         # Save animation
         if format.lower() == 'gif':
             save_path = save_path.replace('.mp4', '.gif')
@@ -584,6 +562,7 @@ class Visualizer:
             return
         
         occupancy_map = np.load(occ_path)
+        occupancy_map = self._align_map_to_grid(occupancy_map, map_name="occupancy map")
         print(f"Loaded occupancy map: {occupancy_map.shape}")
         
         # Get grid extent from BEV grid
@@ -643,6 +622,7 @@ class Visualizer:
             return
         
         sim_map = np.load(sim_path)
+        sim_map = self._align_map_to_grid(sim_map, map_name="similarity map")
         print(f"Loaded similarity map: {sim_map.shape}")
 
         # Exclude all zero scores and normalize
@@ -679,34 +659,35 @@ class Visualizer:
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Normalized Similarity Score')
         plt.tight_layout()
         plt.show()
-        
+
         return sim_map_normalized
 
 
 if __name__ == "__main__":
     config = Config("./config/config.yaml")
-    
     visualizer = Visualizer(config)
-    # visualizer.visualize_occupancy(step=40000, height_range=(0.0, 2.0))
-    visualizer.visualize_sim_map(step=40000)
+    
+    # visualizer.visualize_occupancy(step=20000, height_range=(0.0, 2.0))
+    # visualizer.visualize_sim_map(step=20000)
+    visualizer.visualize_bev_map(visualizer.load_bev_maps(step=20000))
 
     # visualizer.visualize_cam_similarity(image_idx=11, text_query="a pillow", save_path='cam_similarity.png')
     # # Example 1: Visualize a single BEV map
     # bev_maps = visualizer.load_bev_maps(step=40000)
     # visualizer.visualize_bev_map(bev_maps)
     
-    # # Example 2: Create animated history of BEV maps over training
-    # # Setup grid and submap bounds
-    # extent = [visualizer.bev_grid.bev_min_x, visualizer.bev_grid.bev_max_x, 
-    #           visualizer.bev_grid.bev_min_z, visualizer.bev_grid.bev_max_z]
-    # grid_size = (visualizer.bev_grid.bev_width, visualizer.bev_grid.bev_height)
-    # center_x, center_z = 4, -3 # Submap center in meters
-    # side_length = 1  # Submap size in meters
-    # box = (center_x, center_z, side_length)
-    # grid_params = (extent, grid_size, box)
+    # Example 2: Create animated history of BEV maps over training
+    # Setup grid and submap bounds
+    extent = [visualizer.bev_grid.bev_min_x, visualizer.bev_grid.bev_max_x, 
+              visualizer.bev_grid.bev_min_z, visualizer.bev_grid.bev_max_z]
+    grid_size = (visualizer.bev_grid.bev_width, visualizer.bev_grid.bev_height)
+    center_x, center_z = 4, -3 # Submap center in meters
+    side_length = 1  # Submap size in meters
+    box = (center_x, center_z, side_length)
+    grid_params = (extent, grid_size, box)
     
-    # # Create animation (MP4 or GIF)
-    # visualizer.viz_map_history(grid_params, save_path='bev_history.mp4', fps=2, format='mp4')
+    # Create animation (MP4 or GIF)
+    visualizer.viz_map_history(grid_params, save_path='bev_history.mp4', fps=2, format='mp4')
 
     # # Example 3: Visualize camera view similarity
     # visualizer.visualize_cam_similarity(image_idx=10, text_query="a chair")

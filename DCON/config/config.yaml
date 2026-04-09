@@ -28,7 +28,7 @@ semantics:
 
 # Training Settings
 training:
-  iterations: 40000
+  iterations: 30000
   device: "cuda"
   gpu_indices: "6"
   near_plane: 0.01
@@ -89,4 +89,4 @@ hashgrid:
   warmup_steps: 0
 
 ensemble:
-  num_models: 5
+  num_models: 3

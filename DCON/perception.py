@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '4'
+os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 import gc
@@ -18,7 +18,7 @@ import habitat_sim.utils.common as utils
 import habitat_sim.physics as physics
 
 # User Dev Imports
-from src.grid import UncertaintyGrid
+from src.grid import UncertaintyGrid, OccupancyGrid, SimilarityGrid
 from src.config import Config
 from src.gaussians import GaussianSplatting
 from src.semantics import SAM_CLIP_Semantics
@@ -31,10 +31,18 @@ os.environ['MAGNUM_LOG'] = 'quiet'
 os.environ['HABITAT_SIM_LOG'] = 'quiet'
 
 
-
 # --------------------------------------------------------
 # Habitat Configuration & Helpers
 # --------------------------------------------------------
+
+def get_scene_bounds_from_pathfinder(sim):
+    """Extract scene bounds from the Habitat pathfinder AABB."""
+    if not sim.pathfinder.is_loaded:
+        raise RuntimeError("Pathfinder not loaded; cannot determine scene bounds from Habitat.")
+    bounds = sim.pathfinder.get_bounds()
+    return [np.array(bounds[0]).tolist(), np.array(bounds[1]).tolist()]
+
+
 def get_camera_matrix(agent):
     # 1. Get the state of the specific sensor 'rgb'
     state = agent.get_state().sensor_states['rgb']
@@ -78,10 +86,8 @@ def make_cfg(scene_filepath):
 
     return habitat_sim.Configuration(sim_cfg, [agent_cfg])
 
-
-
 class Runner:
-    def __init__(self, cfg: Config, sim, agent):
+    def __init__(self, cfg: Config, sim, agent, scene_bounds):
         self.cfg = cfg
         self.device = self.cfg.device
         
@@ -109,11 +115,13 @@ class Runner:
         # Semantics and Ensemble Models
         self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
         self.ensemble_models = [
-            FeatureField(self.cfg, device=self.device) 
+            FeatureField(self.cfg, scene_bounds=scene_bounds, device=self.device)
             for _ in range(self.cfg.ensemble_num_models)
         ]
 
-        self.ugrid = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
+        self.ugrid = UncertaintyGrid(self.cfg, ensemble=self.ensemble_models, scene_bounds=scene_bounds)
+        self.occupancy_grid = OccupancyGrid(self.cfg, scene_bounds=scene_bounds)
+        self.similarity_grid = SimilarityGrid(self.cfg, ensemble=self.ensemble_models, sam_clip=self.sam_clip, scene_bounds=scene_bounds)
 
     def step_simulator(self, u, dt=0.1):
         """
@@ -234,7 +242,6 @@ class Runner:
         else:
             super_points_gpu = torch.cat(gpu_points_chunks, dim=0)
             super_features_gpu = torch.cat(gpu_features_chunks, dim=0)
-            print(f"Staged {super_points_gpu.shape[0]} points to GPU.")
             return super_points_gpu, super_features_gpu
 
     def train_ensemble(self, save_enabled=False):
@@ -249,7 +256,7 @@ class Runner:
         print(f"Initializing history buffer (start training after {min_frames_to_start} frames)...")
         for i in range(min_frames_to_start):
             # Advance Simulator: Spinning in a circle test [lin_vel=0, ang_vel=2.5]
-            u = [0.0, 3.0]
+            u = [0.0, 5.0]
             self.step_simulator(u)
             
             # Gather state observations
@@ -277,7 +284,7 @@ class Runner:
                         torch.cuda.empty_cache() 
 
                     # Control Policy Query (Spinning for now)
-                    u = [0.0, 3.0]
+                    u = [0.0, 5.0]
                     self.step_simulator(u)
                     
                     new_points, new_features = self.sample_rgb()
@@ -291,9 +298,7 @@ class Runner:
                 if super_points_gpu is not None:
                     del super_points_gpu, super_features_gpu
                     torch.cuda.empty_cache()
-                
-                print(f"\n--- Staging new super-batch for steps {step}-{step+refresh_interval-1} ---")
-                
+                                
                 # Prepare super-batch
                 super_points_gpu, super_features_gpu = self._super_batch(
                     global_point_buffer, staging_size, recent_sample_portion
@@ -310,6 +315,9 @@ class Runner:
             batch_points = super_points_gpu[batch_idx]
             batch_features = super_features_gpu[batch_idx]
 
+            # Record to occupancy grid
+            self.occupancy_grid.update(batch_points)
+
             # Forward / Train Step
             loss = 0
             for model in self.ensemble_models:
@@ -322,20 +330,18 @@ class Runner:
                 print(f"Step {step:04d} | Train Loss: {avg_loss:.5f} | Time: {time.time()-start_time:.1f}s")
 
             if save_enabled and step >= 0 and step % viz_interval == 0:
-                self.save_uncertainty_snapshot(step)
+                # save all maps
+                start_time = time.time()
+                self.ugrid.forward_pass(height_filter=(0.1, 2.0), 
+                    height_samples=10, 
+                    batch_size=100000)
+                self.ugrid.save(step)
+                self.ugrid.clear_umaps()
+                self.occupancy_grid.save(step)
+                self.similarity_grid.compute_similarity_map("a pillow", occupancy_grid=self.occupancy_grid)
+                self.similarity_grid.save(step)
+                print(f"Maps saved at step {step} (Time: {time.time()-start_time:.1f}s)")
 
-    def save_uncertainty_snapshot(self, step):
-        """
-        Compute and save uncertainty maps at the current training step.
-        
-        Args:
-            step: Current training iteration number
-        """
-        elapsed = self.ugrid.compute_and_save_uncertainty_snapshot(
-            iteration=step,
-            height_filter=(0.1, 2.0)
-        )
-        print(f"Uncertainty snapshot time: {elapsed:.6f}s")
 
     def save_models(self):
         for i, model in enumerate(self.ensemble_models):
@@ -349,8 +355,11 @@ class Runner:
 # --------------------------------------------------------
 if __name__ == "__main__":
     
-    # 1. Init Habitat sim
-    scene = "/workspace/DCON/gibson_scenes/Anaheim.glb"
+    # 1. Init runner config
+    runner_config = Config("config/config.yaml")
+    
+    # 2. Init Habitat sim
+    scene = runner_config.scene_path
     sim_config = make_cfg(scene)
 
     try:
@@ -370,11 +379,9 @@ if __name__ == "__main__":
     else:
         print("Warning: No navmesh found. Agent spawned at origin.")
 
-    # 2. Init runner
-    runner_config = Config("config/config.yaml")
-    runner = Runner(runner_config, sim, agent)
-
-    print("\nStarting Online Training. The agent will spin and sample frames automatically...")
+    # 3. Init runner with sim and agent, using pathfinder for scene bounds
+    scene_bounds = get_scene_bounds_from_pathfinder(sim)
+    runner = Runner(runner_config, sim, agent, scene_bounds=scene_bounds)
     
     # 3. Train
     runner.train_ensemble(save_enabled=True)
