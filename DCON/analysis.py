@@ -12,7 +12,7 @@ import imageio.v2 as imageio
 import cv2
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-from matplotlib.colors import LogNorm
+from matplotlib.colors import LogNorm, ListedColormap
 from collections import deque
 
 # Habitat Imports
@@ -132,38 +132,21 @@ class Visualizer:
 
         return ensemble_models
 
-    def load_bev_maps(self, step):
-        """Load the BEV uncertainty maps for a specific training step."""
-        umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
-        epi_path = os.path.join(umaps_dir, f"bev_epistemic_uncertainty_{step}.npy")
-        ale_path = os.path.join(umaps_dir, f"bev_aleatoric_uncertainty_{step}.npy")
-        
-        if os.path.exists(epi_path) and os.path.exists(ale_path):
-            bev_epi_umap = np.load(epi_path)
-            bev_ale_umap = np.load(ale_path)
+    # def _align_map_to_grid(self, map_2d, map_name="map"):
+    #     """Ensure map is shaped as (bev_height, bev_width) for plotting."""
+    #     expected = (self.bev_grid.bev_height, self.bev_grid.bev_width)
+    #     swapped = (self.bev_grid.bev_width, self.bev_grid.bev_height)
 
+    #     if map_2d.shape == expected:
+    #         return map_2d
+    #     if map_2d.shape == swapped:
+    #         print(f"Transposing {map_name} to match BEV grid orientation.")
+    #         return map_2d.T
 
-            # print(f"Loaded BEV maps for step {step} from {umaps_dir}")
-            return bev_epi_umap, bev_ale_umap
-        else:
-            print(f"BEV maps for step {step} not found in {umaps_dir}")
-            return None, None
-
-    def _align_map_to_grid(self, map_2d, map_name="map"):
-        """Ensure map is shaped as (bev_height, bev_width) for plotting."""
-        expected = (self.bev_grid.bev_height, self.bev_grid.bev_width)
-        swapped = (self.bev_grid.bev_width, self.bev_grid.bev_height)
-
-        if map_2d.shape == expected:
-            return map_2d
-        if map_2d.shape == swapped:
-            print(f"Transposing {map_name} to match BEV grid orientation.")
-            return map_2d.T
-
-        raise ValueError(
-            f"{map_name} shape {map_2d.shape} does not match BEV grid "
-            f"{expected} (or swapped {swapped})"
-        )
+    #     raise ValueError(
+    #         f"{map_name} shape {map_2d.shape} does not match BEV grid "
+    #         f"{expected} (or swapped {swapped})"
+    #     )
         
     def visualize_bev_map(self, u_maps):
         """Visualize the BEV uncertainty maps."""
@@ -228,6 +211,7 @@ class Visualizer:
 
             plt.tight_layout()
             plt.show()
+            plt.savefig("./bev_maps.png")
         else:
             print("Unable to visualize BEV maps due to missing data.")
 
@@ -562,7 +546,7 @@ class Visualizer:
             return
         
         occupancy_map = np.load(occ_path)
-        occupancy_map = self._align_map_to_grid(occupancy_map, map_name="occupancy map")
+        # occupancy_map = self._align_map_to_grid(occupancy_map, map_name="occupancy map")
         print(f"Loaded occupancy map: {occupancy_map.shape}")
         
         # Get grid extent from BEV grid
@@ -576,21 +560,28 @@ class Visualizer:
         # Visualize
         fig, ax = plt.subplots(figsize=(10, 8))
         
-        # Use binary colormap (white for free/unknown, black for occupied)
-        im = ax.imshow(occupancy_map, cmap='binary_r', origin='lower', aspect='equal', extent=extent)
+        # Use a discrete colormap: 0=Gray (Unseen), 1=White (Free), 2=Black (Occupied)
+        occ_cmap = ListedColormap(['#808080', '#FFFFFF', '#000000'])
+        im = ax.imshow(occupancy_map, cmap=occ_cmap, origin='lower', aspect='equal', extent=extent, vmin=0, vmax=2)
+        
         ax.set_xlabel('X Position (m)', fontsize=12)
         ax.set_ylabel('Z Position (m)', fontsize=12)
         ax.set_title(f"Occupancy Map (Step {step})\nHeight Range: [{height_range[0]:.2f}, {height_range[1]:.2f}] m", fontsize=14)
         ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         
         # Add statistics
-        occupied_cells = np.sum(occupancy_map == 1)
+        unseen_cells = np.sum(occupancy_map == 0)
+        free_cells = np.sum(occupancy_map == 1)
+        occupied_cells = np.sum(occupancy_map == 2)
         total_cells = occupancy_map.size
         occupancy_rate = occupied_cells / total_cells * 100 if total_cells > 0 else 0
+        exploration_rate = (free_cells + occupied_cells) / total_cells * 100 if total_cells > 0 else 0
         
         stats_text = (
             f'Occupied Cells: {occupied_cells:,}\n'
-            f'Total Cells: {total_cells:,}\n'
+            f'Free Cells: {free_cells:,}\n'
+            f'Unseen Cells: {unseen_cells:,}\n'
+            f'Exploration Rate: {exploration_rate:.2f}%\n'
             f'Occupancy Rate: {occupancy_rate:.2f}%\n'
             f'Resolution: {self.bev_grid.bev_resolution}m/cell\n'
             f'Grid Size: {occupancy_map.shape[1]} × {occupancy_map.shape[0]}'
@@ -604,7 +595,10 @@ class Visualizer:
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
         )
         
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Occupancy (0=Free, 1=Occupied)')
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('State (0=Unseen, 1=Free, 2=Occupied)')
+        cbar.set_ticks([0.33, 1.0, 1.66])
+        cbar.set_ticklabels(['Unseen', 'Free', 'Occupied'])
         plt.tight_layout()
         plt.show()
         
@@ -659,35 +653,181 @@ class Visualizer:
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Normalized Similarity Score')
         plt.tight_layout()
         plt.show()
+        plt.savefig("./figs/similarity_map.png")
 
         return sim_map_normalized
+    
+    def load_umaps(self, step):
+        """Load the BEV uncertainty maps for a specific training step."""
+        umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
+        epi_path = os.path.join(umaps_dir, f"bev_epistemic_uncertainty_{step}.npy")
+        ale_path = os.path.join(umaps_dir, f"bev_aleatoric_uncertainty_{step}.npy")
+        
+        if os.path.exists(epi_path) and os.path.exists(ale_path):
+            bev_epi_umap = np.load(epi_path)
+            bev_ale_umap = np.load(ale_path)
+
+
+            # print(f"Loaded BEV maps for step {step} from {umaps_dir}")
+            return bev_epi_umap, bev_ale_umap
+        else:
+            print(f"BEV maps for step {step} not found in {umaps_dir}")
+            return None, None
+        
+    def load_occmap(self,step):
+        # Load occupancy map
+        occ_maps_dir = os.path.join(self.cfg.output_dir, "occ_maps")
+        occ_path = os.path.join(occ_maps_dir, f"bev_occupancy_{step}.npy")
+        
+        if not os.path.exists(occ_path):
+            print(f"Occupancy map for step {step} not found at {occ_path}")
+            return
+        
+        occupancy_map = np.load(occ_path)
+        return occupancy_map
+    
+    def load_simmap(self,step):
+        sim_maps_dir = os.path.join(self.cfg.output_dir, "sim_maps")
+        sim_path = os.path.join(sim_maps_dir, f"bev_similarity_{step}.npy")
+        
+        if not os.path.exists(sim_path):
+            print(f"Similarity map for step {step} not found at {sim_path}")
+            return
+        
+        sim_map = np.load(sim_path)
+        return sim_map
+    
+        epi_map, sim_plot, occ_map, extent = self._prepare_all_maps_data(step)
+        if epi_map is None: return
+
+        fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
+        self._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
+        
+        plt.subplots_adjust(hspace=0.05)
+        plt.savefig(f"./all_maps_step_{step}.png", bbox_inches='tight')
+        plt.show()
+
+    def _prepare_all_maps_data(self, step):
+        """Helper to load, align, and normalize all maps for a given step."""
+        epi_map, _ = self.load_umaps(step)
+        sim_map = self.load_simmap(step)
+        occ_map = self.load_occmap(step)
+
+        if epi_map is None or sim_map is None or occ_map is None:
+            return None, None, None, None
+
+        expected_shape = (self.bev_grid.bev_height, self.bev_grid.bev_width)
+
+        def align_map(map_2d, map_name):
+            if map_2d.shape == expected_shape:
+                return map_2d
+            if map_2d.shape == (expected_shape[1], expected_shape[0]):
+                return map_2d.T
+            return None # Should not happen with current grid system
+
+        epi_map = align_map(epi_map, "epistemic")
+        sim_map = align_map(sim_map, "similarity")
+        occ_map = align_map(occ_map, "occupancy")
+        
+        if epi_map is None or sim_map is None or occ_map is None:
+            return None, None, None, None
+
+        # Normalize similarity
+        non_zero_mask = sim_map > 0
+        if np.any(non_zero_mask):
+            sim_min, sim_max = sim_map[non_zero_mask].min(), sim_map[non_zero_mask].max()
+            sim_plot = np.zeros_like(sim_map)
+            if sim_max > sim_min:
+                sim_plot[non_zero_mask] = (sim_map[non_zero_mask] - sim_min) / (sim_max - sim_min)
+            else:
+                sim_plot[non_zero_mask] = 1.0
+        else:
+            sim_plot = sim_map
+
+        extent = [self.bev_grid.bev_min_x, self.bev_grid.bev_max_x, 
+                  self.bev_grid.bev_min_z, self.bev_grid.bev_max_z]
+        
+        return epi_map, sim_plot, occ_map, extent
+
+    def _render_all_maps_to_axes(self, axes, step, epi_map, sim_plot, occ_map, extent):
+        """Helper to render maps onto provided axes."""
+        # 1) Epistemic uncertainty
+        im_epi = axes[0].imshow(epi_map, cmap='magma', origin='lower', aspect='equal', extent=extent)
+        axes[0].set_ylabel('Z Position (m)', fontsize=12)
+        axes[0].set_title(rf"Epistemic Uncertainty: $\mathbb{{V}}[\mu_\theta]$ (Step {step})", fontsize=13)
+        axes[0].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        plt.colorbar(im_epi, ax=axes[0], fraction=0.046, pad=0.02, shrink=0.5, label='Epistemic Uncertainty')
+
+        epi_stats = f"Min: {epi_map.min():.6f}\nMax: {epi_map.max():.6f}\nMean: {epi_map.mean():.6f}"
+        axes[0].text(0.02, 0.98, epi_stats, transform=axes[0].transAxes, fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        # 2) Occupancy
+        occ_cmap = ListedColormap(['#808080', '#FFFFFF', '#000000'])
+        im_occ = axes[1].imshow(occ_map, cmap=occ_cmap, origin='lower', aspect='equal', extent=extent, vmin=0, vmax=2)
+        axes[1].set_ylabel('Z Position (m)', fontsize=12)
+        axes[1].set_title(f"Occupancy Map (Step {step})", fontsize=13)
+        axes[1].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        cbar_occ = plt.colorbar(im_occ, ax=axes[1], fraction=0.046, pad=0.02, shrink=0.5)
+        cbar_occ.set_ticks([0.33, 1.0, 1.66])
+        cbar_occ.set_ticklabels(['Unseen', 'Free', 'Occupied'])
+
+        occupied_cells = np.sum(occ_map == 2)
+        exploration_rate = (np.sum(occ_map >= 1) / occ_map.size) * 100
+        occ_stats = f"Explored: {exploration_rate:.2f}%\nOccupied: {occupied_cells:,}"
+        axes[1].text(0.02, 0.98, occ_stats, transform=axes[1].transAxes, fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        # 3) Similarity
+        im_sim = axes[2].imshow(sim_plot, cmap='jet', origin='lower', aspect='equal', extent=extent, vmin=0, vmax=1)
+        axes[2].set_xlabel('X Position (m)', fontsize=12)
+        axes[2].set_ylabel('Z Position (m)', fontsize=12)
+        axes[2].set_title(f"Similarity Map (Step {step})", fontsize=13)
+        axes[2].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        plt.colorbar(im_sim, ax=axes[2], fraction=0.046, pad=0.02, shrink=0.5, label='Normalized Similarity')
+
+    def viz_all_maps_history(self, save_path='simulation_history.mp4', fps=2):
+        """Create an MP4 animation of all maps across the entire simulation."""
+        epochs = list(range(0, self.cfg.iterations + 1, self.cfg.viz_interval))
+        print(f"Generating full simulation history animation ({len(epochs)} steps)...")
+        
+        frames = []
+        for step in epochs:
+            epi_map, sim_plot, occ_map, extent = self._prepare_all_maps_data(step)
+            if epi_map is None:
+                continue
+                
+            fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
+            self._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
+            plt.subplots_adjust(hspace=0.05)
+            
+            # Capture frame
+            fig.canvas.draw()
+            frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            frames.append(frame)
+            plt.close(fig)
+            print(f"  Rendered step {step}")
+
+        if frames:
+            imageio.mimsave(save_path, frames, fps=fps, codec='libx264')
+            print(f"Animation saved to: {save_path}")
+        else:
+            print("No maps found to animate.")
+
+
+
+
 
 
 if __name__ == "__main__":
     config = Config("./config/config.yaml")
     visualizer = Visualizer(config)
-    
-    # visualizer.visualize_occupancy(step=20000, height_range=(0.0, 2.0))
-    # visualizer.visualize_sim_map(step=20000)
-    visualizer.visualize_bev_map(visualizer.load_bev_maps(step=20000))
 
-    # visualizer.visualize_cam_similarity(image_idx=11, text_query="a pillow", save_path='cam_similarity.png')
-    # # Example 1: Visualize a single BEV map
-    # bev_maps = visualizer.load_bev_maps(step=40000)
-    # visualizer.visualize_bev_map(bev_maps)
-    
-    # Example 2: Create animated history of BEV maps over training
-    # Setup grid and submap bounds
-    extent = [visualizer.bev_grid.bev_min_x, visualizer.bev_grid.bev_max_x, 
-              visualizer.bev_grid.bev_min_z, visualizer.bev_grid.bev_max_z]
-    grid_size = (visualizer.bev_grid.bev_width, visualizer.bev_grid.bev_height)
-    center_x, center_z = 4, -3 # Submap center in meters
-    side_length = 1  # Submap size in meters
-    box = (center_x, center_z, side_length)
-    grid_params = (extent, grid_size, box)
-    
-    # Create animation (MP4 or GIF)
-    visualizer.viz_map_history(grid_params, save_path='bev_history.mp4', fps=2, format='mp4')
-
-    # # Example 3: Visualize camera view similarity
-    # visualizer.visualize_cam_similarity(image_idx=10, text_query="a chair")
+    # step = 30000
+    # epi_map, sim_plot, occ_map, extent = visualizer._prepare_all_maps_data(step)
+    # fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
+    # visualizer._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
+    # plt.subplots_adjust(hspace=0.05)
+    # plt.savefig(f'./figs/all_maps_step_{step}.png')  
+    visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)

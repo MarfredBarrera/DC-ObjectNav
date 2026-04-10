@@ -141,8 +141,18 @@ class Runner:
 
         print(f"Initializing history buffer (start training after {min_frames_to_start} frames)...")
         for i in range(min_frames_to_start):
+            # Track index before sampling as sample_rgb increments it
+            idx = self.current_image_idx
+            
             # sample_rgb returns CPU tensors
             world_points, gt_features = self.sample_rgb()
+            
+            # Update occupancy grid with the full observation for seen/unseen logic
+            self.occupancy_grid.update_from_observation(
+                self.gt_depths[idx].to(self.device),
+                self.c2ws[idx].to(self.device),
+                self.intrinsics_tuple
+            )
             
             global_point_buffer.append((world_points, gt_features))
             print(f"  Buffered frame {i+1}/{min_frames_to_start}")
@@ -170,7 +180,17 @@ class Runner:
                         gc.collect() # Force collection of old tensors before new allocation
                         torch.cuda.empty_cache() # Clear GPU cache if any GPU tensors were involved in old_points/features
 
+                    # Track index before sampling
+                    idx = self.current_image_idx
                     new_points, new_features = self.sample_rgb()
+                    
+                    # Update occupancy grid with the full observation
+                    self.occupancy_grid.update_from_observation(
+                        self.gt_depths[idx].to(self.device),
+                        self.c2ws[idx].to(self.device),
+                        self.intrinsics_tuple
+                    )
+                    
                     global_point_buffer.append((new_points, new_features))
                     gc.collect()
                     torch.cuda.empty_cache() # Clear GPU cache again
@@ -269,7 +289,8 @@ class Runner:
             batch_features = super_features_gpu[batch_idx]
 
             # record to occupancy grid
-            self.occupancy_grid.update(batch_points)
+            # Use depth-based update (handled during buffer refresh or on-demand)
+            # self.occupancy_grid.update(batch_points)
 
             # --- Training ---
             loss = 0

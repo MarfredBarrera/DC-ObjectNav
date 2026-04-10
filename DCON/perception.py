@@ -173,8 +173,8 @@ class Runner:
         rgb, depth, c2w_hash = self.get_observations()
 
         # 2. Move specific tensors to GPU for processing
-        depth = depth.to(self.device)
-        c2w_hash = c2w_hash.to(self.device)
+        depth_gpu = depth.to(self.device)
+        c2w_hash_gpu = c2w_hash.to(self.device)
 
         rgb_np = (rgb.numpy() * 255).astype(np.uint8)
 
@@ -182,8 +182,8 @@ class Runner:
         clip_features = self.sam_clip.extract_dense_features(rgb_np)
         
         # 4. Unprojection on GPU
-        mask = (depth > 0.1) & (depth < 10.0)
-        world_points = unprojection(depth, self.intrinsics_tuple, c2w_hash, self.device, mask=mask)
+        mask = (depth_gpu > 0.1) & (depth_gpu < 10.0)
+        world_points = unprojection(depth_gpu, self.intrinsics_tuple, c2w_hash_gpu, self.device, mask=mask)
         gt_features = clip_features[mask]
 
         # 5. Filter zero-norm features
@@ -191,8 +191,8 @@ class Runner:
         world_points = world_points[valid_mask]
         gt_features = gt_features[valid_mask]
 
-        # Return CPU tensors to save VRAM
-        return world_points.cpu(), gt_features.cpu()
+        # Return CPU tensors to save VRAM, along with base data for occupancy updates
+        return world_points.cpu(), gt_features.cpu(), depth.cpu(), c2w_hash.cpu()
 
     def _super_batch(self, global_point_buffer, staging_size, recent_sample_portion):
         """
@@ -260,7 +260,15 @@ class Runner:
             self.step_simulator(u)
             
             # Gather state observations
-            world_points, gt_features = self.sample_rgb()
+            world_points, gt_features, depth, c2w = self.sample_rgb()
+            
+            # Update occupancy grid with the full observation
+            self.occupancy_grid.update_from_observation(
+                depth.to(self.device),
+                c2w.to(self.device),
+                self.intrinsics_tuple
+            )
+            
             global_point_buffer.append((world_points, gt_features))
             print(f"  Buffered frame {i+1}/{min_frames_to_start}")
             torch.cuda.empty_cache()
@@ -287,7 +295,15 @@ class Runner:
                     u = [0.0, 5.0]
                     self.step_simulator(u)
                     
-                    new_points, new_features = self.sample_rgb()
+                    new_points, new_features, depth, c2w = self.sample_rgb()
+                    
+                    # Update occupancy grid with the full observation
+                    self.occupancy_grid.update_from_observation(
+                        depth.to(self.device),
+                        c2w.to(self.device),
+                        self.intrinsics_tuple
+                    )
+                    
                     global_point_buffer.append((new_points, new_features))
                     gc.collect()
                     torch.cuda.empty_cache() 
@@ -316,7 +332,7 @@ class Runner:
             batch_features = super_features_gpu[batch_idx]
 
             # Record to occupancy grid
-            self.occupancy_grid.update(batch_points)
+            # self.occupancy_grid.update(batch_points)
 
             # Forward / Train Step
             loss = 0

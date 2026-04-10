@@ -76,7 +76,7 @@ class FeatureField(nn.Module):
             lr=config.hash_lr,
             betas=(0.9, 0.99),
             eps=1e-15,
-            weight_decay=1e-6)
+            weight_decay=1e-5)
 
     def normalize_positions(self, positions):
         """

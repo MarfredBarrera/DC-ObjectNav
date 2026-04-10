@@ -135,7 +135,8 @@ class SimilarityGrid(BEVGrid):
             y_indices = torch.from_numpy(y_idx).to(self.device)
 
             occ_map = occupancy_grid.occupancy_map
-            mask = (occ_map[y_indices, z_indices, x_indices] == 1)
+            # Use state 2 (occupied) for masking
+            mask = (occ_map[y_indices, z_indices, x_indices] == occupancy_grid.occupied_val)
             query_points = points[mask.cpu().numpy()]
         else:
             query_points = points
@@ -223,18 +224,26 @@ class OccupancyGrid(BEVGrid):
         self._init_map()
         
     def _init_map(self):
-        # Initialize 3D zero map (0 = free/unknown, 1 = occupied/visited)
+        # Occupancy States: 0 = unseen, 1 = free, 2 = occupied
+        self.unseen_val = 0
+        self.free_val = 1
+        self.occupied_val = 2
+        
+        # Initialize 3D zero map (entirely unseen)
         # Shape: (Y/Height_Samples, Z/Height, X/Width)
         if self.bev_width > 0 and self.bev_height > 0:
-            self.occupancy_map = torch.zeros((self.height_samples, self.bev_height, self.bev_width), device=self.device, dtype=torch.uint8)
+            self.occupancy_map = torch.full((self.height_samples, self.bev_height, self.bev_width), 
+                                          self.unseen_val, 
+                                          device=self.device, 
+                                          dtype=torch.uint8)
 
-    def update(self, points, min_y=None, max_y=None):
-        """Update occupancy map from 3D points within the specified height range."""
+    def update(self, points, min_y=0.2, max_y=1.5):
+        """Update occupancy map from 3D points within the specified height range (marks as occupied)."""
         if not self.bev_initialized: return
 
         # Use provided filter range or fall back to scene bounds
-        f_min_y = min_y if min_y is not None else self.bev_min_y
-        f_max_y = max_y if max_y is not None else self.bev_max_y
+        f_min_y = min_y
+        f_max_y = max_y
 
         mask = (points[:, 0] >= self.bev_min_x) & (points[:, 0] < self.bev_max_x) & \
             (points[:, 2] >= self.bev_min_z) & (points[:, 2] < self.bev_max_z) & \
@@ -255,10 +264,103 @@ class OccupancyGrid(BEVGrid):
         z_indices = torch.clamp(z_indices, 0, self.bev_height - 1)
         y_indices = torch.clamp(y_indices, 0, self.height_samples - 1)
         
-        # Set occupancy (1 for occupied)
-        self.occupancy_map[y_indices, z_indices, x_indices] = 1
+        # Set occupancy (2 for occupied)
+        self.occupancy_map[y_indices, z_indices, x_indices] = self.occupied_val
 
-    def get_2d_map(self, min_y=None, max_y=None):
+    def update_from_observation(self, depth, c2w, intrinsics, max_dist=10.0, thickness=0.05):
+        """
+        Update grid states (free/occupied) using a camera observation.
+        Estimates FOV and projects grid cells into camera frame.
+        """
+        if not self.bev_initialized or self.occupancy_map is None:
+            return
+
+        fx, fy, cx, cy, H, W = intrinsics
+        
+        # Estimate FOV for filtering
+        fov_x = 2 * np.arctan(W / (2 * fx))
+        fov_y = 2 * np.arctan(H / (2 * fy))
+        
+        # 1. Get world coordinates of all grid cells
+        # Create grid coordinates
+        y_coords = torch.linspace(self.bev_min_y, self.bev_max_y, self.height_samples, device=self.device)
+        z_coords = torch.linspace(self.bev_min_z + self.bev_resolution/2, self.bev_max_z - self.bev_resolution/2, self.bev_height, device=self.device)
+        x_coords = torch.linspace(self.bev_min_x + self.bev_resolution/2, self.bev_max_x - self.bev_resolution/2, self.bev_width, device=self.device)
+        
+        # Grid indices
+        Y_idx, Z_idx, X_idx = torch.meshgrid(
+            torch.arange(self.height_samples, device=self.device),
+            torch.arange(self.bev_height, device=self.device),
+            torch.arange(self.bev_width, device=self.device),
+            indexing='ij'
+        )
+        
+        # World coordinates (sampled at cell centers)
+        Y_pts, Z_pts, X_pts = torch.meshgrid(y_coords, z_coords, x_coords, indexing='ij')
+        
+        # Flatten for processing
+        pts_world = torch.stack([X_pts.flatten(), Y_pts.flatten(), Z_pts.flatten(), torch.ones_like(X_pts.flatten())], dim=1)
+        
+        # 2. Transform to camera space
+        # w2c = inverse(c2w)
+        w2c = torch.inverse(c2w)
+        pts_cam = (w2c @ pts_world.T).T
+        
+        # 3. Filter by distance and view frustum
+        dist = pts_cam[:, 2]
+        frustum_mask = (dist > 0.1) & (dist < max_dist)
+        
+        if not frustum_mask.any():
+            return
+            
+        pts_cam_valid = pts_cam[frustum_mask]
+        
+        # Project to pixels
+        u = (pts_cam_valid[:, 0] * fx / pts_cam_valid[:, 2]) + cx
+        v = (pts_cam_valid[:, 1] * fy / pts_cam_valid[:, 2]) + cy
+        
+        # Bound check
+        in_view = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        
+        # Combine masks
+        final_mask = frustum_mask.clone()
+        final_mask[frustum_mask.clone()] = in_view
+        
+        if not final_mask.any():
+            return
+            
+        # Get indices and coordinates for cells in view
+        valid_u = u[in_view].long()
+        valid_v = v[in_view].long()
+        valid_dist = pts_cam_valid[in_view, 2]
+        
+        # Sample depth map
+        observed_depth = depth[valid_v, valid_u]
+        
+        # Determine states
+        new_states = torch.full_like(valid_dist, self.unseen_val, dtype=torch.uint8)
+        
+        # Free: distance < observed_depth - thickness
+        # Occupied: abs(distance - observed_depth) < thickness
+        free_mask = valid_dist < (observed_depth - thickness)
+        occ_mask = torch.abs(valid_dist - observed_depth) < thickness
+        
+        new_states[free_mask] = self.free_val
+        new_states[occ_mask] = self.occupied_val
+        
+        # Map back to grid indices
+        valid_Y_idx = Y_idx.flatten()[final_mask]
+        valid_Z_idx = Z_idx.flatten()[final_mask]
+        valid_X_idx = X_idx.flatten()[final_mask]
+        
+        # Update map: User priority: free overrides occupied if seen as free now, 
+        # but unseen should not override anything.
+        # We'll update any that are seen as free or occupied.
+        update_mask = (new_states != self.unseen_val)
+        
+        self.occupancy_map[valid_Y_idx[update_mask], valid_Z_idx[update_mask], valid_X_idx[update_mask]] = new_states[update_mask]
+
+    def get_2d_map(self, min_y=0.2, max_y=1.5):
         """Returns 2D BEV occupancy map (1 if any cell in column is occupied)."""
         if self.occupancy_map is None: return None
 
