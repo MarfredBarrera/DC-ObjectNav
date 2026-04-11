@@ -2,121 +2,67 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
-import gc
-import json
-import math
-import random
-import time
-import torch
-import numpy as np
-import cv2
-import magnum as mn
-import matplotlib.pyplot as plt
-
-# User Dev Imports
-from src.grid import UncertaintyGrid, SimilarityGrid
-from src.config import Config
-from src.gaussians import GaussianSplatting
-from src.semantics import SAM_CLIP_Semantics
-from src.utils import unprojection
-from src.featurefield import FeatureField
-
-# Habitat Imports
-import habitat_sim
-import habitat_sim.utils.common as utils
-import habitat_sim.physics as physics
-
 
 # Silence habitat-sim warnings and logs
 os.environ['GLOG_minloglevel'] = '2'
 os.environ['MAGNUM_LOG'] = 'quiet'
 os.environ['HABITAT_SIM_LOG'] = 'quiet'
 
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+# User Dev Imports
+from src.grid import UncertaintyGrid, SimilarityGrid
+from src.config import Config
+from src.semantics import SAM_CLIP_Semantics
+from src.featurefield import FeatureField
+from src.habitat_utils import (
+    make_cfg,
+    get_scene_bounds_from_pathfinder,
+    spawn_agent_at_random_navpoint,
+    init_simulator,
+)
+from src.sim_interface import SimInterface
+
+import habitat_sim
+
 
 
 # --------------------------------------------------------
-# Habitat Configuration & Helpers
+# Planner
 # --------------------------------------------------------
-def get_camera_matrix(agent):
-    # 1. Get the state of the specific sensor 'rgb'
-    state = agent.get_state().sensor_states['rgb']
-    # 2. Extract Rotation (Quaternion) and Translation (Vector)
-    rot_quat = state.rotation
-    translation = state.position
-    # 3. Convert Quaternion to 3x3 Rotation Matrix
-    rot_mat = utils.quat_to_magnum(rot_quat).to_matrix()
-    rot_mat = np.array(rot_mat)
-    # 4. Build 4x4 Matrix
-    transform_matrix = np.eye(4)
-    transform_matrix[:3, :3] = rot_mat
-    transform_matrix[:3, 3] = translation
-    
-    return transform_matrix
-
-def make_cfg(scene_filepath):
-    sim_cfg = habitat_sim.SimulatorConfiguration()
-    sim_cfg.scene_id = scene_filepath
-    sim_cfg.enable_physics = False
-    sim_cfg.load_semantic_mesh = False
-
-    # Define Sensors
-    rgb_sensor = habitat_sim.CameraSensorSpec()
-    rgb_sensor.uuid = "rgb"
-    rgb_sensor.sensor_type = habitat_sim.SensorType.COLOR
-    rgb_sensor.resolution = [512, 512] 
-    rgb_sensor.position = [0.0, 1.5, 0.0]
-    rgb_sensor.orientation = [0.0, 0.0, 0.0]
-
-    # Add depth sensor
-    depth_sensor = habitat_sim.CameraSensorSpec()
-    depth_sensor.uuid = "depth"
-    depth_sensor.sensor_type = habitat_sim.SensorType.DEPTH
-    depth_sensor.resolution = [512, 512]
-    depth_sensor.position = [0.0, 1.5, 0.0]  
-    depth_sensor.orientation = [0.0, 0.0, 0.0]
-
-    agent_cfg = habitat_sim.agent.AgentConfiguration()
-    agent_cfg.sensor_specifications = [rgb_sensor, depth_sensor]
-
-    return habitat_sim.Configuration(sim_cfg, [agent_cfg])
-
-
 
 class Planner:
-    def __init__(self, cfg: Config, sim, agent):
-        self.cfg = cfg
-        self.device = self.cfg.device
-        
-        # Simulation References
-        self.sim = sim
-        self.agent = agent
-        self.frames_processed = 0
-        
-        # Velocity Controller Setup for continuous kinematics
-        self.vel_control = physics.VelocityControl()
-        self.vel_control.controlling_lin_vel = True
-        self.vel_control.controlling_ang_vel = True
-        
-        # Habitat (OpenGL: -Z forward, Y up) -> GSplat (OpenCV: +Z forward, -Y up)
-        self.convert_mat = np.array([[1,0,0,0], [0,-1,0,0], [0,0,-1,0], [0,0,0,1]])
+    """Planning interface that reads pre-built maps from a PerceptionStack.
 
-        # Intrinsics (Calculated from Habitat Config)
-        self.H, self.W = 512, 512
-        fov_x = math.radians(90.0)
-        self.fx = 0.5 * self.W / math.tan(0.5 * fov_x)
-        self.fy = self.fx
-        self.cx, self.cy = self.W / 2.0, self.H / 2.0
-        self.intrinsics_tuple = (self.fx, self.fy, self.cx, self.cy, self.H, self.W)
+    Parameters
+    ----------
+    cfg:
+        Project Config object.
+    sim_iface:
+        A :class:`src.sim_interface.SimInterface` providing robot control.
+    scene_bounds:
+        Two-element list ``[min_corner, max_corner]``.
+    """
+
+    def __init__(self, cfg: Config, sim_iface: SimInterface, scene_bounds: list):
+        self.cfg = cfg
+        self.device = cfg.device
+        self.scene_bounds = scene_bounds  # stored so load_ensemble can use it
+
+        # SimInterface for robot control and sensor reads
+        self.sim_iface = sim_iface
 
         # Semantics and Ensemble Models
-        self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
+        self.sam_clip = SAM_CLIP_Semantics(cfg, device=self.device)
         self.ensemble_models = [
-            FeatureField(self.cfg, device=self.device) 
-            for _ in range(self.cfg.ensemble_num_models)
+            FeatureField(cfg, scene_bounds=scene_bounds, device=self.device)
+            for _ in range(cfg.ensemble_num_models)
         ]
 
-        self.ugrid = UncertaintyGrid(cfg, ensemble=self.ensemble_models)
-        self.sim_map = SimilarityGrid(cfg, ensemble=self.ensemble_models, sam_clip=self.sam_clip)
+        self.ugrid = UncertaintyGrid(cfg, ensemble=self.ensemble_models, scene_bounds=scene_bounds)
+        self.sim_map = SimilarityGrid(cfg, ensemble=self.ensemble_models, sam_clip=self.sam_clip, scene_bounds=scene_bounds)
 
     def set_umap(self, step=20000):
         epi_map, _ = self.load_umap(step=step)
@@ -154,8 +100,8 @@ class Planner:
         for i in range(self.cfg.ensemble_num_models):
             model_path = os.path.join(ensemble_dir, f"featurefield_ensemble_{i}.pt")
             if os.path.exists(model_path):
-                # Initialize a new FeatureField instance
-                model = FeatureField(self.cfg, device=self.device)
+                # Initialise using the same scene_bounds as the grid members
+                model = FeatureField(self.cfg, scene_bounds=self.scene_bounds, device=self.device)
                 model.load(model_path)
                 ensemble_models.append(model)
                 print(f"  -> Loaded Ensemble Model {i}")
@@ -241,49 +187,26 @@ class Planner:
             print("Unable to visualize BEV maps due to missing data.")
 
 
-    def step_simulator(self, u, dt=0.1):
+    def step(self, u: list, dt: float = 0.1) -> None:
+        """Advance the simulator by one step via SimInterface.
+
+        Parameters
+        ----------
+        u:
+            ``[forward_velocity, yaw_angular_velocity]``
+        dt:
+            Integration time-step in seconds.
         """
-        Advances the agent kinematically using the control input u.
-        u: [forward_velocity, yaw_angular_velocity]
-        """
-        lin_vel, ang_vel = u[0], u[1]
-        
-        # 1. Apply Continuous Velocity Commands (Habitat forward is -Z)
-        self.vel_control.linear_velocity = np.array([0.0, 0.0, -lin_vel])
-        self.vel_control.angular_velocity = np.array([0.0, ang_vel, 0.0])
-        
-        # 2. Integrate kinematics using Magnum bindings
-        agent_state = self.agent.get_state()
-        magnum_rotation = utils.quat_to_magnum(agent_state.rotation)
-        magnum_translation = mn.Vector3(agent_state.position)
-        rigid_state = habitat_sim.RigidState(magnum_rotation, magnum_translation)
-        
-        new_rigid_state = self.vel_control.integrate_transform(dt, rigid_state)
-        
-        agent_state.position = np.array(new_rigid_state.translation)
-        agent_state.rotation = utils.quat_from_magnum(new_rigid_state.rotation) 
-        self.agent.set_state(agent_state)
+        self.sim_iface.step(u, dt)
 
     def get_observations(self):
+        """Read sensor data via SimInterface.
+
+        Returns
+        -------
+        (rgb, depth, c2w) — same semantics as SimInterface.get_observations()
         """
-        Grabs the current sensor data from the simulator and formats it for PyTorch.
-        """
-        obs = self.sim.get_sensor_observations()
-        rgb_rgba = obs["rgb"]
-        depth = obs["depth"]
-
-        # Format for PyTorch
-        rgb_rgb = rgb_rgba[..., :3] # Strip Alpha channel
-        rgb_tensor = torch.from_numpy(rgb_rgb).float() / 255.0
-        depth_tensor = torch.from_numpy(depth).float()
-
-        c2w_hab = get_camera_matrix(self.agent)
-        c2w_cv = c2w_hab @ self.convert_mat
-        c2w_tensor = torch.from_numpy(c2w_cv).float()
-        
-        self.frames_processed += 1
-
-        return rgb_tensor, depth_tensor, c2w_tensor
+        return self.sim_iface.get_observations()
 
 
 
@@ -298,36 +221,22 @@ class Planner:
 # Main Execution
 # --------------------------------------------------------
 if __name__ == "__main__":
-    
-    # 1. Init Habitat sim
-    scene = "/workspace/DCON/gibson_scenes/Anaheim.glb"
-    sim_config = make_cfg(scene)
 
-    try:
-        sim = habitat_sim.Simulator(sim_config)
-    except Exception as e:
-        print(f"Error loading simulator: {e}")
-        exit()
-
-    agent = sim.initialize_agent(0)
-
-    if sim.pathfinder.is_loaded:
-        nav_point = sim.pathfinder.get_random_navigable_point()
-        initial_state = habitat_sim.AgentState()
-        initial_state.position = nav_point
-        agent.set_state(initial_state)
-        print(f"Agent spawned at: {nav_point}")
-    else:
-        print("Warning: No navmesh found. Agent spawned at origin.")
-
-    # 2. Init runner
     cfg = Config("config/config.yaml")
-    planner = Planner(cfg, sim, agent)
+
+    # 1. Init Habitat simulator
+    sim, agent = init_simulator(cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov)
+    spawn_agent_at_random_navpoint(sim, agent)
+    scene_bounds = get_scene_bounds_from_pathfinder(sim)
+
+    # 2. Build interfaces
+    sim_iface = SimInterface(cfg, sim, agent)
+    planner = Planner(cfg, sim_iface, scene_bounds)
+
     planner.load_ensemble()
     # planner.set_umap(step=30000)
     # planner.viz_umap()
     planner.set_sim_map(planner.get_sim_map())
     planner.viz_sim_map()
-    
 
     sim.close()

@@ -192,10 +192,10 @@ class SimilarityGrid(BEVGrid):
         return 
     
     def get_2d_map(self):
-        """Returns 2D BEV similarity map (max similarity across height)."""
+        """Returns 2D BEV similarity map (sum similarity across height)."""
         if self.bev_sim_map_3d is None:
             return None
-        # Max over height samples (dim 0) -> (Z, X)
+        # Sum over height samples (dim 0) -> (Z, X)
         grid_2d, _ = self.bev_sim_map_3d.max(dim=0)
         return grid_2d
     

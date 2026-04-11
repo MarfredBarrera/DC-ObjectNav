@@ -824,10 +824,14 @@ if __name__ == "__main__":
     config = Config("./config/config.yaml")
     visualizer = Visualizer(config)
 
-    # step = 30000
-    # epi_map, sim_plot, occ_map, extent = visualizer._prepare_all_maps_data(step)
-    # fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
-    # visualizer._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
-    # plt.subplots_adjust(hspace=0.05)
-    # plt.savefig(f'./figs/all_maps_step_{step}.png')  
-    visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)
+    step = 6000
+
+    epi_map, ale_map = visualizer.load_umaps(step)
+    visualizer.visualize_bev_map((epi_map, ale_map))
+
+    epi_map, sim_plot, occ_map, extent = visualizer._prepare_all_maps_data(step)
+    fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
+    visualizer._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
+    plt.subplots_adjust(hspace=0.05)
+    plt.savefig(f'./figs/all_maps_step_{step}.png')  
+    # visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)
