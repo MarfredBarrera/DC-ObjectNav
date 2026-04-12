@@ -43,6 +43,7 @@ class PerceptionStack:
         )
 
         self._replay_buffer = []  # list of (points_cpu, features_cpu)
+        self.target_query = ""
 
     def observe(
         self,
@@ -141,24 +142,25 @@ class PerceptionStack:
     def update_maps(
         self,
         step: int,
-        target_query: str = "a pillow",
-        height_filter: tuple = (0.1, 2.0),
-        height_samples: int = 10,
         batch_size: int = 100_000,
     ) -> None:
-        """Compute and save all BEV maps (uncertainty, occupancy, similarity). Intended for low-frequency calls."""
+        """Compute and save all VOXEL maps (uncertainty, occupancy, similarity). Intended for low-frequency calls."""
         t0 = time.time()
 
-        self.ugrid.forward_pass(height_filter=height_filter, height_samples=height_samples, batch_size=batch_size)
+        # Uncertainty Reduction
+        self.ugrid.forward_pass(batch_size=batch_size)
         self.ugrid.save(step)
-        self.ugrid.clear_umaps()
+        # self.ugrid.clear_umaps()
 
+        # Occupancy (already updated incrementally, just save)
+        # Note: we can pass height_filter to get_2d_map in save if we refactor save
         self.occupancy_grid.save(step)
 
-        self.similarity_grid.compute_similarity_map(target_query, occupancy_grid=self.occupancy_grid)
+        # Similarity
+        self.similarity_grid.compute_similarity_map(self.target_query, occupancy_grid=self.occupancy_grid)
         self.similarity_grid.save(step)
 
-        print(f"Maps saved at step {step} ({time.time() - t0:.1f}s)")
+        print(f"Maps saved at step {step} ({time.time() - t0:.2f}s)")
 
     def save_models(self) -> None:
         for i, model in enumerate(self.ensemble):

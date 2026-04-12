@@ -1,10 +1,8 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 import matplotlib
 matplotlib.use('Agg')
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
-import json
-import math
 import time
 import torch
 import numpy as np
@@ -22,9 +20,7 @@ import habitat_sim.physics as physics
 
 # Custom Imports
 from src.config import Config
-from src.gaussians import GaussianSplatting
 from src.semantics import SAM_CLIP_Semantics
-from src.utils import unprojection
 from src.featurefield import FeatureField
 from src.grid import UncertaintyGrid
 
@@ -53,60 +49,13 @@ class Visualizer:
         self.device = self.cfg.device
         self.scene_bounds = get_scene_bounds(self.cfg.scene_path)
 
-        # 1. Load Data
-        print(f"Loading data from {self.cfg.output_dir}...")
-        self.gt_images, self.gt_depths, self.c2ws, self.intrinsics_tuple = self._load_scene_data()
-        self.fx, self.fy, self.cx, self.cy, self.H, self.W = self.intrinsics_tuple
-        self.num_cameras = len(self.gt_images)
-
-        # 2. Semantics
-        self.sam_clip = SAM_CLIP_Semantics(self.cfg, device=self.device)
-
-        # 3. Ensemble Models
+        # 1. Ensemble Models
         self.ensemble_models = self.load_ensemble()
 
-        # 4. BEV Grid
+        # 2. BEV Grid
         self.bev_grid = UncertaintyGrid(cfg, ensemble=self.ensemble_models, scene_bounds=self.scene_bounds)
 
-    def _load_scene_data(self):
-        json_path = os.path.join(self.cfg.output_dir, "transforms.json")
-        with open(json_path, 'r') as f:
-            meta = json.load(f)
-
-        frames = meta['frames']
-        img_0 = imageio.imread(os.path.join(self.cfg.output_dir, frames[0]['file_path']))
-        H, W = img_0.shape[:2]
-        
-        fov_x = meta['camera_angle_x']
-        fx = 0.5 * W / math.tan(0.5 * fov_x)
-        fy = fx
-        cx, cy = W / 2.0, H / 2.0
-
-        gt_images, gt_depths, c2w_matrices = [], [], []
-
-        # Habitat (OpenGL) -> GSplat (OpenCV)
-        convert_mat = np.array([[1,0,0,0], [0,-1,0,0], [0,0,-1,0], [0,0,0,1]])
-
-        for frame in frames:
-            # RGB
-            rgb_path = os.path.join(self.cfg.output_dir, frame['file_path'])
-            rgb = imageio.imread(rgb_path)
-            gt_images.append(torch.from_numpy(rgb).float().to(self.device) / 255.0)
-
-            # Depth
-            depth_name = os.path.basename(frame['file_path']).replace("rgb", "depth").replace(".png", ".npy")
-            depth_path = os.path.join(self.cfg.output_dir, "depth_data", depth_name)
-            depth = np.load(depth_path)
-            if depth.shape[:2] != (H, W):
-                depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
-            gt_depths.append(torch.from_numpy(depth).float().to(self.device))
-
-            # Pose
-            c2w_hab = np.array(frame['transform_matrix'])
-            c2w_cv = c2w_hab @ convert_mat
-            c2w_matrices.append(torch.from_numpy(c2w_cv).float().to(self.device))
-
-        return torch.stack(gt_images), torch.stack(gt_depths), torch.stack(c2w_matrices), (fx, fy, cx, cy, H, W)
+    # Legacy camera data loading removed.
     
 
     def load_ensemble(self):
@@ -132,21 +81,7 @@ class Visualizer:
 
         return ensemble_models
 
-    # def _align_map_to_grid(self, map_2d, map_name="map"):
-    #     """Ensure map is shaped as (bev_height, bev_width) for plotting."""
-    #     expected = (self.bev_grid.bev_height, self.bev_grid.bev_width)
-    #     swapped = (self.bev_grid.bev_width, self.bev_grid.bev_height)
-
-    #     if map_2d.shape == expected:
-    #         return map_2d
-    #     if map_2d.shape == swapped:
-    #         print(f"Transposing {map_name} to match BEV grid orientation.")
-    #         return map_2d.T
-
-    #     raise ValueError(
-    #         f"{map_name} shape {map_2d.shape} does not match BEV grid "
-    #         f"{expected} (or swapped {swapped})"
-    #     )
+    # Transpose logic removed as discretization is now unified.
         
     def visualize_bev_map(self, u_maps):
         """Visualize the BEV uncertainty maps."""
@@ -154,11 +89,8 @@ class Visualizer:
         
         if bev_epi_2d is not None and bev_ale_2d is not None:
             # Reshape from flattened (N,) to 2D (bev_height, bev_width)
-            # bev_epi_2d = bev_epi_umap.reshape(self.bev_grid.bev_height, self.bev_grid.bev_width)
-            # bev_ale_2d = bev_ale_umap.reshape(self.bev_grid.bev_height, self.bev_grid.bev_width)
-            
             fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-            extent = [self.bev_grid.bev_min_x, self.bev_grid.bev_max_x, self.bev_grid.bev_min_z, self.bev_grid.bev_max_z]
+            extent = [self.bev_grid.min_x, self.bev_grid.max_x, self.bev_grid.min_z, self.bev_grid.max_z]
 
             # Epistemic Uncertainty Map
             im1 = axes[0].imshow(bev_epi_2d, cmap='magma', origin='lower', aspect='equal', extent=extent)
@@ -263,7 +195,7 @@ class Visualizer:
         extent, grid_size, box = grid_params
         center_x, center_z, side_length = box
         min_x, max_x, min_z, max_z = extent
-        bev_width, bev_height = grid_size
+        num_x, num_z = grid_size
 
         # explored box
         explored_side = side_length * 2
@@ -440,102 +372,11 @@ class Visualizer:
         plt.tight_layout()
         plt.show()
 
-    def visualize_cam_similarity(self, image_idx, text_query, save_path=None):
-        """
-        Visualize 2D similarity map from a specific camera view using the ensemble.
-        """
-        # 1. Get Data
-        gt_image = self.gt_images[image_idx].cpu().numpy()
-        depth = self.gt_depths[image_idx] # (H, W)
-        c2w = self.c2ws[image_idx]
-        
-        # 2. Unproject to 3D
-        mask = (depth > 0.1) & (depth < 10.0)
-        # unprojection returns (N, 3) when mask is provided
-        world_points = unprojection(depth, self.intrinsics_tuple, c2w, self.device, mask=mask)
-        
-        if world_points.shape[0] == 0:
-            print("No valid points in this view.")
-            return
-
-        # 3. Text Embedding
-        inputs = self.sam_clip.clip_processor(text=[text_query], return_tensors="pt", padding=True).to(self.device)
-        with torch.no_grad():
-            text_embed = self.sam_clip.clip_model.get_text_features(**inputs)
-            text_embed /= text_embed.norm(dim=-1, keepdim=True)
-
-        # 4. Ensemble Query
-        batch_size = 50000
-        total_points = world_points.shape[0]
-        sim_values = torch.zeros(total_points, device=self.device)
-        
-        num_batches = int(np.ceil(total_points / batch_size))
-        
-        print(f"Computing camera-view similarity for '{text_query}' ({total_points} points)...")
-
-        with torch.no_grad():
-            for i in range(num_batches):
-                start = i * batch_size
-                end = min((i + 1) * batch_size, total_points)
-                batch_pts = world_points[start:end]
-                
-                # Get mean features from each model
-                batch_means = []
-                for model in self.ensemble_models:
-                    mean, _ = model.forward(batch_pts, normalize=True)
-                    batch_means.append(mean)
-                
-                # Average across ensemble (Mean of Means)
-                ensemble_mean = torch.stack(batch_means, dim=0).mean(dim=0)
-                ensemble_mean = ensemble_mean / (ensemble_mean.norm(dim=-1, keepdim=True) + 1e-8)
-                
-                # Compute Similarity
-                sim = torch.matmul(ensemble_mean, text_embed.T).squeeze(-1)
-                sim = (sim + 1.0) / 2.0
-                sim_values[start:end] = sim
-
-        # 5. Reconstruct 2D Map
-        H, W = self.H, self.W
-        sim_map = torch.zeros((H, W), device=self.device)
-        sim_map[mask] = sim_values
-        sim_map_np = sim_map.cpu().numpy()
-
-        # 6. Normalize for visualization, excluding bottom 10%
-        valid_scores = sim_map_np[mask.cpu().numpy()]
-        if valid_scores.shape[0] > 0:
-            vmin = np.percentile(valid_scores, 10)
-            vmax = valid_scores.max()
-        else:
-            vmin, vmax = 0, 1
-        
-        # 7. Visualize
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        
-        axes[0].imshow(gt_image)
-        axes[0].set_title(f"RGB View {image_idx}")
-        axes[0].axis('off')
-        
-        im = axes[1].imshow(sim_map_np, cmap='jet', vmin=vmin, vmax=vmax)
-        axes[1].set_title(f"Ensemble Sim: '{text_query}'")
-        axes[1].axis('off')
-        
-        plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path)
-            print(f"Saved to {save_path}")
-            
-        plt.show()
+    # visualize_cam_similarity logic removed as it depends on transforms.json.
 
     def visualize_occupancy(self, step, height_range=None):
         """
         Visualize the occupancy map for a specific training step.
-        
-        Args:
-            step: Training iteration number
-            height_range: Optional tuple (min_height, max_height) for reference/display.
-                         If None, uses full scene height bounds.
         """
         # Load occupancy map
         occ_maps_dir = os.path.join(self.cfg.output_dir, "occ_maps")
@@ -546,16 +387,15 @@ class Visualizer:
             return
         
         occupancy_map = np.load(occ_path)
-        # occupancy_map = self._align_map_to_grid(occupancy_map, map_name="occupancy map")
         print(f"Loaded occupancy map: {occupancy_map.shape}")
         
-        # Get grid extent from BEV grid
-        extent = [self.bev_grid.bev_min_x, self.bev_grid.bev_max_x, 
-                  self.bev_grid.bev_min_z, self.bev_grid.bev_max_z]
+        # Get grid extent from grid
+        extent = [self.bev_grid.min_x, self.bev_grid.max_x, 
+                  self.bev_grid.min_z, self.bev_grid.max_z]
         
         # Determine height range for display
         if height_range is None:
-            height_range = (self.bev_grid.bev_min_y, self.bev_grid.bev_max_y)
+            height_range = (self.bev_grid.min_y, self.bev_grid.max_y)
         
         # Visualize
         fig, ax = plt.subplots(figsize=(10, 8))
@@ -583,7 +423,7 @@ class Visualizer:
             f'Unseen Cells: {unseen_cells:,}\n'
             f'Exploration Rate: {exploration_rate:.2f}%\n'
             f'Occupancy Rate: {occupancy_rate:.2f}%\n'
-            f'Resolution: {self.bev_grid.bev_resolution}m/cell\n'
+            f'Resolution: {self.bev_grid.resolution}m/cell\n'
             f'Grid Size: {occupancy_map.shape[1]} × {occupancy_map.shape[0]}'
         )
         ax.text(
@@ -616,7 +456,6 @@ class Visualizer:
             return
         
         sim_map = np.load(sim_path)
-        sim_map = self._align_map_to_grid(sim_map, map_name="similarity map")
         print(f"Loaded similarity map: {sim_map.shape}")
 
         # Exclude all zero scores and normalize
@@ -638,8 +477,8 @@ class Visualizer:
             print("All scores are zero!")
         
         # Get grid extent from BEV grid
-        extent = [self.bev_grid.bev_min_x, self.bev_grid.bev_max_x, 
-                  self.bev_grid.bev_min_z, self.bev_grid.bev_max_z]
+        extent = [self.bev_grid.min_x, self.bev_grid.max_x, 
+                  self.bev_grid.min_z, self.bev_grid.max_z]
         
         # Visualize
         fig, ax = plt.subplots(figsize=(10, 8))
@@ -716,7 +555,7 @@ class Visualizer:
         if epi_map is None or sim_map is None or occ_map is None:
             return None, None, None, None
 
-        expected_shape = (self.bev_grid.bev_height, self.bev_grid.bev_width)
+        expected_shape = (self.bev_grid.num_z, self.bev_grid.num_x)
 
         def align_map(map_2d, map_name):
             if map_2d.shape == expected_shape:
@@ -744,8 +583,8 @@ class Visualizer:
         else:
             sim_plot = sim_map
 
-        extent = [self.bev_grid.bev_min_x, self.bev_grid.bev_max_x, 
-                  self.bev_grid.bev_min_z, self.bev_grid.bev_max_z]
+        extent = [self.bev_grid.min_x, self.bev_grid.max_x, 
+                  self.bev_grid.min_z, self.bev_grid.max_z]
         
         return epi_map, sim_plot, occ_map, extent
 
@@ -753,8 +592,9 @@ class Visualizer:
         """Helper to render maps onto provided axes."""
         # 1) Epistemic uncertainty
         im_epi = axes[0].imshow(epi_map, cmap='magma', origin='lower', aspect='equal', extent=extent)
+        axes[0].set_xlabel('X Position (m)', fontsize=12)
         axes[0].set_ylabel('Z Position (m)', fontsize=12)
-        axes[0].set_title(rf"Epistemic Uncertainty: $\mathbb{{V}}[\mu_\theta]$ (Step {step})", fontsize=13)
+        axes[0].set_title(rf"Uncertainty: $\mathbb{{V}}[\mu_\theta]$ (Step {step})", fontsize=11)
         axes[0].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         plt.colorbar(im_epi, ax=axes[0], fraction=0.046, pad=0.02, shrink=0.5, label='Epistemic Uncertainty')
 
@@ -765,8 +605,9 @@ class Visualizer:
         # 2) Occupancy
         occ_cmap = ListedColormap(['#808080', '#FFFFFF', '#000000'])
         im_occ = axes[1].imshow(occ_map, cmap=occ_cmap, origin='lower', aspect='equal', extent=extent, vmin=0, vmax=2)
+        axes[1].set_xlabel('X Position (m)', fontsize=12)
         axes[1].set_ylabel('Z Position (m)', fontsize=12)
-        axes[1].set_title(f"Occupancy Map (Step {step})", fontsize=13)
+        axes[1].set_title(f"Occupancy Map (Step {step})", fontsize=11)
         axes[1].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         cbar_occ = plt.colorbar(im_occ, ax=axes[1], fraction=0.046, pad=0.02, shrink=0.5)
         cbar_occ.set_ticks([0.33, 1.0, 1.66])
@@ -782,7 +623,7 @@ class Visualizer:
         im_sim = axes[2].imshow(sim_plot, cmap='jet', origin='lower', aspect='equal', extent=extent, vmin=0, vmax=1)
         axes[2].set_xlabel('X Position (m)', fontsize=12)
         axes[2].set_ylabel('Z Position (m)', fontsize=12)
-        axes[2].set_title(f"Similarity Map (Step {step})", fontsize=13)
+        axes[2].set_title(f"Similarity Map (Step {step})", fontsize=11)
         axes[2].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         plt.colorbar(im_sim, ax=axes[2], fraction=0.046, pad=0.02, shrink=0.5, label='Normalized Similarity')
 
@@ -797,9 +638,9 @@ class Visualizer:
             if epi_map is None:
                 continue
                 
-            fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
             self._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
-            plt.subplots_adjust(hspace=0.05)
+            plt.subplots_adjust(wspace=0.3)
             
             # Capture frame
             fig.canvas.draw()
@@ -824,14 +665,14 @@ if __name__ == "__main__":
     config = Config("./config/config.yaml")
     visualizer = Visualizer(config)
 
-    step = 6000
+    # step = 10000
 
-    epi_map, ale_map = visualizer.load_umaps(step)
-    visualizer.visualize_bev_map((epi_map, ale_map))
+    # epi_map, ale_map = visualizer.load_umaps(step)
+    # visualizer.visualize_bev_map((epi_map, ale_map))
 
-    epi_map, sim_plot, occ_map, extent = visualizer._prepare_all_maps_data(step)
-    fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
-    visualizer._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
-    plt.subplots_adjust(hspace=0.05)
-    plt.savefig(f'./figs/all_maps_step_{step}.png')  
-    # visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)
+    # epi_map, sim_plot, occ_map, extent = visualizer._prepare_all_maps_data(step)
+    # fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    # visualizer._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
+    # plt.subplots_adjust(wspace=0.3)
+    # plt.savefig(f'./figs/all_maps_step_{step}.png')  
+    visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)

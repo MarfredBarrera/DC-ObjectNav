@@ -96,6 +96,10 @@ class Config:
         # Ensemble
         self.ensemble_num_models = 3
 
+        # Grid
+        self.voxel_resolution = 0.05
+        self.grid_max_height = 2.0
+
         # Visualization
         self.viz_interval = 2000
         
@@ -262,3 +266,11 @@ class Config:
             ensemble = yaml_data['ensemble']
             if 'num_models' in ensemble:
                 self.ensemble_num_models = ensemble['num_models']
+
+        # Grid
+        if 'grid' in yaml_data:
+            grid = yaml_data['grid']
+            if 'voxel_resolution' in grid:
+                self.voxel_resolution = grid['voxel_resolution']
+            if 'max_height' in grid:
+                self.grid_max_height = grid['max_height']

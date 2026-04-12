@@ -66,7 +66,8 @@ class Planner:
 
     def set_umap(self, step=20000):
         epi_map, _ = self.load_umap(step=step)
-        self.ugrid.bev_epi_umap = epi_map
+        # Store as 2D for legacy compatibility in this planner
+        self.ugrid.voxels_epi = torch.from_numpy(epi_map).to(self.device) if epi_map is not None else None
     
     def load_umap(self, step=20000):
         umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
@@ -82,10 +83,12 @@ class Planner:
             return None, None
     
     def get_sim_map(self):
-        return self.sim_map.compute_similarity_map("a photo of a pillow", height_filter = (0.1,1.5))
+        self.sim_map.compute_similarity_map("a photo of a pillow")
+        return self.sim_map.get_2d_map(min_y=0.1, max_y=1.5).cpu().numpy()
     
     def set_sim_map(self, sim_map):
-        self.sim_map.bev_similarity_map = sim_map
+        # Store as 2D for legacy compatibility
+        self.sim_map.voxels = torch.from_numpy(sim_map).to(self.device).unsqueeze(0) if sim_map is not None else None
         
     def load_ensemble(self):
         """Loads the ensemble FeatureField models from the output directory."""
@@ -112,10 +115,11 @@ class Planner:
 
     def viz_umap(self):
 
-        bev_epi_2d = self.ugrid.bev_epi_umap
+        bev_epi_2d = self.ugrid.get_2d_map() if self.ugrid.voxels_epi is not None else None
         if bev_epi_2d is not None:
+            if isinstance(bev_epi_2d, torch.Tensor): bev_epi_2d = bev_epi_2d.cpu().numpy()
             fig, axes = plt.subplots(figsize=(12,6))
-            extent = [self.ugrid.bev_min_x, self.ugrid.bev_max_x, self.ugrid.bev_min_z, self.ugrid.bev_max_z]
+            extent = [self.ugrid.min_x, self.ugrid.max_x, self.ugrid.min_z, self.ugrid.max_z]
 
             # Epistemic Uncertainty Map
             im1 = axes.imshow(bev_epi_2d, cmap='magma', origin='lower', aspect='equal', extent=extent)
@@ -146,10 +150,11 @@ class Planner:
             print("Unable to visualize BEV maps due to missing data.")
 
     def viz_sim_map(self):
-        bev_sim_2d = self.sim_map.bev_similarity_map
+        bev_sim_2d = self.sim_map.get_2d_map() if self.sim_map.voxels is not None else None
         if bev_sim_2d is not None:
+            if isinstance(bev_sim_2d, torch.Tensor): bev_sim_2d = bev_sim_2d.cpu().numpy()
             fig, axes = plt.subplots(figsize=(12,6))
-            extent = [self.sim_map.bev_min_x, self.sim_map.bev_max_x, self.sim_map.bev_min_z, self.sim_map.bev_max_z]
+            extent = [self.sim_map.min_x, self.sim_map.max_x, self.sim_map.min_z, self.sim_map.max_z]
 
             # Normalize for visualization, excluding bottom 10%
             if bev_sim_2d.size > 0:

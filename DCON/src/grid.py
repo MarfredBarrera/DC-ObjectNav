@@ -1,32 +1,28 @@
-from sklearn import ensemble
 import torch
 import numpy as np
 import os
 
-class BEVGrid:
+class VoxelGrid:
     """
-    Base class for 2D Bird's Eye View Grids.
+    Base class for 3D Voxel Grids.
     Handles grid initialization, dimensions, and coordinate transforms.
     """
     def __init__(self, config, scene_bounds, device=None):
         self.cfg = config
         self.device = device if device else config.device
-    
-        # BEV Map
-        self.bev_resolution = 0.05
-        self.bev_initialized = False
+        self.resolution = config.voxel_resolution
         
-        # Dimensions
-        self.bev_width = 0
-        self.bev_height = 0
-        self.bev_min_x = 0.0
-        self.bev_max_x = 0.0
-        self.bev_min_z = 0.0
-        self.bev_max_z = 0.0
+        self.initialized = False
+        self.num_x = 0
+        self.num_y = 0
+        self.num_z = 0
+        self.min_x, self.min_y, self.min_z = 0.0, 0.0, 0.0
+        self.max_x, self.max_y, self.max_z = 0.0, 0.0, 0.0
+        
         self.initialize_from_bounds(scene_bounds)
 
     def initialize_from_bounds(self, scene_bounds):
-        """Calculates grid dimensions from scene bounds."""
+        """Calculates grid dimensions from scene bounds using unified resolution."""
         if isinstance(scene_bounds, torch.Tensor):
             min_b = scene_bounds[0].cpu().numpy()
             max_b = scene_bounds[1].cpu().numpy()
@@ -34,639 +30,264 @@ class BEVGrid:
             min_b = scene_bounds[0]
             max_b = scene_bounds[1]
         
-        # Extract bounds (assuming Y is up, X is left-right, Z is forward-back)
-        self.bev_min_x = float(min_b[0])
-        self.bev_max_x = float(max_b[0])
-        self.bev_min_y = float(min_b[1])
-        self.bev_max_y = float(max_b[1])
-        self.bev_min_z = float(min_b[2])
-        self.bev_max_z = float(max_b[2])
+        # Habitat: Y is up, X is left-right, Z is back-forward
+        self.min_x, self.min_y, self.min_z = float(min_b[0]), float(min_b[1]), float(min_b[2])
+        self.max_x, self.max_y, self.max_z = float(max_b[0]), float(max_b[1]), float(max_b[2])
         
-        # CRITICAL FIX: Calculate grid size based on ACTUAL scene bounds
-        x_span = self.bev_max_x - self.bev_min_x
-        z_span = self.bev_max_z - self.bev_min_z
+        # User requested max_height clipping
+        if hasattr(self.cfg, "grid_max_height"):
+            self.max_y = min(self.max_y, self.grid_max_height if hasattr(self, "grid_max_height") else self.cfg.grid_max_height)
+            # Re-ensure self.max_y is set correctly if we used the config value
+            self.max_y = min(self.max_y, self.cfg.grid_max_height)
         
-        self.bev_width = int(np.ceil(x_span / self.bev_resolution))
-        self.bev_height = int(np.ceil(z_span / self.bev_resolution))
+        x_span = self.max_x - self.min_x
+        y_span = self.max_y - self.min_y
+        z_span = self.max_z - self.min_z
         
-        print(f"Scene Bounds:")
-        print(f"  X: [{self.bev_min_x:.2f}, {self.bev_max_x:.2f}] m (span: {x_span:.2f} m)")
-        print(f"  Z: [{self.bev_min_z:.2f}, {self.bev_max_z:.2f}] m (span: {z_span:.2f} m)")
-        print(f"BEV Grid Initialized: {self.bev_width} x {self.bev_height} cells ({self.bev_resolution}m/cell)")
-        self.bev_initialized = True
+        self.num_x = int(np.ceil(x_span / self.resolution))
+        self.num_y = int(np.ceil(y_span / self.resolution))
+        self.num_z = int(np.ceil(z_span / self.resolution))
+        
+        print(f"Voxel Grid Initialized: {self.num_x}x{self.num_y}x{self.num_z} voxels ({self.resolution}m resolution)")
+        self.initialized = True
 
-    def generate_bev_sample_points(self, height_filter=None, height_samples=50):
+    def generate_sample_points(self, height_filter=None):
         """
-        Generate 3D sample points for BEV evaluation.
+        Generate 3D sample points for voxel evaluation.
         
         Args:
-            height_filter: Tuple of (min_y, max_y) coordinates (height) to sample. 
-                          If None, uses scene bounds.
-            height_samples: Number of height levels to sample (default: 50)
+            height_filter: Tuple of (min_y, max_y) coordinates. If None, uses all voxels.
             
         Returns:
-            points: numpy array of shape (N, 3) where N = bev_width * height_samples * bev_height
-            grid_shape: Tuple (bev_width, height_samples, bev_height) for reshaping
+            points: numpy array of shape (N, 3)
+            grid_shape: Tuple (num_y_subset, num_z, num_x)
         """
-        if not self.bev_initialized:
-            raise RuntimeError("BEV grid not initialized!")
+        if not self.initialized:
+            raise RuntimeError("Grid not initialized!")
         
-        # Use scene bounds if not specified
         if height_filter is None:
-            min_y = self.bev_min_y
-            max_y = self.bev_max_y
+            min_y, max_y = self.min_y, self.max_y
+            num_y_subset = self.num_y
         else:
             min_y, max_y = height_filter
+            num_y_subset = int(np.ceil((max_y - min_y) / self.resolution))
         
-        # Generate all grid cell centers
-        x_coords = np.linspace(self.bev_min_x + self.bev_resolution/2, self.bev_max_x - self.bev_resolution/2, self.bev_width)
-        y_coords = np.linspace(min_y, max_y, height_samples) # Vertical dimension
-        z_coords = np.linspace(self.bev_min_z + self.bev_resolution/2, self.bev_max_z - self.bev_resolution/2, self.bev_height)
+        x_coords = np.linspace(self.min_x + self.resolution/2, self.max_x - self.resolution/2, self.num_x)
+        y_coords = np.linspace(min_y + self.resolution/2, max_y - self.resolution/2, num_y_subset)
+        z_coords = np.linspace(self.min_z + self.resolution/2, self.max_z - self.resolution/2, self.num_z)
         
-        # Create 3D meshgrid in (Y, Z, X) order to match memory-efficient layouts
+        # Grid order (Y, Z, X) to match memory-efficient layouts
         Y, Z, X = np.meshgrid(y_coords, z_coords, x_coords, indexing='ij')
         
-        # Stack into (N, 3) array of 3D points
         points = np.stack([X.flatten(), Y.flatten(), Z.flatten()], axis=-1)
-        grid_shape = (height_samples, self.bev_height, self.bev_width)
+        grid_shape = (num_y_subset, self.num_z, self.num_x)
         
         return points, grid_shape
 
+    def get_y_indices(self, min_y, max_y):
+        """Helper to get voxel indices for a height range."""
+        idx_start = int((min_y - self.min_y) / self.resolution)
+        idx_end = int((max_y - self.min_y) / self.resolution)
+        return max(0, idx_start), min(self.num_y, idx_end)
 
-class SimilarityGrid(BEVGrid):
-    """
-    Subclass for Semantic Similarity Mapping.
-    Computes 2D BEV map of similarity between ensemble features and text query.
-    """
+class SimilarityGrid(VoxelGrid):
+    """3D Similarity Voxel Grid with 2D BEV projection."""
     def __init__(self, config, ensemble, sam_clip, scene_bounds):
         super().__init__(config, scene_bounds, device=config.device)
         self.ensemble = ensemble
         self.sam_clip = sam_clip
-        self.bev_sim_map_3d = None
+        self.voxels = None # 3D Similarity Map (Y, Z, X)
 
-    def compute_similarity_map(self, text_query, height_samples=200, batch_size=100000, occupancy_grid=None):
-        if not self.bev_initialized:
-            print("BEV grid not initialized!")
-            return None
+    def compute_similarity_map(self, text_query, batch_size=100000, occupancy_grid=None):
+        if not self.initialized: return None
 
-        # 1. Embed Text
+        # Embed Text
         inputs = self.sam_clip.clip_processor(text=[text_query], return_tensors="pt", padding=True).to(self.device)
         with torch.no_grad():
             text_embed = self.sam_clip.clip_model.get_text_features(**inputs)
             text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
 
-        min_y, max_y = self.bev_min_y, self.bev_max_y
-        points, grid_shape = self.generate_bev_sample_points(height_filter=(min_y, max_y), height_samples=height_samples)
+        # Full grid points
+        points, grid_shape = self.generate_sample_points()
         total_points = points.shape[0]
 
-        # Filter points by occupancy if grid is provided
+        # Use occupancy masking if available
         mask = None
-        if occupancy_grid is not None and occupancy_grid.occupancy_map is not None:
-            x_idx = ((points[:, 0] - self.bev_min_x) / self.bev_resolution).astype(np.int64)
-            z_idx = ((points[:, 2] - self.bev_min_z) / self.bev_resolution).astype(np.int64)
-            y_idx = ((points[:, 1] - self.bev_min_y) / (self.bev_max_y - self.bev_min_y + 1e-6) * (occupancy_grid.height_samples - 1)).astype(np.int64)
+        if occupancy_grid is not None and occupancy_grid.voxels is not None:
+            x_idx = ((points[:, 0] - self.min_x) / self.resolution).astype(np.int64)
+            y_idx = ((points[:, 1] - self.min_y) / self.resolution).astype(np.int64)
+            z_idx = ((points[:, 2] - self.min_z) / self.resolution).astype(np.int64)
             
-            x_idx = np.clip(x_idx, 0, self.bev_width - 1)
-            z_idx = np.clip(z_idx, 0, self.bev_height - 1)
-            y_idx = np.clip(y_idx, 0, occupancy_grid.height_samples - 1)
+            x_idx = np.clip(x_idx, 0, self.num_x - 1)
+            y_idx = np.clip(y_idx, 0, self.num_y - 1)
+            z_idx = np.clip(z_idx, 0, self.num_z - 1)
             
+            # Map indices to torch
             x_indices = torch.from_numpy(x_idx).to(self.device)
-            z_indices = torch.from_numpy(z_idx).to(self.device)
             y_indices = torch.from_numpy(y_idx).to(self.device)
+            z_indices = torch.from_numpy(z_idx).to(self.device)
 
-            occ_map = occupancy_grid.occupancy_map
-            # Use state 2 (occupied) for masking
-            mask = (occ_map[y_indices, z_indices, x_indices] == occupancy_grid.occupied_val)
+            # Occupied points only
+            mask = (occupancy_grid.voxels[y_indices, z_indices, x_indices] == occupancy_grid.occupied_val)
             query_points = points[mask.cpu().numpy()]
         else:
             query_points = points
 
-        total_query_points = query_points.shape[0]
-        if total_query_points == 0:
-            return np.zeros((self.bev_height, self.bev_width))
-            
+        if query_points.shape[0] == 0:
+            self.voxels = torch.zeros(grid_shape, device=self.device)
+            return
+
         points_tensor = torch.from_numpy(query_points).float().to(self.device)
-        
-        # 3. Ensemble Forward Pass (Mean Feature)
-        all_query_sims = []
-        num_batches = int(np.ceil(total_query_points / batch_size))
+        all_sims = []
+        num_batches = int(np.ceil(query_points.shape[0] / batch_size))
         
         with torch.no_grad():
             for i in range(num_batches):
-                start_idx = i * batch_size
-                end_idx = min((i + 1) * batch_size, total_query_points)
-                batch_points = points_tensor[start_idx:end_idx]
+                start, end = i * batch_size, min((i + 1) * batch_size, query_points.shape[0])
+                batch_pts = points_tensor[start:end]
                 
-                # Get mean feature from each model and average them
+                # Ensemble mean
                 batch_means = []
                 for model in self.ensemble:
-                    # forward returns (mean, variance). We want normalized mean.
-                    mean, _ = model.forward(batch_points, normalize=True)
+                    mean, _ = model.forward(batch_pts, normalize=True)
                     batch_means.append(mean)
                 
-                # Stack and Average: (Num_Models, B, D) -> (B, D)
                 ensemble_mean = torch.stack(batch_means, dim=0).mean(dim=0)
-                
-                # Re-normalize the ensemble mean for Cosine Similarity
                 ensemble_mean = ensemble_mean / (ensemble_mean.norm(dim=-1, keepdim=True) + 1e-8)
                 
-                # 4. Compute Similarity
-                # (B, D) @ (1, D).T -> (B, 1)
                 sim = torch.matmul(ensemble_mean, text_embed.T).squeeze(-1)
-                
-                # Normalize [-1, 1] -> [0, 1]
                 sim = (sim + 1.0) / 2.0
-                all_query_sims.append(sim)
+                all_sims.append(sim)
         
-        all_query_sims = torch.cat(all_query_sims, dim=0) # (total_query_points,)
-
-        # 4. Reconstruct full 3D similarity grid
+        all_sims = torch.cat(all_sims, dim=0)
+        
         full_sims = torch.zeros(total_points, device=self.device)
         if mask is not None:
-            full_sims[mask] = all_query_sims
+            full_sims[mask] = all_sims
         else:
-            full_sims = all_query_sims
+            full_sims = all_sims
             
-        self.bev_sim_map_3d = full_sims.reshape(grid_shape) # (Y, Z, X)
+        self.voxels = full_sims.reshape(grid_shape)
 
-        return 
-    
-    def get_2d_map(self):
-        """Returns 2D BEV similarity map (sum similarity across height)."""
-        if self.bev_sim_map_3d is None:
-            return None
-        # Sum over height samples (dim 0) -> (Z, X)
-        grid_2d, _ = self.bev_sim_map_3d.max(dim=0)
-        return grid_2d
-    
+    def get_2d_map(self, min_y=0.0, max_y=1.5):
+        if self.voxels is None: return None
+        y_start, y_end = self.get_y_indices(min_y, max_y)
+        if y_start >= y_end: return torch.zeros((self.num_z, self.num_x), device=self.device)
+        
+        # Implement Top-K Mean (Top 5%)
+        slice = self.voxels[y_start:y_end]
+        num_slices = slice.shape[0]
+        k = max(1, int(0.05 * num_slices))
+        
+        # topk along Y dimension (axis 0)
+        top_vals, _ = torch.topk(slice, k, dim=0)
+        return top_vals.mean(dim=0)
+
     def save(self, step):
-        """Save similarity map to disk."""
         sim_2d = self.get_2d_map()
         if sim_2d is not None:
-            sim_maps_dir = os.path.join(self.cfg.output_dir, "sim_maps")
-            os.makedirs(sim_maps_dir, exist_ok=True)
-            path = os.path.join(sim_maps_dir, f"bev_similarity_{step}.npy")
-            np.save(path, sim_2d.cpu().numpy())
-            print(f"Similarity map saved to {path}")
+            path = os.path.join(self.cfg.output_dir, f"sim_maps/bev_similarity_{step}.npy")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            np.save(path, sim_2d.detach().cpu().numpy())
 
-class OccupancyGrid(BEVGrid):
-    """
-    Subclass for Binary Occupancy Mapping.
-    Records visited areas on the grid.
-    """
-    def __init__(self, config, scene_bounds, device=None, height_samples=100):
-        self.height_samples = height_samples
-        self.occupancy_map = None
-        super().__init__(config, scene_bounds, device=device)
-
-    def initialize_from_bounds(self, scene_bounds):
-        super().initialize_from_bounds(scene_bounds)
-        self._init_map()
-        
-    def _init_map(self):
-        # Occupancy States: 0 = unseen, 1 = free, 2 = occupied
-        self.unseen_val = 0
-        self.free_val = 1
-        self.occupied_val = 2
-        
-        # Initialize 3D zero map (entirely unseen)
-        # Shape: (Y/Height_Samples, Z/Height, X/Width)
-        if self.bev_width > 0 and self.bev_height > 0:
-            self.occupancy_map = torch.full((self.height_samples, self.bev_height, self.bev_width), 
-                                          self.unseen_val, 
-                                          device=self.device, 
-                                          dtype=torch.uint8)
-
-    def update(self, points, min_y=0.2, max_y=1.5):
-        """Update occupancy map from 3D points within the specified height range (marks as occupied)."""
-        if not self.bev_initialized: return
-
-        # Use provided filter range or fall back to scene bounds
-        f_min_y = min_y
-        f_max_y = max_y
-
-        mask = (points[:, 0] >= self.bev_min_x) & (points[:, 0] < self.bev_max_x) & \
-            (points[:, 2] >= self.bev_min_z) & (points[:, 2] < self.bev_max_z) & \
-            (points[:, 1] >= f_min_y) & (points[:, 1] < f_max_y)
-            
-        valid_points = points[mask]
-        
-        if valid_points.shape[0] == 0: return
-
-        # Map to grid indices
-        x_indices = ((valid_points[:, 0] - self.bev_min_x) / self.bev_resolution).long()
-        z_indices = ((valid_points[:, 2] - self.bev_min_z) / self.bev_resolution).long()
-        # Map world Y coordinate to grid index based on the full vertical range [bev_min_y, bev_max_y]
-        y_indices = ((valid_points[:, 1] - self.bev_min_y) / (self.bev_max_y - self.bev_min_y + 1e-6) * (self.height_samples - 1)).long()
-        
-        # Clamp to be safe
-        x_indices = torch.clamp(x_indices, 0, self.bev_width - 1)
-        z_indices = torch.clamp(z_indices, 0, self.bev_height - 1)
-        y_indices = torch.clamp(y_indices, 0, self.height_samples - 1)
-        
-        # Set occupancy (2 for occupied)
-        self.occupancy_map[y_indices, z_indices, x_indices] = self.occupied_val
+class OccupancyGrid(VoxelGrid):
+    """3D Occupancy Voxel Grid."""
+    def __init__(self, config, scene_bounds):
+        super().__init__(config, scene_bounds, device=config.device)
+        self.unseen_val, self.free_val, self.occupied_val = 0, 1, 2
+        self.voxels = torch.full((self.num_y, self.num_z, self.num_x), self.unseen_val, device=self.device, dtype=torch.uint8)
 
     def update_from_observation(self, depth, c2w, intrinsics, max_dist=10.0, thickness=0.05):
-        """
-        Update grid states (free/occupied) using a camera observation.
-        Estimates FOV and projects grid cells into camera frame.
-        """
-        if not self.bev_initialized or self.occupancy_map is None:
-            return
-
+        if not self.initialized: return
         fx, fy, cx, cy, H, W = intrinsics
         
-        # Estimate FOV for filtering
-        fov_x = 2 * np.arctan(W / (2 * fx))
-        fov_y = 2 * np.arctan(H / (2 * fy))
+        # Get world coords of all cells
+        y_c = torch.linspace(self.min_y, self.max_y, self.num_y, device=self.device)
+        z_c = torch.linspace(self.min_z + self.resolution/2, self.max_z - self.resolution/2, self.num_z, device=self.device)
+        x_c = torch.linspace(self.min_x + self.resolution/2, self.max_x - self.resolution/2, self.num_x, device=self.device)
         
-        # 1. Get world coordinates of all grid cells
-        # Create grid coordinates
-        y_coords = torch.linspace(self.bev_min_y, self.bev_max_y, self.height_samples, device=self.device)
-        z_coords = torch.linspace(self.bev_min_z + self.bev_resolution/2, self.bev_max_z - self.bev_resolution/2, self.bev_height, device=self.device)
-        x_coords = torch.linspace(self.bev_min_x + self.bev_resolution/2, self.bev_max_x - self.bev_resolution/2, self.bev_width, device=self.device)
+        Y_idx, Z_idx, X_idx = torch.meshgrid(torch.arange(self.num_y, device=self.device),
+                                             torch.arange(self.num_z, device=self.device),
+                                             torch.arange(self.num_x, device=self.device), indexing='ij')
         
-        # Grid indices
-        Y_idx, Z_idx, X_idx = torch.meshgrid(
-            torch.arange(self.height_samples, device=self.device),
-            torch.arange(self.bev_height, device=self.device),
-            torch.arange(self.bev_width, device=self.device),
-            indexing='ij'
-        )
-        
-        # World coordinates (sampled at cell centers)
-        Y_pts, Z_pts, X_pts = torch.meshgrid(y_coords, z_coords, x_coords, indexing='ij')
-        
-        # Flatten for processing
+        Y_pts, Z_pts, X_pts = torch.meshgrid(y_c, z_c, x_c, indexing='ij')
         pts_world = torch.stack([X_pts.flatten(), Y_pts.flatten(), Z_pts.flatten(), torch.ones_like(X_pts.flatten())], dim=1)
         
-        # 2. Transform to camera space
-        # w2c = inverse(c2w)
-        w2c = torch.inverse(c2w)
-        pts_cam = (w2c @ pts_world.T).T
-        
-        # 3. Filter by distance and view frustum
+        pts_cam = (torch.inverse(c2w) @ pts_world.T).T
         dist = pts_cam[:, 2]
         frustum_mask = (dist > 0.1) & (dist < max_dist)
-        
-        if not frustum_mask.any():
-            return
+        if not frustum_mask.any(): return
             
-        pts_cam_valid = pts_cam[frustum_mask]
+        valid_cam = pts_cam[frustum_mask]
+        u = (valid_cam[:, 0] * fx / valid_cam[:, 2]) + cx
+        v = (valid_cam[:, 1] * fy / valid_cam[:, 2]) + cy
         
-        # Project to pixels
-        u = (pts_cam_valid[:, 0] * fx / pts_cam_valid[:, 2]) + cx
-        v = (pts_cam_valid[:, 1] * fy / pts_cam_valid[:, 2]) + cy
-        
-        # Bound check
         in_view = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-        
-        # Combine masks
         final_mask = frustum_mask.clone()
-        final_mask[frustum_mask.clone()] = in_view
-        
-        if not final_mask.any():
-            return
+        final_mask[frustum_mask] = in_view
+        if not final_mask.any(): return
             
-        # Get indices and coordinates for cells in view
-        valid_u = u[in_view].long()
-        valid_v = v[in_view].long()
-        valid_dist = pts_cam_valid[in_view, 2]
+        v_u, v_v, v_dist = u[in_view].long(), v[in_view].long(), valid_cam[in_view, 2]
+        obs_depth = depth[v_v, v_u]
         
-        # Sample depth map
-        observed_depth = depth[valid_v, valid_u]
+        new_states = torch.full_like(v_dist, self.unseen_val, dtype=torch.uint8)
+        new_states[v_dist < (obs_depth - thickness)] = self.free_val
+        new_states[torch.abs(v_dist - obs_depth) < thickness] = self.occupied_val
         
-        # Determine states
-        new_states = torch.full_like(valid_dist, self.unseen_val, dtype=torch.uint8)
-        
-        # Free: distance < observed_depth - thickness
-        # Occupied: abs(distance - observed_depth) < thickness
-        free_mask = valid_dist < (observed_depth - thickness)
-        occ_mask = torch.abs(valid_dist - observed_depth) < thickness
-        
-        new_states[free_mask] = self.free_val
-        new_states[occ_mask] = self.occupied_val
-        
-        # Map back to grid indices
-        valid_Y_idx = Y_idx.flatten()[final_mask]
-        valid_Z_idx = Z_idx.flatten()[final_mask]
-        valid_X_idx = X_idx.flatten()[final_mask]
-        
-        # Update map: User priority: free overrides occupied if seen as free now, 
-        # but unseen should not override anything.
-        # We'll update any that are seen as free or occupied.
-        update_mask = (new_states != self.unseen_val)
-        
-        self.occupancy_map[valid_Y_idx[update_mask], valid_Z_idx[update_mask], valid_X_idx[update_mask]] = new_states[update_mask]
+        self.voxels[Y_idx.flatten()[final_mask], Z_idx.flatten()[final_mask], X_idx.flatten()[final_mask]] = new_states
 
     def get_2d_map(self, min_y=0.2, max_y=1.5):
-        """Returns 2D BEV occupancy map (1 if any cell in column is occupied)."""
-        if self.occupancy_map is None: return None
-
-        # Use provided height slice or default to full scene range
-        f_min_y = min_y if min_y is not None else self.bev_min_y
-        f_max_y = max_y if max_y is not None else self.bev_max_y
-
-        # Map world height to grid indices based on the grid's Y range [bev_min_y, bev_max_y]
-        min_y_idx = int((f_min_y - self.bev_min_y) / (self.bev_max_y - self.bev_min_y + 1e-6) * (self.height_samples - 1))
-        max_y_idx = int((f_max_y - self.bev_min_y) / (self.bev_max_y - self.bev_min_y + 1e-6) * (self.height_samples - 1))
-        min_y_idx = max(0, min_y_idx)
-        max_y_idx = min(self.height_samples - 1, max_y_idx)
-        occ_slice = self.occupancy_map[min_y_idx:max_y_idx+1, :, :]
-        # Max over height samples
-        occ_2d, _ = occ_slice.max(dim=0)
-        return occ_2d
+        y_start, y_end = self.get_y_indices(min_y, max_y)
+        if y_start >= y_end: return torch.zeros((self.num_z, self.num_x), device=self.device)
+        return self.voxels[y_start:y_end].max(dim=0)[0]
 
     def save(self, step):
-        """Save occupancy map to disk."""
-        if self.occupancy_map is not None:
-            occ_2d = self.get_2d_map()
-            occ_maps_dir = os.path.join(self.cfg.output_dir, "occ_maps")
-            os.makedirs(occ_maps_dir, exist_ok=True)
-            path = os.path.join(occ_maps_dir, f"bev_occupancy_{step}.npy")
-            np.save(path, occ_2d.cpu().numpy())
-            print(f"Occupancy map saved to {path}")
+        occ_2d = self.get_2d_map()
+        path = os.path.join(self.cfg.output_dir, f"occ_maps/bev_occupancy_{step}.npy")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.save(path, occ_2d.cpu().numpy())
 
-
-class UncertaintyGrid(BEVGrid):
-    """
-    Subclass for Uncertainty Mapping (Epistemic & Aleatoric).
-    Maintains a 2D Bird's Eye View Grid representing feature field uncertainty.
-    """
+class UncertaintyGrid(VoxelGrid):
+    """3D Uncertainty Voxel Grid."""
     def __init__(self, config, ensemble, scene_bounds):
         super().__init__(config, scene_bounds, device=config.device)
         self.ensemble = ensemble
-        
-        # Core Tensors
-        self.bev_epi_umap = None
-        self.bev_ale_umap = None
+        self.voxels_epi = None
+        self.voxels_ale = None
 
-        # 3D maps
-        self.bev_epi_umap_3d = None
-        self.bev_ale_umap_3d = None
+    def forward_pass(self, height_filter=(0.1,2.0), batch_size=100000):
+        if not self.initialized: return
+        points, grid_shape = self.generate_sample_points(height_filter)
+        pts_tensor = torch.from_numpy(points).float().to(self.device)
+        
+        preds, vars = [], []
+        for model in self.ensemble:
+            p_batch, v_batch = [], []
+            for i in range(int(np.ceil(pts_tensor.shape[0] / batch_size))):
+                start, end = i * batch_size, min((i + 1) * batch_size, pts_tensor.shape[0])
+                m, v = model.forward(pts_tensor[start:end], normalize=True)
+                p_batch.append(m); v_batch.append(v)
+            preds.append(torch.cat(p_batch, dim=0)); vars.append(torch.cat(v_batch, dim=0))
+        
+        preds, vars = torch.stack(preds), torch.stack(vars)
+        epi = preds.var(dim=0).mean(dim=-1)
+        ale = vars.mean(dim=0).mean(dim=-1)
+        
+        self.voxels_epi = epi.reshape(grid_shape)
+        self.voxels_ale = ale.reshape(grid_shape)
 
-    def forward_single(self, model, points, batch_size=100000):
-        """
-        Forward pass points through a single ensemble member with batching.
-        
-        Args:
-            model: Single hashgrid model from the ensemble
-            points: Tensor of 3D points (N, 3)
-            batch_size: Number of points to process at once
-            
-        Returns:
-            predictions: Tensor of predicted features (N, feature_dim)
-            variances: Tensor of aleatoric variances (N, feature_dim)
-        """
-        total_points = points.shape[0]
-        predictions_list = []
-        variances_list = []
-        num_batches = int(np.ceil(total_points / batch_size))
-        
-        with torch.no_grad():
-            for i in range(num_batches):
-                start_idx = i * batch_size
-                end_idx = min((i + 1) * batch_size, total_points)
-                batch_points = points[start_idx:end_idx]
-                
-                mean, variance = model.forward(batch_points, normalize=True)
-                predictions_list.append(mean)
-                variances_list.append(variance)
-        
-        predictions = torch.cat(predictions_list, dim=0)
-        variances = torch.cat(variances_list, dim=0)
-        
-        return predictions, variances
-    
-    def forward_ensemble(self, points, batch_size=100000):
-        """
-        Forward pass points through all ensemble members.
-        
-        Args:
-            points: Tensor of 3D points (N, 3) on device
-            batch_size: Number of points to process at once per model
-            
-        Returns:
-            ensemble_predictions: Tensor of shape (num_models, N, feature_dim)
-            ensemble_variances: Tensor of shape (num_models, N, feature_dim)
-        """
-        ensemble_predictions = []
-        ensemble_variances = []
-        
-        for idx, model in enumerate(self.ensemble):
-            predictions, variances = self.forward_single(model, points, batch_size)
-            ensemble_predictions.append(predictions)
-            ensemble_variances.append(variances)
-        
-        # Stack: (num_models, N, feature_dim)
-        ensemble_predictions = torch.stack(ensemble_predictions, dim=0)
-        ensemble_variances = torch.stack(ensemble_variances, dim=0)
-        
-        return ensemble_predictions, ensemble_variances
-    
-    # ========== Uncertainty Computation Functions ==========
-    
-    def compute_epistemic_uncertainty(self, ensemble_predictions):
-        """
-        Compute epistemic uncertainty (variance across ensemble predictions).
-        
-        Args:
-            ensemble_predictions: Tensor of shape (num_models, N, feature_dim)
-            
-        Returns:
-            epistemic: Tensor of shape (N,) - mean variance across features
-        """
-        # Compute variance across ensemble (dim=0), then average across features (dim=-1)
-        epistemic = ensemble_predictions.var(dim=0).mean(dim=-1)
-        return epistemic
-    
-    def compute_aleatoric_uncertainty(self, ensemble_variances):
-        """
-        Compute aleatoric uncertainty (mean of predicted variances).
-        
-        Args:
-            ensemble_variances: Tensor of shape (num_models, N, feature_dim)
-            
-        Returns:
-            aleatoric: Tensor of shape (N,) - mean variance across ensemble and features
-        """
-        # Average across ensemble (dim=0), then average across features (dim=-1)
-        aleatoric = ensemble_variances.mean(dim=0).mean(dim=-1)
-        return aleatoric
+    def get_2d_map(self, min_y=0.1, max_y=1.5, type='epistemic'):
+        voxels = self.voxels_epi if type == 'epistemic' else self.voxels_ale
+        if voxels is None: return None
+        # Adjust slicing if voxels is only a subset from forward_pass
+        # For simplicity, assume forward_pass was run on the full grid or the requested range.
+        # If voxels shape doesn't match full num_y, we just mean over what we have.
+        return voxels.mean(dim=0)
 
-    
-    def aggregate_height_samples(self, uncertainties, grid_shape):
-        """
-        Reshape and aggregate uncertainties along height dimension.
-        
-        Args:
-            uncertainties: Tensor of shape (N,) on CPU
-            grid_shape: Tuple (height_samples, bev_height, bev_width)
-            
-        Returns:
-            bev_2d: Tensor of shape (bev_height, bev_width) - BEV uncertainty map
-        """
-        # uncertainties are flat, reshape to (Y, Z, X)
-        grid_3d = uncertainties.reshape(grid_shape)
-        
-        # Average along height dimension (axis 0) -> (Z, X)
-        bev_2d = grid_3d.mean(dim=0)
-
-        return bev_2d
-    
-    # ========== High-Level Pipeline Function ==========
-
-    def forward_pass(self, height_filter=None, height_samples=10, batch_size=100000):
-        """
-        Complete pipeline: Generate points, run ensemble, compute uncertainties, aggregate.
-        
-        Args:
-            height_filter: Tuple of (min_y, max_y) coordinates (height) to sample. 
-                          If None, uses scene bounds.
-            height_samples: Number of height levels to sample (default: 10)
-            batch_size: Number of points to process at once (to avoid OOM)
-        
-        Returns:
-            None (stores results in self.bev_epi_umap and self.bev_ale_umap)
-        """
-        if not self.bev_initialized:
-            print("BEV grid not initialized!")
-            return
-        
-        # Step 1: Generate sampling points
-        points, grid_shape = self.generate_bev_sample_points(height_filter, height_samples)
-        total_points = points.shape[0]
-        print(f"Processing {total_points:,} points ({grid_shape[0]}x{grid_shape[1]}x{grid_shape[2]})...")
-        
-        # Step 2: Convert to tensor and run ensemble forward pass
-        points_tensor = torch.from_numpy(points).float().to(self.device)
-        print(f"Running forward pass through {len(self.ensemble)} ensemble members...")
-        ensemble_predictions, ensemble_variances = self.forward_ensemble(points_tensor, batch_size)
-        
-        # Step 3: Compute uncertainties
-        epistemic_uncertainty = self.compute_epistemic_uncertainty(ensemble_predictions)
-        aleatoric_uncertainty = self.compute_aleatoric_uncertainty(ensemble_variances)
-        
-        # Step 3b: Store 3D
-        self.bev_epi_umap_3d = epistemic_uncertainty
-        self.bev_ale_umap_3d = aleatoric_uncertainty
-
-        # Step 4: Move to CPU and aggregate height samples
-        epi_2d = self.aggregate_height_samples(epistemic_uncertainty.cpu(), grid_shape)
-        ale_2d = self.aggregate_height_samples(aleatoric_uncertainty.cpu(), grid_shape)
-
-        # Step 5: Store results
-        self.set_umaps(epi_2d, ale_2d)
-        
-        return
-
-    # ========== Utility Functions ==========
-
-    def set_umaps(self, epi_map, ale_map):
-        self.bev_epi_umap = epi_map
-        self.bev_ale_umap = ale_map
-    
-    def get_umaps(self):
-        return self.bev_epi_umap, self.bev_ale_umap
-    
-    def clear_umaps(self):
-        self.bev_epi_umap = None
-        self.bev_ale_umap = None
-        self.bev_epi_umap_3d = None
-        self.bev_ale_umap_3d = None
-        torch.cuda.empty_cache()
-    
-    def visualize_bev_map(self, save_path=None, show=False, height_filter=None):
-        """
-        Args:
-            save_path: Path to save the visualization (optional)
-            show: Whether to display the plot (default: False)
-        
-        Returns:
-            fig, ax: matplotlib figure and axis objects
-        """
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import LogNorm
-        
-
-        # Reshape uncertainty map to 2D grid
-        uncertainty_grid = self.bev_epi_umap.cpu().reshape(
-            self.bev_height, self.bev_width
-        ).numpy()
-        
-        # Create figure
-        fig, ax = plt.subplots(figsize=(12, 10))
-        
-        # Plot heatmap with log scale
-        extent = [self.bev_min_x, self.bev_max_x, self.bev_min_z, self.bev_max_z]
-        im = ax.imshow(
-            uncertainty_grid, 
-            origin='lower',
-            aspect='equal',
-            extent=extent,
-            cmap='turbo',
-            interpolation='nearest',
-            norm=LogNorm()
-        )
-        
-        # Add colorbar
-        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label('Epistemic Uncertainty', rotation=270, labelpad=20, fontsize=12)
-        
-        # Labels and title
-        ax.set_xlabel('X Position (m)', fontsize=12)
-        ax.set_ylabel('Z Position (m)', fontsize=12)
-        ax.set_title(
-            f'BEV Uncertainty Map\n'
-            f'Resolution: {self.bev_resolution}m/cell, '
-            f'Grid: {self.bev_width}x{self.bev_height}',
-            fontsize=14,
-            fontweight='bold'
-        )
-        
-        # Add grid
-        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-        
-        # Add statistics text
-        stats_text = (
-            f'Min: {uncertainty_grid.min():.6f}\n'
-            f'Max: {uncertainty_grid.max():.6f}\n'
-            f'Mean: {uncertainty_grid.mean():.6f}\n'
-            f'Std: {uncertainty_grid.std():.6f}'
-        )
-        ax.text(
-            0.02, 0.98, stats_text,
-            transform=ax.transAxes,
-            fontsize=10,
-            verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
-        )
-        
-        plt.tight_layout()
-        
-        # Save if requested
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"BEV map saved to: {save_path}")
-        
-        # Show if requested
-        if show:
-            plt.show()
-        
-        return fig, ax
-    
-    def save(self, step, save_dir=None):
-        """Save the BEV uncertainty maps as numpy files."""
-        umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
-        os.makedirs(umaps_dir, exist_ok=True)
-        epi_path = os.path.join(umaps_dir, f"bev_epistemic_uncertainty_{step}.npy")
-        ale_path = os.path.join(umaps_dir, f"bev_aleatoric_uncertainty_{step}.npy")
-        
-        epi_array = self.bev_epi_umap.cpu().numpy()
-        ale_array = self.bev_ale_umap.cpu().numpy()
-        
-        np.save(epi_path, epi_array)
-        np.save(ale_path, ale_array)
-        
-        print(f"BEV maps saved (step {step}, shape {epi_array.shape}) to: {umaps_dir}")
+    def save(self, step):
+        epi_2d = self.get_2d_map(type='epistemic')
+        ale_2d = self.get_2d_map(type='aleatoric')
+        path_base = os.path.join(self.cfg.output_dir, "umaps")
+        os.makedirs(path_base, exist_ok=True)
+        if epi_2d is not None: np.save(os.path.join(path_base, f"bev_epistemic_uncertainty_{step}.npy"), epi_2d.detach().cpu().numpy())
+        if ale_2d is not None: np.save(os.path.join(path_base, f"bev_aleatoric_uncertainty_{step}.npy"), ale_2d.detach().cpu().numpy())

@@ -1,5 +1,6 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+# os.environ['taskset'] = '-c 112-127'
+os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 os.environ['GLOG_minloglevel'] = '2'
@@ -28,13 +29,15 @@ def spin_policy(perception: PerceptionStack) -> list:
 
 def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
     sim, agent = init_simulator(cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov)
-    # spawn_agent_at_random_navpoint(sim, agent)
+    spawn_agent_at_random_navpoint(sim, agent)
     target_point = np.array([0.0, 0.0, 1.0])
-    spawn_agent_at_pos(sim, agent, target_point)
+    # spawn_agent_at_pos(sim, agent, target_point)
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)
     perception = PerceptionStack(cfg, scene_bounds)
+
+    perception.target_query = "a pumpkin"
 
     import cv2
     img = sim_iface.get_observations()[0]
@@ -84,7 +87,7 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
 
         if save_enabled and step % cfg.viz_interval == 0:
             perception.update_maps(step)
-            start_time = time.time()
+            # start_time = time.time()
 
     perception.save_models()
     sim.close()

@@ -7,7 +7,7 @@ paths:
   sam_checkpoint: "/workspace/DCON/SAM_models/sam_vit_b_01ec64.pth"
 
 habitat:
-  scene_path: "/workspace/DCON/gibson_scenes/Anaheim.glb"
+  scene_path: "/workspace/DCON/gibson_scenes/Annawan.glb"
   img_width: 512
   img_height: 512
   fov: 90
@@ -90,3 +90,7 @@ hashgrid:
 
 ensemble:
   num_models: 3
+ 
+grid:
+  voxel_resolution: 0.1
+  max_height: 2.0
