@@ -1,6 +1,6 @@
 import os
 # os.environ['taskset'] = '-c 112-127'
-os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 os.environ['GLOG_minloglevel'] = '2'
@@ -37,7 +37,7 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
     sim_iface = SimInterface(cfg, sim, agent)
     perception = PerceptionStack(cfg, scene_bounds)
 
-    perception.target_query = "a pumpkin"
+    perception.target_query = "a green plant"
 
     import cv2
     img = sim_iface.get_observations()[0]
@@ -54,6 +54,13 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
         perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
         print(f"  Buffered seed frame {i + 1}/{min_frames}")
         torch.cuda.empty_cache()
+
+        # save current view 2d maps
+        rgb, depth, c2w = sim_iface.get_observations()
+        perception.save_2d_similarity(i, depth, c2w, sim_iface.intrinsics)
+        # save rgb img
+        rgb_np = (rgb.numpy() * 255).astype(np.uint8)
+        cv2.imwrite(f"{cfg.output_dir}/rgbs/rgb_{i:03d}.png", cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR))
 
     refresh_interval = cfg.hash_buffer_refresh_interval
     super_pts, super_feats = perception.make_super_batch()
@@ -87,6 +94,12 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
 
         if save_enabled and step % cfg.viz_interval == 0:
             perception.update_maps(step)
+            # save current view 2d maps
+            rgb, depth, c2w = sim_iface.get_observations()
+            perception.save_2d_similarity(step, depth, c2w, sim_iface.intrinsics)
+            # save rgb img
+            rgb_np = (rgb.numpy() * 255).astype(np.uint8)
+            cv2.imwrite(f"{cfg.output_dir}/rgbs/rgb_{step:03d}.png", cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR))
             # start_time = time.time()
 
     perception.save_models()

@@ -182,6 +182,56 @@ class PerceptionStack:
             else:
                 print(f"Warning: model {i} not found at {path}")
 
+    def save_2d_similarity(self, step: int, depth: torch.Tensor, c2w: torch.Tensor, intrinsics: tuple) -> None:
+        """Query ensemble for 2D similarity from current camera view and save."""
+        if not self.target_query:
+            return
+
+        # 1. Get Text Embedding
+        inputs = self.sam_clip.clip_processor(text=[self.target_query], return_tensors="pt", padding=True).to(self.device)
+        with torch.no_grad():
+            text_embed = self.sam_clip.clip_model.get_text_features(**inputs)
+            text_embed = text_embed / (text_embed.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # 2. Project View to 3D
+        fx, fy, cx, cy, H, W = intrinsics
+        mask = (depth > 0.1) & (depth < 10.0)
+        world_points = unprojection(depth.to(self.device), intrinsics, c2w.to(self.device), self.device, mask=mask)
+
+        if world_points.shape[0] == 0:
+            sim_2d = torch.zeros((H, W), device=self.device)
+        else:
+            # 3. Query Ensemble
+            batch_size = 100_000
+            num_batches = int(np.ceil(world_points.shape[0] / batch_size))
+            all_sims = []
+            
+            with torch.no_grad():
+                for i in range(num_batches):
+                    start, end = i * batch_size, min((i + 1) * batch_size, world_points.shape[0])
+                    batch_pts = world_points[start:end]
+                    
+                    batch_means = []
+                    for model in self.ensemble:
+                        m, _ = model.forward(batch_pts, normalize=True)
+                        batch_means.append(m)
+                    
+                    ens_mean = torch.stack(batch_means, dim=0).mean(dim=0)
+                    ens_mean = ens_mean / (ens_mean.norm(dim=-1, keepdim=True) + 1e-8)
+                    
+                    sim = (ens_mean @ text_embed.T).squeeze(-1)
+                    sim = (sim + 1.0) / 2.0
+                    all_sims.append(sim)
+            
+            sim_2d = torch.zeros((H, W), device=self.device)
+            sim_2d[mask] = torch.cat(all_sims, dim=0)
+
+        # 4. Save
+        sim_dir = os.path.join(self.cfg.output_dir, "2d_sim_maps")
+        os.makedirs(sim_dir, exist_ok=True)
+        save_path = os.path.join(sim_dir, f"sim2d_{step:03d}.npy")
+        np.save(save_path, sim_2d.cpu().numpy())
+
     @property
     def buffer_size(self) -> int:
         return len(self._replay_buffer)

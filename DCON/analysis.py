@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 import matplotlib
 matplotlib.use('Agg')
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
@@ -54,6 +54,9 @@ class Visualizer:
 
         # 2. BEV Grid
         self.bev_grid = UncertaintyGrid(cfg, ensemble=self.ensemble_models, scene_bounds=self.scene_bounds)
+
+        # 3. Visualization Params
+        self.sim_temperature = 0.5  # Default temperature for sharpening similarity maps
 
     # Legacy camera data loading removed.
     
@@ -535,97 +538,197 @@ class Visualizer:
         
         sim_map = np.load(sim_path)
         return sim_map
-    
-        epi_map, sim_plot, occ_map, extent = self._prepare_all_maps_data(step)
-        if epi_map is None: return
 
-        fig, axes = plt.subplots(3, 1, figsize=(10, 15), sharex=True)
-        self._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
+    def load_sim2dmap(self, step):
+        """Load the 2D similarity map for a given step."""
+        sim2d_dir = os.path.join(self.cfg.output_dir, "2d_sim_maps")
+        sim2d_path = os.path.join(sim2d_dir, f"sim2d_{step:03d}.npy")
+        if not os.path.exists(sim2d_path):
+            return None
+        return np.load(sim2d_path)
+
+    def apply_temperature(self, sim_map, temperature=0.2):
+        """
+        Apply Softmax temperature scaling: exp(x/T) / sum(exp(x/T)).
+        Lower temperature (< 1.0) sharpens the focus on high-similarity points.
+        """
+        if temperature == 1.0 or sim_map is None:
+            return sim_map
         
-        plt.subplots_adjust(hspace=0.05)
-        plt.savefig(f"./all_maps_step_{step}.png", bbox_inches='tight')
-        plt.show()
+        # For numerical stability, subtract the max before exponentiating
+        max_val = np.max(sim_map)
+        exp_map = np.exp((sim_map - max_val) / temperature)
+        
+        # Probability distribution (Softmax)
+        softmax_map = exp_map / np.sum(exp_map)
+        
+        # Re-normalize peak to 1.0 for visualization (otherwise it's too dark)
+        return softmax_map / np.max(softmax_map)
+        
+    def generate_step_png(self, step, save_path=None):
+        """Generate and save a single PNG snapshot of the 2x3 visualization for a specific step."""
+        result = self._prepare_all_maps_data(step)
+        if result[0] is None:
+            print(f"No data found for step {step}")
+            return None
+        
+        epi_map, sim_plot, occ_map, sim2d_plot, combined_z, extent = result
+
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        self._render_all_maps_to_axes(axes.flatten(), step, epi_map, sim_plot, occ_map, sim2d_plot, combined_z, extent)
+        
+        plt.subplots_adjust(hspace=0.3, wspace=0.3)
+        
+        if save_path is None:
+            save_path = f"./analysis_step_{step}.png"
+            
+        plt.savefig(save_path, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Visualization saved to: {save_path}")
+        return save_path
+
+    def visualize_all_maps(self, step):
+        """Legacy wrapper for generating and showing a snapshot."""
+        self.generate_step_png(step)
 
     def _prepare_all_maps_data(self, step):
-        """Helper to load, align, and normalize all maps for a given step."""
+        """Helper to load, align, and normalize all maps (BEV and 2D) for a given step."""
         epi_map, _ = self.load_umaps(step)
         sim_map = self.load_simmap(step)
         occ_map = self.load_occmap(step)
+        sim2d_map = self.load_sim2dmap(step)
 
         if epi_map is None or sim_map is None or occ_map is None:
-            return None, None, None, None
+            return None, None, None, None, None, None
 
         expected_shape = (self.bev_grid.num_z, self.bev_grid.num_x)
 
-        def align_map(map_2d, map_name):
+        def align_map(map_2d):
+            if map_2d is None: return None
             if map_2d.shape == expected_shape:
                 return map_2d
             if map_2d.shape == (expected_shape[1], expected_shape[0]):
                 return map_2d.T
-            return None # Should not happen with current grid system
+            return None
 
-        epi_map = align_map(epi_map, "epistemic")
-        sim_map = align_map(sim_map, "similarity")
-        occ_map = align_map(occ_map, "occupancy")
+        epi_map = align_map(epi_map)
+        sim_map = align_map(sim_map)
+        occ_map = align_map(occ_map)
         
         if epi_map is None or sim_map is None or occ_map is None:
-            return None, None, None, None
+            return None, None, None, None, None, None
 
-        # Normalize similarity
-        non_zero_mask = sim_map > 0
-        if np.any(non_zero_mask):
-            sim_min, sim_max = sim_map[non_zero_mask].min(), sim_map[non_zero_mask].max()
-            sim_plot = np.zeros_like(sim_map)
-            if sim_max > sim_min:
-                sim_plot[non_zero_mask] = (sim_map[non_zero_mask] - sim_min) / (sim_max - sim_min)
+        # Compute Z-scores for Combined Map
+        def get_z_score(m):
+            std = np.std(m)
+            if std < 1e-8: return np.zeros_like(m)
+            return (m - np.mean(m)) / std
+
+        z_epi = get_z_score(epi_map)
+        z_sim = get_z_score(sim_map)
+        combined_z = z_epi + z_sim
+
+        def normalize_sim(m):
+            if m is None: return None
+            non_zero_mask = m > 0
+            if not np.any(non_zero_mask): return m
+            m_min, m_max = m[non_zero_mask].min(), m[non_zero_mask].max()
+            m_norm = np.zeros_like(m)
+            if m_max > m_min:
+                m_norm[non_zero_mask] = (m[non_zero_mask] - m_min) / (m_max - m_min)
             else:
-                sim_plot[non_zero_mask] = 1.0
-        else:
-            sim_plot = sim_map
+                m_norm[non_zero_mask] = 1.0
+            
+            # Apply temperature scaling to the normalized [0, 1] range
+            return self.apply_temperature(m_norm, temperature=self.sim_temperature)
+
+        sim_plot = normalize_sim(sim_map)
+        sim2d_plot = normalize_sim(sim2d_map)
 
         extent = [self.bev_grid.min_x, self.bev_grid.max_x, 
                   self.bev_grid.min_z, self.bev_grid.max_z]
         
-        return epi_map, sim_plot, occ_map, extent
+        return epi_map, sim_plot, occ_map, sim2d_plot, combined_z, extent
 
-    def _render_all_maps_to_axes(self, axes, step, epi_map, sim_plot, occ_map, extent):
-        """Helper to render maps onto provided axes."""
-        # 1) Epistemic uncertainty
-        im_epi = axes[0].imshow(epi_map, cmap='magma', origin='lower', aspect='equal', extent=extent)
-        axes[0].set_xlabel('X Position (m)', fontsize=12)
-        axes[0].set_ylabel('Z Position (m)', fontsize=12)
-        axes[0].set_title(rf"Uncertainty: $\mathbb{{V}}[\mu_\theta]$ (Step {step})", fontsize=11)
-        axes[0].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-        plt.colorbar(im_epi, ax=axes[0], fraction=0.046, pad=0.02, shrink=0.5, label='Epistemic Uncertainty')
+    def _render_all_maps_to_axes(self, axes, step, epi_map, sim_plot, occ_map, sim2d_plot, combined_z, extent):
+        """Helper to render maps onto provided axes (expects flattened axes of length 6)."""
+        # 0) RGB Image
+        rgb_path = os.path.join(self.cfg.output_dir, "rgbs", f"rgb_{step:03d}.png")
+        if os.path.exists(rgb_path):
+            rgb = cv2.imread(rgb_path)
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+            axes[0].imshow(rgb)
+            axes[0].set_title(f"Agent View (Step {step})", fontsize=11)
+            axes[0].axis('off')
+        else:
+            axes[0].text(0.5, 0.5, f"RGB not found\nrgb_{step:03d}.png", ha='center', va='center', fontsize=8)
+            axes[0].set_title(f"Agent View (Missing)", fontsize=11)
+            axes[0].axis('on')
+            axes[0].set_xticks([]); axes[0].set_yticks([])
+
+        # 1) 2D View Similarity (Normalized)
+        if sim2d_plot is not None:
+            im_sim2d = axes[1].imshow(sim2d_plot, cmap='jet', vmin=0.0, vmax=1.0)
+            axes[1].set_title(f"View Similarity (Step {step})", fontsize=11)
+            axes[1].axis('off')
+            plt.colorbar(im_sim2d, ax=axes[1], fraction=0.046, pad=0.02, shrink=0.7)
+        else:
+            axes[1].text(0.5, 0.5, f"2D Sim not found\nsim2d_{step:03d}.npy", ha='center', va='center', fontsize=8)
+            axes[1].set_title(f"View Similarity (Missing)", fontsize=11)
+            axes[1].axis('on')
+            axes[1].set_xticks([]); axes[1].set_yticks([])
+
+        # 2) Combined Z-Score (New)
+        if combined_z is not None:
+            im_z = axes[2].imshow(combined_z, cmap='plasma', origin='lower', aspect='equal', extent=extent)
+            axes[2].set_title(f"Combined Z-Score (Sim+Unc)", fontsize=11)
+            axes[2].set_xlabel('X (m)', fontsize=10)
+            axes[2].set_ylabel('Z (m)', fontsize=10)
+            axes[2].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+            plt.colorbar(im_z, ax=axes[2], fraction=0.046, pad=0.02, shrink=0.7)
+            
+            z_stats = f"Min: {combined_z.min():.2f}\nMax: {combined_z.max():.2f}\nMean: {combined_z.mean():.2f}"
+            axes[2].text(0.02, 0.98, z_stats, transform=axes[2].transAxes, fontsize=10,
+                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        else:
+             axes[2].axis('off')
+
+        # 3) Epistemic uncertainty
+        im_epi = axes[3].imshow(epi_map, cmap='magma', origin='lower', aspect='equal', extent=extent)
+        axes[3].set_xlabel('X Position (m)', fontsize=10)
+        axes[3].set_ylabel('Z Position (m)', fontsize=10)
+        axes[3].set_title(rf"Uncertainty: $\mathbb{{V}}[\mu_\theta]$ (Step {step})", fontsize=11)
+        axes[3].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        plt.colorbar(im_epi, ax=axes[3], fraction=0.046, pad=0.02, shrink=0.5, label='Epistemic Uncertainty')
 
         epi_stats = f"Min: {epi_map.min():.6f}\nMax: {epi_map.max():.6f}\nMean: {epi_map.mean():.6f}"
-        axes[0].text(0.02, 0.98, epi_stats, transform=axes[0].transAxes, fontsize=10,
+        axes[3].text(0.02, 0.98, epi_stats, transform=axes[3].transAxes, fontsize=10,
                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-        # 2) Occupancy
+        # 4) Occupancy
         occ_cmap = ListedColormap(['#808080', '#FFFFFF', '#000000'])
-        im_occ = axes[1].imshow(occ_map, cmap=occ_cmap, origin='lower', aspect='equal', extent=extent, vmin=0, vmax=2)
-        axes[1].set_xlabel('X Position (m)', fontsize=12)
-        axes[1].set_ylabel('Z Position (m)', fontsize=12)
-        axes[1].set_title(f"Occupancy Map (Step {step})", fontsize=11)
-        axes[1].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-        cbar_occ = plt.colorbar(im_occ, ax=axes[1], fraction=0.046, pad=0.02, shrink=0.5)
+        im_occ = axes[4].imshow(occ_map, cmap=occ_cmap, origin='lower', aspect='equal', extent=extent, vmin=0, vmax=2)
+        axes[4].set_xlabel('X Position (m)', fontsize=10)
+        axes[4].set_ylabel('Z Position (m)', fontsize=10)
+        axes[4].set_title(f"Occupancy Map (Step {step})", fontsize=11)
+        axes[4].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        cbar_occ = plt.colorbar(im_occ, ax=axes[4], fraction=0.046, pad=0.02, shrink=0.5)
         cbar_occ.set_ticks([0.33, 1.0, 1.66])
         cbar_occ.set_ticklabels(['Unseen', 'Free', 'Occupied'])
 
         occupied_cells = np.sum(occ_map == 2)
         exploration_rate = (np.sum(occ_map >= 1) / occ_map.size) * 100
         occ_stats = f"Explored: {exploration_rate:.2f}%\nOccupied: {occupied_cells:,}"
-        axes[1].text(0.02, 0.98, occ_stats, transform=axes[1].transAxes, fontsize=10,
+        axes[4].text(0.02, 0.98, occ_stats, transform=axes[4].transAxes, fontsize=10,
                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-        # 3) Similarity
-        im_sim = axes[2].imshow(sim_plot, cmap='jet', origin='lower', aspect='equal', extent=extent, vmin=0, vmax=1)
-        axes[2].set_xlabel('X Position (m)', fontsize=12)
-        axes[2].set_ylabel('Z Position (m)', fontsize=12)
-        axes[2].set_title(f"Similarity Map (Step {step})", fontsize=11)
-        axes[2].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-        plt.colorbar(im_sim, ax=axes[2], fraction=0.046, pad=0.02, shrink=0.5, label='Normalized Similarity')
+        # 5) Similarity (BEV)
+        im_sim = axes[5].imshow(sim_plot, cmap='jet', origin='lower', aspect='equal', extent=extent, vmin=0, vmax=1)
+        axes[5].set_xlabel('X Position (m)', fontsize=10)
+        axes[5].set_ylabel('Z Position (m)', fontsize=10)
+        axes[5].set_title(f"Similarity Map (Step {step})", fontsize=11)
+        axes[5].grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        plt.colorbar(im_sim, ax=axes[5], fraction=0.046, pad=0.02, shrink=0.5, label='Normalized Similarity')
 
     def viz_all_maps_history(self, save_path='simulation_history.mp4', fps=2):
         """Create an MP4 animation of all maps across the entire simulation."""
@@ -634,13 +737,14 @@ class Visualizer:
         
         frames = []
         for step in epochs:
-            epi_map, sim_plot, occ_map, extent = self._prepare_all_maps_data(step)
-            if epi_map is None:
+            result = self._prepare_all_maps_data(step)
+            if result[0] is None:
                 continue
+            epi_map, sim_plot, occ_map, sim2d_plot, combined_z, extent = result
                 
-            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-            self._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
-            plt.subplots_adjust(wspace=0.3)
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+            self._render_all_maps_to_axes(axes.flatten(), step, epi_map, sim_plot, occ_map, sim2d_plot, combined_z, extent)
+            plt.subplots_adjust(hspace=0.3, wspace=0.3)
             
             # Capture frame
             fig.canvas.draw()
@@ -675,4 +779,8 @@ if __name__ == "__main__":
     # visualizer._render_all_maps_to_axes(axes, step, epi_map, sim_plot, occ_map, extent)
     # plt.subplots_adjust(wspace=0.3)
     # plt.savefig(f'./figs/all_maps_step_{step}.png')  
+    # visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)
+    
+    # Generate a single step snapshot (e.g. at step 10000)
+    # visualizer.generate_step_png(step=20000, save_path='./figs/snapshot_step_10000.png')
     visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)
