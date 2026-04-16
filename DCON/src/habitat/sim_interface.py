@@ -9,7 +9,7 @@ import habitat_sim
 import habitat_sim.utils.common as utils
 import habitat_sim.physics as physics
 
-from src.habitat_utils import get_camera_matrix, HABITAT_TO_CV
+from src.habitat.habitat_utils import get_camera_matrix, HABITAT_TO_CV
 
 
 class SimInterface:

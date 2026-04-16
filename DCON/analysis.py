@@ -20,9 +20,9 @@ import habitat_sim.physics as physics
 
 # Custom Imports
 from src.config import Config
-from src.semantics import SAM_CLIP_Semantics
-from src.featurefield import FeatureField
-from src.grid import UncertaintyGrid
+from src.perception.semantics import SAM_CLIP_Semantics
+from src.perception.featurefield import FeatureField
+from src.perception.grid import UncertaintyGrid
 
 
 def get_scene_bounds(scene_path):
@@ -619,14 +619,30 @@ class Visualizer:
             return None, None, None, None, None, None
 
         # Compute Z-scores for Combined Map
-        def get_z_score(m):
-            std = np.std(m)
+        def get_z_score(m, mask=None, ignore_percentile=0):
+            if mask is not None:
+                m_vals = m[mask]
+            else:
+                m_vals = m.flatten()
+
+            if ignore_percentile > 0 and len(m_vals) > 0:
+                thresh = np.percentile(m_vals, ignore_percentile)
+                m_vals = m_vals[m_vals >= thresh]
+
+            if len(m_vals) == 0:
+                return np.zeros_like(m)
+
+            mean, std = np.mean(m_vals), np.std(m_vals)
             if std < 1e-8: return np.zeros_like(m)
-            return (m - np.mean(m)) / std
+            return (m - mean) / std
 
         z_epi = get_z_score(epi_map)
-        z_sim = get_z_score(sim_map)
-        combined_z = z_epi + z_sim
+        
+        # similarity z-score using occupancy mask and ignoring bottom 10%
+        sim_mask = (occ_map == 2)
+        z_sim = get_z_score(sim_map, mask=sim_mask, ignore_percentile=75)
+        
+        combined_z = 0*z_epi + 1.0*z_sim
 
         def normalize_sim(m):
             if m is None: return None
@@ -680,7 +696,7 @@ class Visualizer:
 
         # 2) Combined Z-Score (New)
         if combined_z is not None:
-            im_z = axes[2].imshow(combined_z, cmap='plasma', origin='lower', aspect='equal', extent=extent)
+            im_z = axes[2].imshow(combined_z, cmap='jet', origin='lower', aspect='equal', extent=extent, vmin = -3, vmax=3)
             axes[2].set_title(f"Combined Z-Score (Sim+Unc)", fontsize=11)
             axes[2].set_xlabel('X (m)', fontsize=10)
             axes[2].set_ylabel('Z (m)', fontsize=10)

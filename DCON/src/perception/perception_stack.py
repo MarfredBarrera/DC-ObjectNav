@@ -7,10 +7,10 @@ import numpy as np
 import torch
 
 from src.config import Config
-from src.semantics import SAM_CLIP_Semantics
-from src.featurefield import FeatureField
-from src.grid import UncertaintyGrid, OccupancyGrid, SimilarityGrid
-from src.utils import unprojection
+from src.perception.semantics import SAM_CLIP_Semantics
+from src.perception.featurefield import FeatureField
+from src.perception.grid import UncertaintyGrid, OccupancyGrid, SimilarityGrid
+from src.perception.utils import unprojection
 
 
 class PerceptionStack:

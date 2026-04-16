@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import tinycudann as tcnn
 import numpy as np
 import json
-from src.utils import unprojection
+from src.perception.utils import unprojection
 
 
 class FeatureField(nn.Module):

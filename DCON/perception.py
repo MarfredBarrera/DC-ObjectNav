@@ -13,14 +13,14 @@ import torch
 import numpy as np
 
 from src.config import Config
-from src.habitat_utils import (
+from src.habitat.habitat_utils import (
     init_simulator,
     get_scene_bounds_from_pathfinder,
     spawn_agent_at_random_navpoint,
     spawn_agent_at_pos
 )
-from src.sim_interface import SimInterface
-from src.perception_stack import PerceptionStack
+from src.habitat.sim_interface import SimInterface
+from src.perception.perception_stack import PerceptionStack
 
 
 def spin_policy(perception: PerceptionStack) -> list:
@@ -37,7 +37,7 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
     sim_iface = SimInterface(cfg, sim, agent)
     perception = PerceptionStack(cfg, scene_bounds)
 
-    perception.target_query = "a green plant"
+    perception.target_query = "a pillow"
 
     import cv2
     img = sim_iface.get_observations()[0]
