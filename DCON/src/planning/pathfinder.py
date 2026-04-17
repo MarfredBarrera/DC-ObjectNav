@@ -4,7 +4,7 @@ import heapq
 from sklearn.mixture import GaussianMixture
 import time
 
-class PathExplorer:
+class PathFinder:
     def __init__(self, cfg, device="cuda"):
         self.cfg = cfg
         self.device = device
@@ -146,6 +146,14 @@ class PathExplorer:
             return 0.0, torch.zeros_like(epi_map, dtype=torch.bool, device=self.device)
             
         Z_dim, X_dim = epi_map.shape
+        # if occ_map.shape != epi_map.shape:
+        #     print(f"Warning: Shape mismatch! epi_map: {epi_map.shape}, occ_map: {occ_map.shape}. Resizing occ_map.")
+        #     # This shouldn't happen if maps are loaded correctly, but let's be safe
+        #     occ_map = torch.nn.functional.interpolate(
+        #         occ_map.float().unsqueeze(0).unsqueeze(0), 
+        #         size=(Z_dim, X_dim), mode='nearest'
+        #     ).squeeze().long()
+
         seen_so_far = torch.zeros((Z_dim, X_dim), dtype=torch.bool, device=self.device)
         total_discounted_ig = 0.0
         
@@ -190,6 +198,7 @@ class PathExplorer:
                 occ_vals = occ_map[rz, rx]
                 is_occ = (occ_vals >= 2)
                 if is_occ.any():
+                    # Find first obstacle along the ray
                     idx_occ = is_occ.nonzero()[0].item()
                     visible_z = rz[:idx_occ+1]
                     visible_x = rx[:idx_occ+1]
@@ -197,6 +206,9 @@ class PathExplorer:
                     visible_z = rz
                     visible_x = rx
                     
+                # # Double check bounds before assignment to avoid CUDA assert
+                # visible_z = torch.clamp(visible_z, 0, Z_dim - 1)
+                # visible_x = torch.clamp(visible_x, 0, X_dim - 1)
                 waypoint_mask[visible_z, visible_x] = True
 
             # Calculate novelty: cells visible now but not in previous steps
@@ -263,4 +275,5 @@ class PathExplorer:
             return scores, None
             
         best = max(valid_scores, key=lambda x: x['score'])
-        return scores, best['idx']
+
+        return scores, best['idx'], best['traj']
