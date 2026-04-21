@@ -24,6 +24,8 @@ class Config:
         self.fov = 90
         self.data_queue_size = 30
         self.training_queue_size = 10
+        self.sensor_height = 1.5
+        self.max_sensor_dist = 10.0
         
         # Semantics Settings
         self.SAM_model_type = "vit_b"
@@ -135,6 +137,10 @@ class Config:
                 self.fov = habitat['fov']
             if 'data_queue_size' in habitat:
                 self.data_queue_size = habitat['data_queue_size']
+            if 'sensor_height' in habitat:
+                self.sensor_height = habitat['sensor_height']
+            if 'max_sensor_dist' in habitat:
+                self.max_sensor_dist = habitat['max_sensor_dist']
             if 'training_queue_size' in habitat:
                 self.training_queue_size = habitat['training_queue_size']
         

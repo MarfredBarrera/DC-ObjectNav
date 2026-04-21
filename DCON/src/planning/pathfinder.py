@@ -182,7 +182,10 @@ class PathFinder:
             
         return goals
 
-    def compute_fov_ig(self, trajectory, epi_map, occ_map, fov_deg=90, max_dist=40, gamma_ig=0.95):
+    def compute_fov_ig(self, trajectory, epi_map, occ_map, fov_deg=90, max_dist=None, gamma_ig=0.95, intrinsics=None, sensor_height=1.5):
+        if max_dist is None:
+            # Consolidate with max_sensor_dist from config
+            max_dist = int(self.cfg.max_sensor_dist / self.cfg.voxel_resolution)
         """
         Compute discounted Information Gain (IG) along a trajectory using Torch.
         Each waypoint's newly observed uncertainty is discounted by gamma_ig^t.
@@ -191,18 +194,32 @@ class PathFinder:
             return 0.0, torch.zeros_like(epi_map, dtype=torch.bool, device=self.device)
             
         Z_dim, X_dim = epi_map.shape
-        # if occ_map.shape != epi_map.shape:
-        #     print(f"Warning: Shape mismatch! epi_map: {epi_map.shape}, occ_map: {occ_map.shape}. Resizing occ_map.")
-        #     # This shouldn't happen if maps are loaded correctly, but let's be safe
-        #     occ_map = torch.nn.functional.interpolate(
-        #         occ_map.float().unsqueeze(0).unsqueeze(0), 
-        #         size=(Z_dim, X_dim), mode='nearest'
-        #     ).squeeze().long()
 
         seen_so_far = torch.zeros((Z_dim, X_dim), dtype=torch.bool, device=self.device)
         total_discounted_ig = 0.0
         
-        fov_rad = fov_deg * np.pi / 180.0
+        # 1. Setup Camera Metrics & Dead Zone
+        if intrinsics is not None:
+            fx, fy, cx, cy, H, W = intrinsics
+            # Perspective ray sampling (pinhole model)
+            # Sample across the image width to get realistic ray distribution
+            num_rays = int(W // 4) # Subsample for performance, but maintain distribution
+            pixels = torch.linspace(0, W - 1, num_rays, device=self.device)
+            ray_angles_relative = torch.atan((pixels - cx) / fx)
+            
+            # Vertical FOV for dead zone calculation
+            vfov = 2 * np.arctan(H / (2 * fy))
+            # The agent cannot see the ground closer than min_dist
+            min_dist = sensor_height / np.tan(vfov / 2)
+        else:
+            # Fallback to uniform angular sampling
+            fov_rad = np.radians(fov_deg)
+            num_rays = int(fov_deg)
+            ray_angles_relative = torch.linspace(-fov_rad/2, fov_rad/2, num_rays, device=self.device)
+            min_dist = 1.0 # Default fallback
+            
+        # Convert min_dist (meters) to grid cells
+        min_dist_cells = max(1.0, min_dist / self.cfg.voxel_resolution)
         
         for t in range(len(trajectory)):
             pos_z, pos_x = trajectory[t]
@@ -218,11 +235,10 @@ class PathFinder:
                 
             heading = np.arctan2(next_z - pos_z, next_x - pos_x)
             
-            # Vectorized obstruction mask based on immediate cell values
-            num_rays = int(fov_deg)
-            ray_angles = torch.linspace(-fov_rad/2, fov_rad/2, num_rays, device=self.device) + heading
+            # Ray angles relative to current heading
+            ray_angles = ray_angles_relative + heading
             
-            steps = torch.arange(1, max_dist + 1, device=self.device).view(-1, 1) # [max_dist, 1]
+            steps = torch.arange(int(min_dist_cells), max_dist + 1, device=self.device).view(-1, 1) # [max_dist - min_dist, 1]
             ray_angles_vec = ray_angles.view(1, -1) # [1, num_rays]
             
             ray_z = (pos_z + steps * torch.sin(ray_angles_vec)).long() # [max_dist, num_rays]
@@ -262,7 +278,7 @@ class PathFinder:
 
         return total_discounted_ig, seen_so_far
 
-    def score_trajectories(self, trajectories, sim_map, epi_map, occ_map, alpha=1.0, beta=1.0, gamma=0.1):
+    def score_trajectories(self, trajectories, sim_map, epi_map, occ_map, alpha=1.0, beta=1.0, gamma=0.1, intrinsics=None, sensor_height=1.5):
         """
         Score a list of trajectory alternatives.
         Score(T_k) = alpha*Semantic(G_k) + beta*IG(T_k) - gamma*Cost(T_k)
@@ -297,7 +313,7 @@ class PathFinder:
             goal = traj[-1]
             semantic_score = z_sim[goal[0], goal[1]]
             
-            ig_score, seen_mask = self.compute_fov_ig(traj, epi_torch, occ_torch, gamma_ig=0.95)
+            ig_score, seen_mask = self.compute_fov_ig(traj, epi_torch, occ_torch, gamma_ig=0.95, intrinsics=intrinsics, sensor_height=sensor_height)
             
             cost_score = len(traj) * self.cfg.voxel_resolution
             
@@ -322,7 +338,7 @@ class PathFinder:
 
         return scores, best['idx'], best['traj']
 
-    def mppi_optimize_trajectory(self, ref_traj, epi_map, occ_map, num_samples=30, num_iters=3, lambda_weight=1.0, w_ref=1.0, w_ig=20.0, w_occ=100.0, stride=3, max_horizon=25):
+    def mppi_optimize_trajectory(self, ref_traj, epi_map, occ_map, num_samples=30, num_iters=3, lambda_weight=0.5, w_ref=0.0, w_ig=10.0, w_occ=100.0, stride=3, max_horizon=25, intrinsics=None, sensor_height=1.5):
         """
         Optimize a nominal A* trajectory using MPPI unicycle kinematic sampling.
         Subsamples the reference trajectory to save computation time on IG scoring.
@@ -330,9 +346,9 @@ class PathFinder:
         if not ref_traj or len(ref_traj) < 2:
             return ref_traj
             
-        # Downsample reference trajectory to reduce horizon H
-        if len(ref_traj) > max_horizon * stride:
-            ref_traj = ref_traj[:max_horizon * stride]
+        # # Downsample reference trajectory to reduce horizon H
+        # if len(ref_traj) > max_horizon * stride:
+        #     ref_traj = ref_traj[:max_horizon * stride]
         
         ref_traj = ref_traj[::stride]
         
@@ -416,7 +432,7 @@ class PathFinder:
                  
                  # Only compute FOV IG if no massive collisions to save time
                  if collision_cost[k] < 3:
-                     ig_k, _ = self.compute_fov_ig(traj_k, epi_torch, occ_torch, gamma_ig=0.95)
+                     ig_k, _ = self.compute_fov_ig(traj_k, epi_torch, occ_torch, gamma_ig=0.95, intrinsics=intrinsics, sensor_height=sensor_height)
                      scores[k] += w_ig * ig_k
                      
              # Extract best for current iteration
@@ -424,7 +440,7 @@ class PathFinder:
              if scores[iter_best_idx] > best_score and collision_cost[iter_best_idx] == 0:
                  best_score = scores[iter_best_idx].item()
                  best_traj = [(int(Z_idx[iter_best_idx, t]), int(X_idx[iter_best_idx, t])) for t in range(horizon)]
-                 _, best_mask = self.compute_fov_ig(best_traj, epi_torch, occ_torch, gamma_ig=0.95)
+                 _, best_mask = self.compute_fov_ig(best_traj, epi_torch, occ_torch, gamma_ig=0.95, intrinsics=intrinsics, sensor_height=sensor_height)
                  
              # MPPI Update Rule
              # Weight generation using Softmax / Exponential weighting

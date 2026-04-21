@@ -197,7 +197,9 @@ class OccupancyGrid(VoxelGrid):
         self.unseen_val, self.free_val, self.occupied_val = 0, 1, 2
         self.voxels = torch.full((self.num_y, self.num_z, self.num_x), self.unseen_val, device=self.device, dtype=torch.uint8)
 
-    def update_from_observation(self, depth, c2w, intrinsics, max_dist=10.0, thickness=0.05):
+    def update_from_observation(self, depth, c2w, intrinsics, max_dist=None, thickness=0.05):
+        if max_dist is None:
+            max_dist = self.cfg.max_sensor_dist
         if not self.initialized: return
         fx, fy, cx, cy, H, W = intrinsics
         

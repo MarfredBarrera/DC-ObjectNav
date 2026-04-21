@@ -49,7 +49,7 @@ class PerceptionStack:
         self,
         sim_iface,
         depth_near: float = 0.1,
-        depth_far: float = 10.0,
+        depth_far: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (world_points, gt_features, depth, c2w) — all on CPU."""
         rgb, depth, c2w = sim_iface.get_observations()
@@ -60,6 +60,9 @@ class PerceptionStack:
         rgb_np = (rgb.numpy() * 255).astype(np.uint8)
         clip_features = self.sam_clip.extract_dense_features(rgb_np)
 
+        if depth_far is None:
+            depth_far = self.cfg.max_sensor_dist
+            
         mask = (depth_gpu > depth_near) & (depth_gpu < depth_far)
         world_points = unprojection(depth_gpu, sim_iface.intrinsics, c2w_gpu, self.device, mask=mask)
         gt_features = clip_features[mask]
@@ -195,7 +198,7 @@ class PerceptionStack:
 
         # 2. Project View to 3D
         fx, fy, cx, cy, H, W = intrinsics
-        mask = (depth > 0.1) & (depth < 10.0)
+        mask = (depth > 0.1) & (depth < self.cfg.max_sensor_dist)
         world_points = unprojection(depth.to(self.device), intrinsics, c2w.to(self.device), self.device, mask=mask)
 
         if world_points.shape[0] == 0:

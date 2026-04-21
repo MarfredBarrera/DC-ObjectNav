@@ -287,16 +287,20 @@ class Planner:
                 return [], None
                 
             # 3. MPPI Optimization
-            optimized_path, seen_mask = self.pathfinder.mppi_optimize_trajectory(ref_path, self.bev_epi_map, self.bev_occ_map)
+            optimized_path, seen_mask = self.pathfinder.mppi_optimize_trajectory(
+                ref_path, self.bev_epi_map, self.bev_occ_map,
+                intrinsics=self.sim_iface.intrinsics, sensor_height=self.cfg.sensor_height
+            )
             
             # 4. Pack into standard scores format for visualizer compatibility
             scores = [{
                 'idx': 0,
-                'score': best_score['score'] if 'best_score' in locals() else 100.0,
+                'score': 100.0, # Placeholder for now
                 'semantic': 0.0,
                 'ig': 0.0,
                 'cost': 0.0,
                 'traj': optimized_path,
+                'ref_traj': ref_path,
                 'seen_mask': seen_mask
             }]
             return scores, 0
@@ -317,7 +321,8 @@ class Planner:
             # 3. Score paths
             scores, best_idx, _ = self.pathfinder.score_trajectories(
                 trajectories, self.bev_sim_map, self.bev_epi_map, self.bev_occ_map,
-                alpha, beta, gamma
+                alpha, beta, gamma,
+                intrinsics=self.sim_iface.intrinsics, sensor_height=self.cfg.sensor_height
             )
             
             return scores, best_idx
@@ -368,7 +373,7 @@ if __name__ == "__main__":
     cfg = Config("config/config.yaml")
 
     # 1. Init Habitat simulator
-    sim, agent = init_simulator(cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov)
+    sim, agent = init_simulator(cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov, sensor_height=cfg.sensor_height)
     spawn_agent_at_random_navpoint(sim, agent)
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
@@ -400,7 +405,7 @@ if __name__ == "__main__":
         start_point = planner.world_to_grid(*start_world)
         
         print(f"Testing path planner from world {start_world} -> grid {start_point}")
-        scores, best_idx = planner.plan_paths(start_point, num_modes=20,alpha=1.0,beta=10.0, gamma=0.01, strategy="mppi")
+        scores, best_idx = planner.plan_paths(start_point, num_modes=20,alpha=10.0,beta=1.0, gamma=0.01, strategy="astar")
         
         
         if best_idx is not None:

@@ -228,8 +228,19 @@ class Visualizer:
                 x_vals, z_vals = [c[0] for c in coords], [c[1] for c in coords]
                 alpha = 1.0 if s['idx'] == best_idx else 0.3
                 color = 'red' if s['idx'] == best_idx else 'blue'
-                axes[0].plot(x_vals, z_vals, color=color, alpha=alpha, linewidth=2)
+                axes[0].plot(x_vals, z_vals, color=color, alpha=alpha, linewidth=2, label='Optimized' if s['idx'] == best_idx else None)
+                
+            # Plot reference trajectory if it exists (A* nominal path)
+            ref_route = s.get('ref_traj')
+            if ref_route and grid_to_world_fn:
+                ref_coords = [grid_to_world_fn(pt[0], pt[1]) for pt in ref_route]
+                rx_vals, rz_vals = [c[0] for c in ref_coords], [c[1] for c in ref_coords]
+                axes[0].plot(rx_vals, rz_vals, color='orange', linestyle='--', alpha=0.8, linewidth=2, label='Reference' if s['idx'] == best_idx else None)
+
+            if route and grid_to_world_fn:
                 axes[0].scatter(x_vals[-1], z_vals[-1], marker='x', color='green', s=100)
+        
+        axes[0].legend(loc='upper right', fontsize=8)
 
         # 2. Similarity + Best path
         # sim_vis = self.normalize_sim(sim_map)
@@ -238,8 +249,16 @@ class Visualizer:
         im_sim = axes[1].imshow(sim_vis, cmap=self.sim_cmap, origin='lower', aspect='equal', extent=extent, vmin = -3, vmax = 3)
         axes[1].set_title("Best Trajectory over Similarity")
         if best_idx is not None and grid_to_world_fn:
-            best_traj = scores[best_idx]['traj']
+            best_score = scores[best_idx]
+            best_traj = best_score['traj']
             best_coords = [grid_to_world_fn(pt[0], pt[1]) for pt in best_traj]
+            
+            # Plot Reference if it exists
+            ref_traj = best_score.get('ref_traj')
+            if ref_traj:
+                ref_coords = [grid_to_world_fn(pt[0], pt[1]) for pt in ref_traj]
+                axes[1].plot([c[0] for c in ref_coords], [c[1] for c in ref_coords], color='orange', linestyle='--', linewidth=2, alpha=0.6)
+            
             axes[1].plot([c[0] for c in best_coords], [c[1] for c in best_coords], color='white', linewidth=3, alpha=0.8)
             axes[1].scatter(best_coords[-1][0], best_coords[-1][1], marker='*', color='white', s=200)
             plt.colorbar(im_sim, ax=axes[1], fraction=0.046, pad=0.02, shrink=0.7)
