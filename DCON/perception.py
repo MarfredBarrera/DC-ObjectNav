@@ -1,6 +1,7 @@
+import argparse
 import os
 # os.environ['taskset'] = '-c 112-127'
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 os.environ['GLOG_minloglevel'] = '2'
@@ -37,7 +38,7 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
     sim_iface = SimInterface(cfg, sim, agent)
     perception = PerceptionStack(cfg, scene_bounds)
 
-    perception.target_query = "a pillow"
+    perception.target_query = cfg.target_query
 
     import cv2
     img = sim_iface.get_observations()[0]
@@ -108,5 +109,16 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--query", type=str, default="a pillow", help="Target query for perception")
+    parser.add_argument("--gpu", type=str, default="0", help="GPU device index")
+    parser.add_argument("--cores", type=str, default="0-127", help="CPU cores for taskset")
+    args = parser.parse_args()
+
+    # Set GPU device
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+
     runner_cfg = Config("config/config.yaml")
+    runner_cfg.target_query = args.query
+    
     run(runner_cfg, policy_fn=spin_policy, save_enabled=True)

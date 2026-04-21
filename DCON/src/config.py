@@ -35,6 +35,7 @@ class Config:
         self.crop_n_layers = 1
         self.crop_n_points_downscale_factor = 2
         self.min_mask_region_area = 100
+        self.target_query = " "
         
         # Training Settings
         self.iterations = 10000

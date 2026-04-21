@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 
@@ -263,36 +263,64 @@ class Planner:
         else:
             print("Unable to visualize Occupancy map due to missing data.")
 
-    def plan_paths(self, start_pos, alpha=1.0, beta=1.0, gamma=1.0, num_modes=3):
+    def plan_paths(self, start_pos, alpha=1.0, beta=10.0, gamma=0.1, num_modes=3, strategy="mppi"):
         """
         Generate and score trajectories from start_pos.
         start_pos: (z, x) tuple of starting grid coordinates
+        strategy: "astar" or "mppi"
         """
         if self.bev_sim_map is None or self.bev_epi_map is None or self.bev_occ_map is None:
             print("Cannot plan paths, missing maps. Ensure sim, epi, and occ maps are loaded.")
             return [], None
             
-        # 1. Get Candidate Goals from GMM
-        print("Finding candidate goals using GMM...")
-        goals = self.pathfinder.get_gmm_goals(self.bev_sim_map, num_modes=num_modes)
-        print(f"Testing {len(goals)} potential goals.")
-        
-        # 2. Plan paths using A*
-        trajectories = []
-        for goal in goals:
-            path = self.pathfinder.astar(self.bev_occ_map, start_pos, goal)
-            if path is not None:
-                trajectories.append(path)
-            else:
-                print(f"Goal {goal} is unreachable.")
+        if strategy == "mppi":
+            # 1. Target Single Best Goal
+            best_goal = self.pathfinder.get_highest_sim_goal(self.bev_sim_map, occ_map=self.bev_occ_map)
+            if best_goal is None:
+                print("No valid goals found for MPPI.")
+                return [], None
+            
+            # 2. Get Nominal Trajectory
+            ref_path = self.pathfinder.astar(self.bev_occ_map, start_pos, best_goal)
+            if ref_path is None:
+                print(f"Goal {best_goal} is unreachable by A* reference.")
+                return [], None
                 
-        # 3. Score paths
-        scores, best_idx, _ = self.pathfinder.score_trajectories(
-            trajectories, self.bev_sim_map, self.bev_epi_map, self.bev_occ_map,
-            alpha, beta, gamma
-        )
-        
-        return scores, best_idx
+            # 3. MPPI Optimization
+            optimized_path, seen_mask = self.pathfinder.mppi_optimize_trajectory(ref_path, self.bev_epi_map, self.bev_occ_map)
+            
+            # 4. Pack into standard scores format for visualizer compatibility
+            scores = [{
+                'idx': 0,
+                'score': best_score['score'] if 'best_score' in locals() else 100.0,
+                'semantic': 0.0,
+                'ig': 0.0,
+                'cost': 0.0,
+                'traj': optimized_path,
+                'seen_mask': seen_mask
+            }]
+            return scores, 0
+            
+        else: # original A* multigoal
+            # 1. Get Candidate Goals from GMM
+            goals = self.pathfinder.get_gmm_goals(self.bev_sim_map, num_modes=num_modes, occ_map=self.bev_occ_map)
+            
+            # 2. Plan paths using A*
+            trajectories = []
+            for goal in goals:
+                path = self.pathfinder.astar(self.bev_occ_map, start_pos, goal)
+                if path is not None:
+                    trajectories.append(path)
+                else:
+                    print(f"Goal {goal} is unreachable.")
+                    
+            # 3. Score paths
+            scores, best_idx, _ = self.pathfinder.score_trajectories(
+                trajectories, self.bev_sim_map, self.bev_epi_map, self.bev_occ_map,
+                alpha, beta, gamma
+            )
+            
+            return scores, best_idx
 
     def world_to_grid(self, x, z):
         """Converts world coordinates (x, z) in meters to grid indices (z_idx, x_idx)."""
@@ -350,11 +378,11 @@ if __name__ == "__main__":
 
     visualizer = Visualizer(cfg) 
     frames = []
+    planner.load_ensemble()
 
     for k in range(int(cfg.iterations/cfg.viz_interval)+1):
         print(k)
         step = k*cfg.viz_interval
-        planner.load_ensemble()
         umap = planner.load_umap(step=step)
         omap = planner.load_occ_map(step=step)
         smap = planner.load_sim_map(step=step)
@@ -372,7 +400,7 @@ if __name__ == "__main__":
         start_point = planner.world_to_grid(*start_world)
         
         print(f"Testing path planner from world {start_world} -> grid {start_point}")
-        scores, best_idx = planner.plan_paths(start_point, num_modes=10,gamma=0,beta=100.0, alpha=0.0)
+        scores, best_idx = planner.plan_paths(start_point, num_modes=20,alpha=1.0,beta=10.0, gamma=0.01, strategy="mppi")
         
         
         if best_idx is not None:
@@ -381,7 +409,7 @@ if __name__ == "__main__":
 
             extent = [planner.sim_map.min_x, planner.sim_map.max_x, planner.sim_map.min_z, planner.sim_map.max_z]
             fig = visualizer.plot_planner_paths(planner.bev_occ_map, planner.bev_sim_map, planner.bev_epi_map,
-            extent, scores, best_idx, save_path=f"./figs/planner_viz_{step}.png", grid_to_world_fn=planner.grid_to_world)
+            extent, scores, best_idx, grid_to_world_fn=planner.grid_to_world)
             frames.append(visualizer.fig_to_numpy(fig))
 
     visualizer.create_video(frames, "./figs/planner_viz.mp4", fps=2)
