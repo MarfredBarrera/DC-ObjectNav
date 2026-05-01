@@ -238,11 +238,12 @@ class PathFinder:
             # Ray angles relative to current heading
             ray_angles = ray_angles_relative + heading
             
-            steps = torch.arange(int(min_dist_cells), max_dist + 1, device=self.device).view(-1, 1) # [max_dist - min_dist, 1]
+            # Start sampling from step 1 to ensure occlusion is detected even for nearby walls
+            all_steps = torch.arange(1, max_dist + 1, device=self.device).view(-1, 1) # [max_dist, 1]
             ray_angles_vec = ray_angles.view(1, -1) # [1, num_rays]
             
-            ray_z = (pos_z + steps * torch.sin(ray_angles_vec)).long() # [max_dist, num_rays]
-            ray_x = (pos_x + steps * torch.cos(ray_angles_vec)).long()
+            ray_z = (pos_z + all_steps * torch.sin(ray_angles_vec)).long() # [max_dist, num_rays]
+            ray_x = (pos_x + all_steps * torch.cos(ray_angles_vec)).long()
             
             valid_idx = (ray_z >= 0) & (ray_z < Z_dim) & (ray_x >= 0) & (ray_x < X_dim)
             
@@ -258,7 +259,9 @@ class PathFinder:
             occ_cumsum = torch.cumsum(is_occ.int(), dim=0)
             # A cell is visible if the accumulated obstacles before it is 0
             shift_cumsum = torch.cat([torch.zeros((1, num_rays), dtype=torch.int32, device=self.device), occ_cumsum[:-1, :]], dim=0)
-            is_visible = (shift_cumsum == 0) & valid_idx
+            
+            # A cell is visible for IG if it is within bounds, not occluded, AND beyond the dead zone
+            is_visible = (shift_cumsum == 0) & valid_idx & (all_steps >= min_dist_cells)
             
             vis_z = ray_z[is_visible]
             vis_x = ray_x[is_visible]
@@ -338,7 +341,7 @@ class PathFinder:
 
         return scores, best['idx'], best['traj']
 
-    def mppi_optimize_trajectory(self, ref_traj, epi_map, occ_map, num_samples=30, num_iters=3, lambda_weight=0.5, w_ref=0.0, w_ig=10.0, w_occ=100.0, stride=3, max_horizon=25, intrinsics=None, sensor_height=1.5):
+    def mppi_optimize_trajectory(self, ref_traj, epi_map, occ_map, num_samples=30, num_iters=3, lambda_weight=0.5, w_ref=1.0, w_ig=0.0, w_occ=100.0, stride=3, max_horizon=25, intrinsics=None, sensor_height=1.5):
         """
         Optimize a nominal A* trajectory using MPPI unicycle kinematic sampling.
         Subsamples the reference trajectory to save computation time on IG scoring.

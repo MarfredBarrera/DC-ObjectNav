@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 
@@ -8,6 +8,7 @@ os.environ['GLOG_minloglevel'] = '2'
 os.environ['MAGNUM_LOG'] = 'quiet'
 os.environ['HABITAT_SIM_LOG'] = 'quiet'
 
+import time
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -24,9 +25,10 @@ from src.habitat.habitat_utils import (
     spawn_agent_at_random_navpoint,
     init_simulator,
 )
-from src.habitat.sim_interface import SimInterface
-from src.planning.pathfinder import PathFinder
+from src.planning.astar import AStarPlanner
+from src.planning.mppi import MPPIPlanner
 from src.visualization.visualizer import Visualizer
+from src.habitat.sim_interface import SimInterface
 
 import habitat_sim
 
@@ -72,7 +74,8 @@ class Planner:
         self.bev_sim_map = None
         self.bev_occ_map = None
         
-        self.pathfinder = PathFinder(cfg, device=self.device)
+        self.astar_planner = AStarPlanner(cfg, device=self.device)
+        self.mppi_planner = MPPIPlanner(cfg, device=self.device)
     
     def load_umap(self, step=20000):
         umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
@@ -275,19 +278,19 @@ class Planner:
             
         if strategy == "mppi":
             # 1. Target Single Best Goal
-            best_goal = self.pathfinder.get_highest_sim_goal(self.bev_sim_map, occ_map=self.bev_occ_map)
+            best_goal = self.mppi_planner.get_highest_sim_goal(self.bev_sim_map, occ_map=self.bev_occ_map)
             if best_goal is None:
                 print("No valid goals found for MPPI.")
                 return [], None
             
             # 2. Get Nominal Trajectory
-            ref_path = self.pathfinder.astar(self.bev_occ_map, start_pos, best_goal)
+            ref_path = self.astar_planner.plan(self.bev_occ_map, start_pos, best_goal)
             if ref_path is None:
                 print(f"Goal {best_goal} is unreachable by A* reference.")
                 return [], None
                 
             # 3. MPPI Optimization
-            optimized_path, seen_mask = self.pathfinder.mppi_optimize_trajectory(
+            optimized_path, seen_mask = self.mppi_planner.optimize_trajectory(
                 ref_path, self.bev_epi_map, self.bev_occ_map,
                 intrinsics=self.sim_iface.intrinsics, sensor_height=self.cfg.sensor_height
             )
@@ -307,19 +310,19 @@ class Planner:
             
         else: # original A* multigoal
             # 1. Get Candidate Goals from GMM
-            goals = self.pathfinder.get_gmm_goals(self.bev_sim_map, num_modes=num_modes, occ_map=self.bev_occ_map)
+            goals = self.astar_planner.get_gmm_goals(self.bev_sim_map, num_modes=num_modes, occ_map=self.bev_occ_map)
             
             # 2. Plan paths using A*
             trajectories = []
             for goal in goals:
-                path = self.pathfinder.astar(self.bev_occ_map, start_pos, goal)
+                path = self.astar_planner.plan(self.bev_occ_map, start_pos, goal)
                 if path is not None:
                     trajectories.append(path)
                 else:
                     print(f"Goal {goal} is unreachable.")
                     
             # 3. Score paths
-            scores, best_idx, _ = self.pathfinder.score_trajectories(
+            scores, best_idx, _ = self.astar_planner.score_trajectories(
                 trajectories, self.bev_sim_map, self.bev_epi_map, self.bev_occ_map,
                 alpha, beta, gamma,
                 intrinsics=self.sim_iface.intrinsics, sensor_height=self.cfg.sensor_height
@@ -386,7 +389,7 @@ if __name__ == "__main__":
     planner.load_ensemble()
 
     for k in range(int(cfg.iterations/cfg.viz_interval)+1):
-        print(k)
+        t0 = time.time()
         step = k*cfg.viz_interval
         umap = planner.load_umap(step=step)
         omap = planner.load_occ_map(step=step)
@@ -396,27 +399,23 @@ if __name__ == "__main__":
         planner.set_occ_map(omap)
         planner.set_sim_map(smap)
         
-        # planner.viz_umap()
-        # planner.viz_sim_map()
-        # planner.viz_occ_map()
-        
         # Test planning
         start_world = (-1.0, -6.5)
         start_point = planner.world_to_grid(*start_world)
         
         print(f"Testing path planner from world {start_world} -> grid {start_point}")
-        scores, best_idx = planner.plan_paths(start_point, num_modes=20,alpha=10.0,beta=1.0, gamma=0.01, strategy="astar")
+        scores, best_idx = planner.plan_paths(start_point, num_modes=20,alpha=10.0,beta=1.0, gamma=0.01, strategy="mppi")
         
         
         if best_idx is not None:
             best_score = scores[best_idx]
-            print(f"Best path found (Score: {best_score['score']:.4f})")
+            print(f"Time: {time.time() - t0:.4f}")
 
-            extent = [planner.sim_map.min_x, planner.sim_map.max_x, planner.sim_map.min_z, planner.sim_map.max_z]
-            fig = visualizer.plot_planner_paths(planner.bev_occ_map, planner.bev_sim_map, planner.bev_epi_map,
-            extent, scores, best_idx, grid_to_world_fn=planner.grid_to_world)
-            frames.append(visualizer.fig_to_numpy(fig))
+    #         extent = [planner.sim_map.min_x, planner.sim_map.max_x, planner.sim_map.min_z, planner.sim_map.max_z]
+    #         fig = visualizer.plot_planner_paths(planner.bev_occ_map, planner.bev_sim_map, planner.bev_epi_map,
+    #         extent, scores, best_idx, grid_to_world_fn=planner.grid_to_world)
+    #         frames.append(visualizer.fig_to_numpy(fig))
 
-    visualizer.create_video(frames, "./figs/planner_viz.mp4", fps=2)
+    # visualizer.create_video(frames, "./figs/planner_viz.mp4", fps=2)
 
     sim.close()

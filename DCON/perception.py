@@ -1,7 +1,7 @@
 import argparse
 import os
 # os.environ['taskset'] = '-c 112-127'
-# os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9+PTX"
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = "false"
 os.environ['GLOG_minloglevel'] = '2'
