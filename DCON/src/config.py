@@ -11,11 +11,13 @@ class Config:
         Args:
             yaml_path: Path to YAML configuration file. If None, uses default values.
         """
+        # Visualization
+        self.viz_interval = 500
+        self.vmax_epi = 0.002
         # Set all default values first
         # Paths
         self.output_dir = "/workspace/DCON/output/current_scene"
         self.output_name = "model.pt"
-        self.SAM_checkpoint_path = "/workspace/DCON/SAM_models/sam_vit_b_01ec64.pth"
 
         # Habitat Settings
         self.scene_path = "/workspace/DCON/gibson_scenes/Anaheim.glb"
@@ -27,17 +29,10 @@ class Config:
         self.sensor_height = 1.5
         self.max_sensor_dist = 10.0
         
-        # Semantics Settings
-        self.SAM_model_type = "vit_b"
-        self.CLIP_model_name = "openai/clip-vit-base-patch32"
-        self.CLIP_label_batch_size = 64
-        self.points_per_side = 32
-        self.pred_iou_thresh = 0.86
-        self.stability_score_thresh = 0.92
-        self.crop_n_layers = 1
-        self.crop_n_points_downscale_factor = 2
-        self.min_mask_region_area = 100
-        self.target_query = " "
+        # Semantics Settings (MaskCLIP)
+        self.maskclip_model_name = "ViT-B/16"
+        self.maskclip_input_size = 448
+        self.target_query = "green plant"
         
         # Training Settings
         self.iterations = 10000
@@ -122,8 +117,6 @@ class Config:
                 self.output_dir = paths['output_dir']
             if 'output_name' in paths:
                 self.output_name = paths['output_name']
-            if 'sam_checkpoint' in paths:
-                self.SAM_checkpoint_path = paths['sam_checkpoint']
         # Habitat Settings
         if 'habitat' in yaml_data:
             habitat = yaml_data['habitat']
@@ -144,27 +137,15 @@ class Config:
             if 'training_queue_size' in habitat:
                 self.training_queue_size = habitat['training_queue_size']
         
-        # Semantics
+        # Semantics (MaskCLIP)
         if 'semantics' in yaml_data:
             sem = yaml_data['semantics']
-            if 'sam_model_type' in sem:
-                self.SAM_model_type = sem['sam_model_type']
-            if 'clip_model_name' in sem:
-                self.CLIP_model_name = sem['clip_model_name']
-            if 'clip_label_batch_size' in sem:
-                self.CLIP_label_batch_size = sem['clip_label_batch_size']
-            if 'points_per_side' in sem:
-                self.points_per_side = sem['points_per_side']
-            if 'pred_iou_thresh' in sem:
-                self.pred_iou_thresh = sem['pred_iou_thresh']
-            if 'stability_score_thresh' in sem:
-                self.stability_score_thresh = sem['stability_score_thresh']
-            if 'crop_n_layers' in sem:
-                self.crop_n_layers = sem['crop_n_layers']
-            if 'crop_n_points_downscale_factor' in sem:
-                self.crop_n_points_downscale_factor = sem['crop_n_points_downscale_factor']
-            if 'min_mask_region_area' in sem:
-                self.min_mask_region_area = sem['min_mask_region_area']
+            if 'maskclip_model_name' in sem:
+                self.maskclip_model_name = sem['maskclip_model_name']
+            if 'maskclip_input_size' in sem:
+                self.maskclip_input_size = sem['maskclip_input_size']
+            if 'target_query' in sem:
+                self.target_query = sem['target_query']
         
         # Training
         if 'training' in yaml_data:

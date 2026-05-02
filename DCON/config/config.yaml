@@ -4,7 +4,6 @@
 paths:
   output_dir: "/workspace/DCON/output/current_scene"
   output_name: "model.pt"
-  sam_checkpoint: "/workspace/DCON/SAM_models/sam_vit_b_01ec64.pth"
 
 habitat:
   scene_path: "/workspace/DCON/gibson_scenes/Annawan.glb"
@@ -14,17 +13,11 @@ habitat:
   data_queue_size: 30
   training_queue_size: 20
 
-# Semantics Settings
+# Semantics Settings (MaskCLIP)
 semantics:
-  sam_model_type: "vit_b"
-  clip_model_name: "openai/clip-vit-base-patch32"
-  clip_label_batch_size: 64
-  points_per_side: 16
-  pred_iou_thresh: 0.86
-  stability_score_thresh: 0.92
-  crop_n_layers: 0
-  crop_n_points_downscale_factor: 2
-  min_mask_region_area: 100
+  maskclip_model_name: "ViT-B/16"
+  maskclip_input_size: 448
+  target_query: "a pillow"
 
 # Training Settings
 training:

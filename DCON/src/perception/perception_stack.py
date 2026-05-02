@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from src.config import Config
-from src.perception.semantics import SAM_CLIP_Semantics
+from src.perception.semantics import MaskCLIPSemantics
 from src.perception.featurefield import FeatureField
 from src.perception.grid import UncertaintyGrid, OccupancyGrid, SimilarityGrid
 from src.perception.utils import unprojection
@@ -30,7 +30,7 @@ class PerceptionStack:
         self.device = cfg.device
         self.scene_bounds = scene_bounds
 
-        self.sam_clip = SAM_CLIP_Semantics(cfg, device=self.device)
+        self.mask_clip = MaskCLIPSemantics(device=self.device)
         self.ensemble = [
             FeatureField(cfg, scene_bounds=scene_bounds, device=self.device)
             for _ in range(cfg.ensemble_num_models)
@@ -39,11 +39,11 @@ class PerceptionStack:
         self.ugrid = UncertaintyGrid(cfg, ensemble=self.ensemble, scene_bounds=scene_bounds)
         self.occupancy_grid = OccupancyGrid(cfg, scene_bounds=scene_bounds)
         self.similarity_grid = SimilarityGrid(
-            cfg, ensemble=self.ensemble, sam_clip=self.sam_clip, scene_bounds=scene_bounds,
+            cfg, ensemble=self.ensemble, semantics=self.mask_clip, scene_bounds=scene_bounds,
         )
 
         self._replay_buffer = []  # list of (points_cpu, features_cpu)
-        self.target_query = ""
+        self.target_query = cfg.target_query
 
     def observe(
         self,
@@ -57,8 +57,9 @@ class PerceptionStack:
         depth_gpu = depth.to(self.device)
         c2w_gpu = c2w.to(self.device)
 
-        rgb_np = (rgb.numpy() * 255).astype(np.uint8)
-        clip_features = self.sam_clip.extract_dense_features(rgb_np)
+        # MaskCLIP: pass the image tensor directly on GPU — no numpy conversion
+        rgb_gpu = rgb.to(self.device)
+        clip_features = self.mask_clip.extract_dense_features(rgb_gpu)
 
         if depth_far is None:
             depth_far = self.cfg.max_sensor_dist
@@ -172,29 +173,62 @@ class PerceptionStack:
             model.save(path)
             print(f"Saved ensemble model {i} -> {path}")
 
-    def load_models(self) -> None:
-        ensemble_dir = os.path.join(self.cfg.output_dir, "ensemble")
-        if not os.path.exists(ensemble_dir):
-            print(f"Error: ensemble directory not found at {ensemble_dir}")
-            return
+    def save_pretrained(self) -> None:
+        """Save current models to ensemble/pretrained/ so a future run can load them."""
         for i, model in enumerate(self.ensemble):
-            path = os.path.join(ensemble_dir, f"featurefield_ensemble_{i}.pt")
-            if os.path.exists(path):
-                model.load(path)
-                print(f"Loaded ensemble model {i} <- {path}")
-            else:
-                print(f"Warning: model {i} not found at {path}")
+            path = os.path.join(self.cfg.output_dir, f"ensemble/pretrained/pretrained_{i}.pt")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            model.save(path)
+            print(f"Saved pretrained model {i} -> {path}")
 
+    def load_models(self, pretrained: bool = False) -> bool:
+        """Load models from disk. Returns True if at least one model was loaded."""
+        ensemble_dir = os.path.join(self.cfg.output_dir, "ensemble")
+        if pretrained:
+            ensemble_dir = os.path.join(ensemble_dir, "pretrained")
+
+        if not os.path.exists(ensemble_dir):
+            print(f"Warning: ensemble directory not found at {ensemble_dir}")
+            return False
+
+        loaded_any = False
+        for i, model in enumerate(self.ensemble):
+            # When loading pretrained, try pretrained_{i}.pt first then fall back
+            # to featurefield_ensemble_{i}.pt (handles the case where the user
+            # placed standard-save files in the pretrained directory).
+            if pretrained:
+                candidates = [f"pretrained_{i}.pt", f"featurefield_ensemble_{i}.pt"]
+            else:
+                candidates = [f"featurefield_ensemble_{i}.pt"]
+
+            path = None
+            for filename in candidates:
+                candidate = os.path.join(ensemble_dir, filename)
+                if os.path.exists(candidate):
+                    path = candidate
+                    break
+
+            if path is not None:
+                # Skip optimizer state for pretrained loads — fine-tuning on a new
+                # data distribution with the converged Adam stats produces oversized
+                # first steps that destroy the pretrained weights.
+                model.load(path, load_optimizer=not pretrained)
+                print(f"  -> Loaded {'pretrained ' if pretrained else ''}model {i} <- {path}")
+                loaded_any = True
+            else:
+                tried = [os.path.join(ensemble_dir, f) for f in candidates]
+                print(f"  -> Warning: model {i} not found (tried: {tried})")
+
+        return loaded_any
+        
     def save_2d_similarity(self, step: int, depth: torch.Tensor, c2w: torch.Tensor, intrinsics: tuple) -> None:
         """Query ensemble for 2D similarity from current camera view and save."""
         if not self.target_query:
             return
 
         # 1. Get Text Embedding
-        inputs = self.sam_clip.clip_processor(text=[self.target_query], return_tensors="pt", padding=True).to(self.device)
         with torch.no_grad():
-            text_embed = self.sam_clip.clip_model.get_text_features(**inputs)
-            text_embed = text_embed / (text_embed.norm(dim=-1, keepdim=True) + 1e-8)
+            text_embed = self.mask_clip.encode_text(self.target_query)
 
         # 2. Project View to 3D
         fx, fy, cx, cy, H, W = intrinsics

@@ -17,7 +17,7 @@ from matplotlib.colors import ListedColormap
 # User Dev Imports
 from src.perception.grid import UncertaintyGrid, SimilarityGrid
 from src.config import Config
-from src.perception.semantics import SAM_CLIP_Semantics
+from src.perception.semantics import MaskCLIPSemantics
 from src.perception.featurefield import FeatureField
 from src.habitat.habitat_utils import (
     make_cfg,
@@ -29,6 +29,7 @@ from src.planning.astar import AStarPlanner
 from src.planning.mppi import MPPIPlanner
 from src.visualization.visualizer import Visualizer
 from src.habitat.sim_interface import SimInterface
+from src.perception.utils import unprojection
 
 import habitat_sim
 
@@ -60,14 +61,14 @@ class Planner:
         self.sim_iface = sim_iface
 
         # Semantics and Ensemble Models
-        self.sam_clip = SAM_CLIP_Semantics(cfg, device=self.device)
+        self.mask_clip = MaskCLIPSemantics(device=self.device)
         self.ensemble_models = [
             FeatureField(cfg, scene_bounds=scene_bounds, device=self.device)
             for _ in range(cfg.ensemble_num_models)
         ]
 
         self.ugrid = UncertaintyGrid(cfg, ensemble=self.ensemble_models, scene_bounds=scene_bounds)
-        self.sim_map = SimilarityGrid(cfg, ensemble=self.ensemble_models, sam_clip=self.sam_clip, scene_bounds=scene_bounds)
+        self.sim_map = SimilarityGrid(cfg, ensemble=self.ensemble_models, semantics=self.mask_clip, scene_bounds=scene_bounds)
         
         self.bev_epi_map = None
         self.bev_ale_map = None
@@ -76,6 +77,7 @@ class Planner:
         
         self.astar_planner = AStarPlanner(cfg, device=self.device)
         self.mppi_planner = MPPIPlanner(cfg, device=self.device)
+        self.target_query = cfg.target_query
     
     def load_umap(self, step=20000):
         umaps_dir = os.path.join(self.cfg.output_dir, "umaps")
@@ -112,9 +114,27 @@ class Planner:
         else:
             print(f"BEV map for step {step} not found in {occ_map_dir}")
             return None
+
+    def load_sim2d(self, step=20000):
+        sim2d_dir = os.path.join(self.cfg.output_dir, "2d_sim_maps")
+        sim2d_path = os.path.join(sim2d_dir, f"sim2d_{step:03d}.npy")
+        if os.path.exists(sim2d_path):
+            return np.load(sim2d_path)
+        return None
+
+    def load_rgb(self, step=20000):
+        rgb_dir = os.path.join(self.cfg.output_dir, "rgbs")
+        # Perception.py saves as rgb_{step:03d}.png
+        rgb_path = os.path.join(rgb_dir, f"rgb_{step:03d}.png")
+        if os.path.exists(rgb_path):
+            import cv2
+            img = cv2.imread(rgb_path)
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return None
         
-    def get_sim_map(self):
-        self.sim_map.compute_similarity_map("a photo of a pillow")
+    def get_sim_map(self, query=None):
+        query = query if query is not None else self.target_query
+        self.sim_map.compute_similarity_map(query)
         return self.sim_map.get_2d_map(min_y=0.1, max_y=1.5).cpu().numpy()
     
     def set_sim_map(self, sim_map):
@@ -127,39 +147,88 @@ class Planner:
     def set_occ_map(self, occ_map):
         self.bev_occ_map = occ_map
         
-    def load_ensemble(self, pretrained=True):
-        """Loads the ensemble FeatureField models from the output directory."""
-        ensemble_models = []
+    def load_ensemble(self, pretrained=False):
+        """Loads weights in-place into the existing ensemble models.
+        
+        This modifies self.ensemble_models directly so that the grids
+        (UncertaintyGrid, SimilarityGrid) which hold references to
+        these same objects automatically see the loaded weights.
+        """
         ensemble_dir = os.path.join(self.cfg.output_dir, "ensemble")
 
         if pretrained:
-            for i in range(self.cfg.ensemble_num_models):
-                model_path = os.path.join(ensemble_dir, f"pretrained/pretrained_{i}.pt")
+            subdir = os.path.join(ensemble_dir, "pretrained")
+            if not os.path.exists(subdir):
+                print(f"Warning: pretrained directory not found at {subdir}")
+                return
+            for i, model in enumerate(self.ensemble_models):
+                model_path = os.path.join(subdir, f"pretrained_{i}.pt")
                 if os.path.exists(model_path):
-                    model = FeatureField(self.cfg, scene_bounds=self.scene_bounds, device=self.device)
                     model.load(model_path)
-                    ensemble_models.append(model)
-                    print(f"  -> Loaded Pretrained Ensemble Model")
+                    print(f"  -> Loaded pretrained ensemble model {i} <- {model_path}")
                 else:
-                    print(f"  -> Warning: Pretrained Ensemble Model not found at {model_path}")
-            return ensemble_models
+                    print(f"  -> Warning: pretrained model {i} not found at {model_path}")
 
-        else:   
+        else:
             if not os.path.exists(ensemble_dir):
                 print(f"Error: Ensemble directory not found at {ensemble_dir}")
                 return
             print("Loading Ensemble Models...")
-            for i in range(self.cfg.ensemble_num_models):
+            for i, model in enumerate(self.ensemble_models):
                 model_path = os.path.join(ensemble_dir, f"featurefield_ensemble_{i}.pt")
                 if os.path.exists(model_path):
-                    # Initialise using the same scene_bounds as the grid members
-                    model = FeatureField(self.cfg, scene_bounds=self.scene_bounds, device=self.device)
                     model.load(model_path)
-                    ensemble_models.append(model)
-                    print(f"  -> Loaded Ensemble Model {i}")
+                    print(f"  -> Loaded ensemble model {i} <- {model_path}")
                 else:
-                    print(f"  -> Warning: Model {i} not found at {model_path}")
-            return ensemble_models
+                    print(f"  -> Warning: model {i} not found at {model_path}")
+
+    def compute_umap(self):
+        """Compute uncertainty maps from the currently loaded ensemble models."""
+        print("Computing uncertainty map from loaded ensemble...")
+        self.ugrid.forward_pass()
+        epi = self.ugrid.get_2d_map(type='epistemic')
+        ale = self.ugrid.get_2d_map(type='aleatoric')
+        if epi is not None:
+            self.bev_epi_map = epi.cpu().numpy()
+        if ale is not None:
+            self.bev_ale_map = ale.cpu().numpy()
+        return self.bev_epi_map, self.bev_ale_map
+
+    def compute_sim2d(self):
+        """Compute 2D view similarity from the current camera pose using the loaded ensemble."""
+        with torch.no_grad():
+            text_embed = self.mask_clip.encode_text(self.target_query)
+
+        _, depth, c2w = self.sim_iface.get_observations()
+        depth = depth.to(self.device)
+        c2w = c2w.to(self.device)
+        intrinsics = self.sim_iface.intrinsics
+        fx, fy, cx, cy, H, W = intrinsics
+
+        mask = (depth > 0.1) & (depth < self.cfg.max_sensor_dist)
+        world_points = unprojection(depth, intrinsics, c2w, self.device, mask=mask)
+
+        if world_points.shape[0] == 0:
+            return torch.zeros((H, W)).cpu().numpy()
+
+        batch_size = self.cfg.hash_inference_batch_size
+        all_sims = []
+        with torch.no_grad():
+            for i in range(0, world_points.shape[0], batch_size):
+                batch_pts = world_points[i:i + batch_size]
+                batch_means = []
+                for model in self.ensemble_models:
+                    m, _ = model.forward(batch_pts, normalize=True)
+                    batch_means.append(m)
+                ens_mean = torch.stack(batch_means).mean(dim=0)
+                ens_mean = ens_mean / (ens_mean.norm(dim=-1, keepdim=True) + 1e-8)
+                sim = (ens_mean @ text_embed.T).squeeze(-1)
+                sim = (sim + 1.0) / 2.0
+                all_sims.append(sim)
+
+        sim_2d = torch.zeros((H, W), device=self.device)
+        sim_2d[mask] = torch.cat(all_sims)
+        return sim_2d.cpu().numpy()
 
     def viz_umap(self):
 
@@ -170,7 +239,7 @@ class Planner:
             extent = [self.ugrid.min_x, self.ugrid.max_x, self.ugrid.min_z, self.ugrid.max_z]
 
             # Epistemic Uncertainty Map
-            im1 = axes.imshow(bev_epi_2d, cmap='magma', origin='lower', aspect='equal', extent=extent)
+            im1 = axes.imshow(bev_epi_2d, cmap='magma', origin='lower', aspect='equal', extent=extent, vmin=0, vmax=self.cfg.vmax_epi)
             axes.set_xlabel('X Position (m)', fontsize=12)
             axes.set_ylabel('Z Position (m)', fontsize=12)
             axes.set_title(r"Epistemic Uncertainty: $\mathbb{V}[\mu_\theta]$", fontsize=10)
@@ -391,31 +460,45 @@ if __name__ == "__main__":
     for k in range(int(cfg.iterations/cfg.viz_interval)+1):
         t0 = time.time()
         step = k*cfg.viz_interval
-        umap = planner.load_umap(step=step)
+        umap = planner.load_umap(step=step) 
         omap = planner.load_occ_map(step=step)
         smap = planner.load_sim_map(step=step)
-
         planner.set_umap(umap)
         planner.set_occ_map(omap)
         planner.set_sim_map(smap)
-        
+
+
         # Test planning
         start_world = (-1.0, -6.5)
         start_point = planner.world_to_grid(*start_world)
-        
-        print(f"Testing path planner from world {start_world} -> grid {start_point}")
-        scores, best_idx = planner.plan_paths(start_point, num_modes=20,alpha=10.0,beta=1.0, gamma=0.01, strategy="mppi")
-        
-        
-        if best_idx is not None:
-            best_score = scores[best_idx]
-            print(f"Time: {time.time() - t0:.4f}")
+        scores, best_idx = planner.plan_paths(start_point, num_modes=20, alpha=10.0, beta=1.0, gamma=0.01, strategy="mppi")
+        print(f"Plan Time: {time.time() - t0:.4f}s")
 
-    #         extent = [planner.sim_map.min_x, planner.sim_map.max_x, planner.sim_map.min_z, planner.sim_map.max_z]
-    #         fig = visualizer.plot_planner_paths(planner.bev_occ_map, planner.bev_sim_map, planner.bev_epi_map,
-    #         extent, scores, best_idx, grid_to_world_fn=planner.grid_to_world)
-    #         frames.append(visualizer.fig_to_numpy(fig))
+        # 1. Prepare Maps for Combined Grid
+        rgb = planner.load_rgb(step)
+        sim2d = planner.load_sim2d(step)
 
-    # visualizer.create_video(frames, "./figs/planner_viz.mp4", fps=2)
+
+        # Use free space for Z-score normalization
+        mask = (omap == 1) if omap is not None else None
+        z_sim = visualizer.get_z_score(planner.bev_sim_map, mask=mask, ignore_percentile=75)
+        combined_z = z_sim
+
+        maps_dict = {
+            'rgb': rgb,
+            'sim2d': sim2d,
+            'epi': planner.bev_epi_map,   # set by compute_umap(), correct type
+            'occ': omap,
+            'sim': smap,
+            'combined_z': combined_z,
+        }
+
+        extent = [planner.sim_map.min_x, planner.sim_map.max_x, planner.sim_map.min_z, planner.sim_map.max_z]
+        fig = visualizer.render_combined_grid(maps_dict, extent, step=step)
+        frames.append(visualizer.fig_to_numpy(fig))
+        plt.close(fig)
+
+
+    visualizer.create_video(frames, "./figs/planner_viz.mp4", fps=2)
 
     sim.close()

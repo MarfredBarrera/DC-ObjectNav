@@ -92,20 +92,18 @@ class VoxelGrid:
 
 class SimilarityGrid(VoxelGrid):
     """3D Similarity Voxel Grid with 2D BEV projection."""
-    def __init__(self, config, ensemble, sam_clip, scene_bounds):
+    def __init__(self, config, ensemble, semantics, scene_bounds):
         super().__init__(config, scene_bounds, device=config.device)
         self.ensemble = ensemble
-        self.sam_clip = sam_clip
+        self.semantics = semantics
         self.voxels = None # 3D Similarity Map (Y, Z, X)
 
     def compute_similarity_map(self, text_query, batch_size=100000, occupancy_grid=None):
         if not self.initialized: return None
 
-        # Embed Text
-        inputs = self.sam_clip.clip_processor(text=[text_query], return_tensors="pt", padding=True).to(self.device)
+        # Embed Text via MaskCLIP
         with torch.no_grad():
-            text_embed = self.sam_clip.clip_model.get_text_features(**inputs)
-            text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
+            text_embed = self.semantics.encode_text(text_query)
 
         # Full grid points
         points, grid_shape = self.generate_sample_points()

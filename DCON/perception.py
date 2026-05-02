@@ -28,7 +28,8 @@ def spin_policy(perception: PerceptionStack) -> list:
     return [0.0, 5.0]
 
 
-def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
+def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True,
+        use_pretrained: bool = False, save_as_pretrained: bool = False) -> None:
     sim, agent = init_simulator(cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov)
     spawn_agent_at_random_navpoint(sim, agent)
     target_point = np.array([0.0, 0.0, 1.0])
@@ -40,13 +41,22 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
 
     perception.target_query = cfg.target_query
 
+    if use_pretrained:
+        print("Loading pretrained models...")
+        loaded = perception.load_models(pretrained=True)
+        if not loaded:
+            print("WARNING: No pretrained model files found. Training from scratch.")
+
     import cv2
     img = sim_iface.get_observations()[0]
     rgb_np = (img.numpy() * 255).astype(np.uint8)
     cv2.imwrite("debug_spawn.png", cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR))
 
     # Seed the replay buffer before training starts
-    min_frames = 3
+    if args.pretrained:
+        min_frames = 10
+    else:
+        min_frames = 3
     print(f"Seeding replay buffer with {min_frames} frames...")
     for i in range(min_frames):
         sim_iface.step(policy_fn(perception))
@@ -72,7 +82,9 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
         if step % refresh_interval == 0:
             if step > 0:
                 sim_iface.step(policy_fn(perception))
+                t0 = time.time()
                 pts, feats, depth, c2w = perception.observe(sim_iface)
+                print(f"Step {step}: observe time {time.time() - t0:.3f}s")
                 perception.update_replay_buffer(pts, feats)
                 perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
                 print(f"Step {step}: buffer {perception.buffer_size}/{cfg.hash_replay_buffer_size}, "
@@ -104,6 +116,9 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True) -> None:
             # start_time = time.time()
 
     perception.save_models()
+    if save_as_pretrained:
+        print("Saving models as pretrained baseline...")
+        perception.save_pretrained()
     sim.close()
     print("Training complete.")
 
@@ -113,12 +128,16 @@ if __name__ == "__main__":
     parser.add_argument("--query", type=str, default="a pillow", help="Target query for perception")
     parser.add_argument("--gpu", type=str, default="0", help="GPU device index")
     parser.add_argument("--cores", type=str, default="0-127", help="CPU cores for taskset")
+    parser.add_argument("--pretrained", action="store_true", default=False,
+                        help="Load pretrained models from ensemble/pretrained/ before training")
+    parser.add_argument("--save-pretrained", action="store_true", default=False,
+                        help="Save final models to ensemble/pretrained/ (use after a bootstrap run)")
     args = parser.parse_args()
 
-    # Set GPU device
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
     runner_cfg = Config("config/config.yaml")
     runner_cfg.target_query = args.query
-    
-    run(runner_cfg, policy_fn=spin_policy, save_enabled=True)
+
+    run(runner_cfg, policy_fn=spin_policy, save_enabled=True,
+        use_pretrained=args.pretrained, save_as_pretrained=args.save_pretrained)

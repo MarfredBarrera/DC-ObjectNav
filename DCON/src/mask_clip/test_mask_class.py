@@ -8,8 +8,8 @@ from MaskCLIP import MaskCLIP
 #use NVIDIA GPU if available
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-#initialize MaskCLIP instance
-mask_clip = MaskCLIP(device=device)
+#initialize MaskCLIP instance using the Vision Transformer (ViT-B/16)
+mask_clip = MaskCLIP(model_name="ViT-B/16", device=device)
 
 #defining path for all possible images. CHOOSE some image from the images folder
 #img_path = os.path.join("images", "image_bear_mask.jpeg")
@@ -22,7 +22,7 @@ img_path = os.path.join("images", "image.png")
 
 
 #UPDATE: prompt for desired image
-prompt = "green plant"
+prompt = "refridgerator"
 
 #set a maximum dimension of 512 for image so that doesn't take too long to process
 MAX_DIM = 512

@@ -82,7 +82,8 @@ class Visualizer:
             (epi_map, r"Epistemic: $\mathbb{V}[\mu_\theta]$", "Epi"),
             (ale_map, r"Aleatoric: $\mathbb{E}[\sigma^2_\theta]$", "Ale")
         ]):
-            im = axes[i].imshow(m, cmap=self.unc_cmap, origin='lower', aspect='equal', extent=extent)
+            vmax = self.cfg.vmax_epi if label == "Epi" else m.max()
+            im = axes[i].imshow(m, cmap=self.unc_cmap, origin='lower', aspect='equal', extent=extent, vmin=0, vmax=vmax)
             axes[i].set_title(title, fontsize=12)
             axes[i].set_xlabel('X (m)')
             axes[i].set_ylabel('Z (m)')
@@ -167,6 +168,7 @@ class Visualizer:
         # 1. View Similarity (2D)
         if 'sim2d' in maps_dict and maps_dict['sim2d'] is not None:
             s2d = self.normalize_sim(maps_dict['sim2d'])
+            s2d = self.apply_temperature(s2d, 0.5)
             im1 = axs[1].imshow(s2d, cmap=self.sim_cmap, vmin=0, vmax=1)
             axs[1].set_title("View Similarity")
             plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.02, shrink=0.7)
@@ -182,7 +184,7 @@ class Visualizer:
 
         # 3. Uncertainty
         if 'epi' in maps_dict and maps_dict['epi'] is not None:
-            im3 = axs[3].imshow(maps_dict['epi'], cmap=self.unc_cmap, origin='lower', extent=extent)
+            im3 = axs[3].imshow(maps_dict['epi'], cmap=self.unc_cmap, origin='lower', extent=extent, vmin=0, vmax=self.cfg.vmax_epi)
             axs[3].set_title("Epistemic Uncertainty")
             plt.colorbar(im3, ax=axs[3], fraction=0.046, pad=0.02, shrink=0.7)
             axs[3].grid(True, alpha=0.3)
@@ -198,6 +200,7 @@ class Visualizer:
         # 5. BEV Similarity
         if 'sim' in maps_dict and maps_dict['sim'] is not None:
             s_bev = self.normalize_sim(maps_dict['sim'])
+            s_bev = self.apply_temperature(s_bev, 0.5)
             im5 = axs[5].imshow(s_bev, cmap=self.sim_cmap, origin='lower', extent=extent, vmin=0, vmax=1)
             axs[5].set_title("BEV Similarity Map")
             plt.colorbar(im5, ax=axs[5], fraction=0.046, pad=0.02, shrink=0.7)

@@ -228,28 +228,7 @@ class FeatureField(nn.Module):
         
         return feature_map
     
-    def query_similarity(self, depth, c2w, intrinsics, text_query, clip_processor, clip_model):
-        """
-        Query semantic similarity using text prompt.
-        """
-        # Get feature map (ignore uncertainty for similarity query)
-        feature_map = self.get_hashgrid_features(depth, c2w, intrinsics, return_uncertainty=False)
-        
-        # Get text embedding
-        inputs = clip_processor(text=[text_query], return_tensors="pt", padding=True).to(self.device)
-        with torch.no_grad():
-            text_embed = clip_model.get_text_features(**inputs)
-            text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
-        
-        # Compute similarity
-        H, W, D = feature_map.shape
-        flat_map = feature_map.view(-1, D)
-        sim = torch.matmul(flat_map, text_embed.T).view(H, W)
-        
-        # Normalize to [0, 1]
-        normalized = (sim + 1.0) / 2.0
-        return torch.clamp(normalized, 0.0, 1.0)
-    
+
     def save(self, path):
         """Save model state."""
         torch.save({
@@ -259,10 +238,17 @@ class FeatureField(nn.Module):
         }, path)
         print(f"FeatureField saved to {path}")
     
-    def load(self, path):
-        """Load model state."""
+    def load(self, path, load_optimizer=True):
+        """Load model state.
+
+        load_optimizer=False starts Adam fresh — use this when fine-tuning from
+        a pretrained checkpoint on a new data distribution.  Reusing the
+        converged optimizer's running statistics with new (large) gradients
+        causes oversized first steps that wipe out the pretrained weights.
+        """
         checkpoint = torch.load(path)
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if load_optimizer:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scene_bounds = checkpoint['scene_bounds']
-        print(f"FeatureField loaded from {path}")
+        print(f"FeatureField loaded from {path} (optimizer={'restored' if load_optimizer else 'fresh'})")

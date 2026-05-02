@@ -3,18 +3,19 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 import time
 
-from model import build_model
-import clip
-from simple_tokenizer import SimpleTokenizer
+from src.mask_clip.model import build_model
+from src.mask_clip import clip
+from src.mask_clip.simple_tokenizer import SimpleTokenizer
 
 class MaskCLIP:
 
-    def __init__(self, device="cuda"):
+    def __init__(self, model_name="ViT-B/16", device="cuda"):
         self.device = device
         self.tokenizer = SimpleTokenizer()
+        self.model_name = model_name
 
         #uses the downloaded weights and apply to model.py
-        model_full, _ = clip.load("ViT-B/16", device=self.device)
+        model_full, _ = clip.load(self.model_name, device=self.device)
         
         #reconstructs model from model.py for dense feature extraction
         self.model = build_model(model_full.state_dict()).to(self.device).eval()
@@ -48,13 +49,15 @@ class MaskCLIP:
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
             #calculating similarity grid
-            heatmap = (patch_features @ text_features.T).reshape(1, 1, 28, 28)
+            num_patches = patch_features.shape[1]
+            grid_size = int(num_patches ** 0.5)
+            heatmap = (patch_features @ text_features.T).reshape(1, 1, grid_size, grid_size)
 
             #apply the calculated surface on the original image
             mask = F.interpolate(heatmap, size=(h_orig, w_orig), mode='bilinear')[0, 0]
             
-            #scales the image back to its original size and then sums up all the patches to get the weighted average --> [1, 512]
-            weights = heatmap.view(1, 784, 1)
+            #scales the image back to its original size and then sums up all the patches to get the weighted average --> [1, dim]
+            weights = heatmap.view(1, num_patches, 1)
             weighted_features = patch_features * weights
             semantic_vector = weighted_features.sum(dim=1) / (weights. sum() + 1e-8)
 
