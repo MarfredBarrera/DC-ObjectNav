@@ -87,3 +87,7 @@ ensemble:
 grid:
   voxel_resolution: 0.1
   max_height: 2.0
+
+planning:
+  mppi_dt: 0.5
+  mppi_w_sign: -1.0

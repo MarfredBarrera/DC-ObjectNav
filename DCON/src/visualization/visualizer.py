@@ -150,61 +150,107 @@ class Visualizer:
         plt.show()
         return fig
 
-    def render_combined_grid(self, maps_dict, extent, step=None, save_path=None):
+    def render_combined_grid(self, maps_dict, extent, agent_trail=None, ref_traj_world=None,
+                             opt_traj_world=None, current_pos=None, current_heading=0.0,
+                             step=None, save_path=None):
         """
-        Renders a 2x3 grid of maps:
-        [RGB, ViewSim, CombinedZ]
+        Renders a diagnostic grid of maps with trajectory overlays:
+        [RGB, ViewSim]
         [Uncertainty, Occupancy, BEVSim]
         """
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        axs = axes.flatten()
+        fig = plt.figure(figsize=(16, 10))
+        gs = fig.add_gridspec(2, 3)
         
+        # We will use 5 axes
+        ax_rgb = fig.add_subplot(gs[0, 0])
+        ax_sim2d = fig.add_subplot(gs[0, 1])
+        # Skip gs[0, 2] -> Empty or for Title
+        ax_epi = fig.add_subplot(gs[1, 0])
+        ax_occ = fig.add_subplot(gs[1, 1])
+        ax_sim = fig.add_subplot(gs[1, 2])
+        
+        min_x, max_x, min_z, max_z = extent
+        arrow_len = (max_x - min_x) * 0.05
+
+        def _overlays(ax):
+            if ax is None: return
+            # Full agent trail
+            if agent_trail and len(agent_trail) > 1:
+                tx = [p[0] for p in agent_trail]
+                tz = [p[1] for p in agent_trail]
+                ax.plot(tx, tz, color='gray', linewidth=2, alpha=0.7, zorder=3)
+
+            # A* reference path
+            if ref_traj_world and len(ref_traj_world) > 1:
+                rx = [p[0] for p in ref_traj_world]
+                rz = [p[1] for p in ref_traj_world]
+                ax.plot(rx, rz, color='orange', linestyle='--', linewidth=1.5, alpha=0.8, zorder=4)
+
+            # MPPI optimised path
+            if opt_traj_world and len(opt_traj_world) > 1:
+                ox = [p[0] for p in opt_traj_world]
+                oz = [p[1] for p in opt_traj_world]
+                ax.plot(ox, oz, color='cyan', linewidth=2, alpha=0.9, zorder=5)
+                ax.scatter(ox[-1], oz[-1], marker='*', color='cyan', s=100, zorder=6)
+
+            # Current pose arrow
+            if current_pos is not None:
+                cx, cz = current_pos
+                dx = arrow_len * np.cos(current_heading)
+                dz = arrow_len * np.sin(current_heading)
+                ax.annotate('', xy=(cx + dx, cz + dz), xytext=(cx, cz),
+                            arrowprops=dict(arrowstyle='->', color='red', lw=2.5), zorder=7)
+                ax.scatter(cx, cz, color='red', s=30, zorder=7)
+
         # 0. RGB
-        if 'rgb' in maps_dict and maps_dict['rgb'] is not None:
-            axs[0].imshow(maps_dict['rgb'])
-            axs[0].set_title(f"Agent View (Step {step})" if step else "Agent View")
-            axs[0].axis('off')
+        rgb = maps_dict.get('rgb')
+        if rgb is not None:
+            ax_rgb.imshow(rgb)
+            title = f"Agent View (Step {step})" if step is not None else "Agent View"
+            ax_rgb.set_title(title)
+            ax_rgb.axis('off')
         
         # 1. View Similarity (2D)
-        if 'sim2d' in maps_dict and maps_dict['sim2d'] is not None:
-            s2d = self.normalize_sim(maps_dict['sim2d'])
+        sim2d = maps_dict.get('sim2d')
+        if sim2d is not None:
+            s2d = self.normalize_sim(sim2d)
             s2d = self.apply_temperature(s2d, 0.5)
-            im1 = axs[1].imshow(s2d, cmap=self.sim_cmap, vmin=0, vmax=1)
-            axs[1].set_title("View Similarity")
-            plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.02, shrink=0.7)
-            axs[1].axis('off')
+            im1 = ax_sim2d.imshow(s2d, cmap=self.sim_cmap, vmin=0, vmax=1)
+            ax_sim2d.set_title("View Similarity")
+            plt.colorbar(im1, ax=ax_sim2d, fraction=0.046, pad=0.02, shrink=0.7)
+            ax_sim2d.axis('off')
 
-        # 2. Combined Z-Score
-        if 'combined_z' in maps_dict and maps_dict['combined_z'] is not None:
-            cz = maps_dict['combined_z']
-            im2 = axs[2].imshow(cz, cmap=self.sim_cmap, origin='lower', extent=extent, vmin=-3, vmax=3)
-            axs[2].set_title("Combined Z-Score (Sim+Unc)")
-            plt.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.02, shrink=0.7)
-            axs[2].grid(True, alpha=0.3)
+        # 2. Uncertainty
+        epi = maps_dict.get('epi')
+        if epi is not None:
+            im3 = ax_epi.imshow(epi, cmap=self.unc_cmap, origin='lower', extent=extent, vmin=0, vmax=self.cfg.vmax_epi)
+            ax_epi.set_title("Epistemic Uncertainty")
+            plt.colorbar(im3, ax=ax_epi, fraction=0.046, pad=0.02, shrink=0.7)
+            _overlays(ax_epi)
 
-        # 3. Uncertainty
-        if 'epi' in maps_dict and maps_dict['epi'] is not None:
-            im3 = axs[3].imshow(maps_dict['epi'], cmap=self.unc_cmap, origin='lower', extent=extent, vmin=0, vmax=self.cfg.vmax_epi)
-            axs[3].set_title("Epistemic Uncertainty")
-            plt.colorbar(im3, ax=axs[3], fraction=0.046, pad=0.02, shrink=0.7)
-            axs[3].grid(True, alpha=0.3)
-
-        # 4. Occupancy
-        if 'occ' in maps_dict and maps_dict['occ'] is not None:
-            im4 = axs[4].imshow(maps_dict['occ'], cmap=self.occ_cmap, origin='lower', extent=extent, vmin=0, vmax=2)
-            axs[4].set_title("Occupancy Map")
-            cbar = plt.colorbar(im4, ax=axs[4], fraction=0.046, pad=0.02, shrink=0.7)
+        # 3. Occupancy
+        occ = maps_dict.get('occ')
+        if occ is not None:
+            im4 = ax_occ.imshow(occ, cmap=self.occ_cmap, origin='lower', extent=extent, vmin=0, vmax=2)
+            ax_occ.set_title("Occupancy + Plan")
+            cbar = plt.colorbar(im4, ax=ax_occ, fraction=0.046, pad=0.02, shrink=0.7)
             cbar.set_ticks([0.33, 1.0, 1.66]); cbar.set_ticklabels(['U', 'F', 'O'])
-            axs[4].grid(True, alpha=0.3)
+            _overlays(ax_occ)
 
-        # 5. BEV Similarity
-        if 'sim' in maps_dict and maps_dict['sim'] is not None:
-            s_bev = self.normalize_sim(maps_dict['sim'])
+        # 4. BEV Similarity
+        sim = maps_dict.get('sim')
+        if sim is not None:
+            s_bev = self.normalize_sim(sim)
             s_bev = self.apply_temperature(s_bev, 0.5)
-            im5 = axs[5].imshow(s_bev, cmap=self.sim_cmap, origin='lower', extent=extent, vmin=0, vmax=1)
-            axs[5].set_title("BEV Similarity Map")
-            plt.colorbar(im5, ax=axs[5], fraction=0.046, pad=0.02, shrink=0.7)
-            axs[5].grid(True, alpha=0.3)
+            im5 = ax_sim.imshow(s_bev, cmap=self.sim_cmap, origin='lower', extent=extent, vmin=0, vmax=1)
+            ax_sim.set_title("BEV Similarity")
+            plt.colorbar(im5, ax=ax_sim, fraction=0.046, pad=0.02, shrink=0.7)
+            _overlays(ax_sim)
+
+        for ax in [ax_epi, ax_occ, ax_sim]:
+            ax.set_xlabel('X (m)')
+            ax.set_ylabel('Z (m)')
+            ax.grid(True, alpha=0.3, linestyle='--')
 
         plt.subplots_adjust(hspace=0.3, wspace=0.3)
         if save_path:
@@ -290,6 +336,96 @@ class Visualizer:
         if save_path:
             plt.savefig(save_path, bbox_inches='tight')
         plt.show()
+        return fig
+
+    def render_nav_frame(self, maps_dict, extent, agent_trail, ref_traj_world,
+                         opt_traj_world, current_pos, current_heading, step=None):
+        """Render a 1×3 navigation frame: occupancy | similarity | uncertainty.
+
+        All trajectory arguments use world-space (x, z) metre coordinates.
+
+        Parameters
+        ----------
+        maps_dict : dict with keys 'occ', 'sim', 'epi' (numpy arrays)
+        extent    : [min_x, max_x, min_z, max_z]
+        agent_trail     : list of (x, z) — full position history
+        ref_traj_world  : list of (x, z) — current A* reference path
+        opt_traj_world  : list of (x, z) — current MPPI optimised path
+        current_pos     : (x, z) current agent position
+        current_heading : float, radians (atan2(fwd_z, fwd_x) convention)
+        """
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        min_x, max_x, min_z, max_z = extent
+        arrow_len = (max_x - min_x) * 0.08
+
+        def _overlays(ax):
+            # Full agent trail
+            if len(agent_trail) > 1:
+                tx = [p[0] for p in agent_trail]
+                tz = [p[1] for p in agent_trail]
+                ax.plot(tx, tz, color='gray', linewidth=2.5, alpha=0.90, zorder=3)
+                # ax.scatter(tx[0], tz[0], color='lime', s=30, zorder=4, label='Start')
+
+            # A* reference path
+            if ref_traj_world and len(ref_traj_world) > 1:
+                rx = [p[0] for p in ref_traj_world]
+                rz = [p[1] for p in ref_traj_world]
+                ax.plot(rx, rz, color='orange', linestyle='--', linewidth=2,
+                        alpha=0.85, zorder=4, label='A* ref')
+
+            # MPPI optimised path
+            if opt_traj_world and len(opt_traj_world) > 1:
+                ox = [p[0] for p in opt_traj_world]
+                oz = [p[1] for p in opt_traj_world]
+                ax.plot(ox, oz, color='cyan', linewidth=2.5, alpha=0.9, zorder=5, label='MPPI')
+                ax.scatter(ox[-1], oz[-1], marker='*', color='cyan', s=200, zorder=6)
+
+            # Current pose arrow
+            if current_pos is not None:
+                cx, cz = current_pos
+                dx = arrow_len * np.cos(current_heading)
+                dz = arrow_len * np.sin(current_heading)
+                ax.annotate('', xy=(cx + dx, cz + dz), xytext=(cx, cz),
+                            arrowprops=dict(arrowstyle='->', color='red', lw=4.0), zorder=7)
+                ax.scatter(cx, cz, color='red', s=50, zorder=7)
+
+        title_suffix = f" (step {step})" if step is not None else ""
+
+        # Panel 0 — Occupancy
+        occ = maps_dict.get('occ')
+        if occ is not None:
+            axes[0].imshow(occ, cmap=self.occ_cmap, origin='lower', aspect='equal',
+                           extent=extent, vmin=0, vmax=2)
+        axes[0].set_title(f"Occupancy + Plan{title_suffix}", fontsize=12)
+        _overlays(axes[0])
+        axes[0].legend(loc='upper right', fontsize=8, framealpha=0.7)
+
+        # Panel 1 — Similarity
+        sim = maps_dict.get('sim')
+        if sim is not None:
+            sim_vis = self.normalize_sim(sim)
+            sim_vis = self.apply_temperature(sim_vis, 0.5)
+            im1 = axes[1].imshow(sim_vis, cmap=self.sim_cmap, origin='lower', aspect='equal',
+                                 extent=extent, vmin=0, vmax=1)
+            plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.02, shrink=0.7)
+        axes[1].set_title(f"Similarity + Trail{title_suffix}", fontsize=12)
+        _overlays(axes[1])
+
+        # Panel 2 — Epistemic uncertainty
+        epi = maps_dict.get('epi')
+        if epi is not None:
+            im2 = axes[2].imshow(epi, cmap=self.unc_cmap, origin='lower', aspect='equal',
+                                 extent=extent, vmin=0, vmax=self.cfg.vmax_epi)
+            plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.02, shrink=0.7)
+        axes[2].set_title(f"Uncertainty + MPPI{title_suffix}", fontsize=12)
+        _overlays(axes[2])
+
+        for ax in axes:
+            ax.set_xlabel('X (m)')
+            ax.set_ylabel('Z (m)')
+            ax.grid(True, alpha=0.3, linestyle='--')
+
+        plt.tight_layout()
         return fig
 
     def fig_to_numpy(self, fig):

@@ -50,8 +50,8 @@ class PerceptionStack:
         sim_iface,
         depth_near: float = 0.1,
         depth_far: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (world_points, gt_features, depth, c2w) — all on CPU."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (world_points, gt_features, depth, c2w, rgb) — all on CPU."""
         rgb, depth, c2w = sim_iface.get_observations()
 
         depth_gpu = depth.to(self.device)
@@ -72,7 +72,7 @@ class PerceptionStack:
         world_points = world_points[valid]
         gt_features = gt_features[valid]
 
-        return world_points.cpu(), gt_features.cpu(), depth.cpu(), c2w.cpu()
+        return world_points.cpu(), gt_features.cpu(), depth.cpu(), c2w.cpu(), rgb.cpu()
 
     def update_replay_buffer(self, world_points: torch.Tensor, gt_features: torch.Tensor) -> None:
         if len(self._replay_buffer) >= self.cfg.hash_replay_buffer_size:
@@ -147,24 +147,27 @@ class PerceptionStack:
         self,
         step: int,
         batch_size: int = 100_000,
+        save_enabled: bool = True,
     ) -> None:
-        """Compute and save all VOXEL maps (uncertainty, occupancy, similarity). Intended for low-frequency calls."""
+        """Compute all VOXEL maps (uncertainty, occupancy, similarity). Saves to disk only if save_enabled."""
         t0 = time.time()
 
         # Uncertainty Reduction
         self.ugrid.forward_pass(batch_size=batch_size)
-        self.ugrid.save(step)
-        # self.ugrid.clear_umaps()
+        if save_enabled:
+            self.ugrid.save(step)
 
-        # Occupancy (already updated incrementally, just save)
-        # Note: we can pass height_filter to get_2d_map in save if we refactor save
-        self.occupancy_grid.save(step)
+        # Occupancy (already updated incrementally)
+        if save_enabled:
+            self.occupancy_grid.save(step)
 
         # Similarity
         self.similarity_grid.compute_similarity_map(self.target_query, occupancy_grid=self.occupancy_grid)
-        self.similarity_grid.save(step)
+        if save_enabled:
+            self.similarity_grid.save(step)
 
-        print(f"Maps saved at step {step} ({time.time() - t0:.2f}s)")
+        verb = "saved" if save_enabled else "computed (in-memory)"
+        print(f"Maps {verb} at step {step} ({time.time() - t0:.2f}s)")
 
     def save_models(self) -> None:
         for i, model in enumerate(self.ensemble):

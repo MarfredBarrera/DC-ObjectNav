@@ -213,3 +213,34 @@ def compute_batch_fov_ig(Z_samples, X_samples, Theta_samples, epi_map, occ_map, 
         seen_so_far |= waypoint_mask
 
     return total_discounted_ig, seen_so_far
+
+def normalize_sim(m):
+    if m is None: return None
+    non_zero_mask = m > 0
+    if not np.any(non_zero_mask): return m
+    m_min, m_max = m[non_zero_mask].min(), m[non_zero_mask].max()
+    m_norm = np.zeros_like(m)
+    if m_max > m_min:
+        m_norm[non_zero_mask] = (m[non_zero_mask] - m_min) / (m_max - m_min)
+    else:
+        m_norm[non_zero_mask] = 1.0
+    
+    # Apply temperature scaling to the normalized [0, 1] range
+    return apply_temperature(m_norm, temperature=0.5)
+
+def apply_temperature(sim_map, temperature=0.2):
+    """Apply Softmax temperature scaling and re-normalize."""
+    if temperature == 1.0 or sim_map is None:
+        return sim_map
+    sim_map = _to_numpy(sim_map)
+    max_val = np.max(sim_map)
+    exp_map = np.exp((sim_map - max_val) / temperature)
+    softmax_map = exp_map / np.sum(exp_map)
+    if np.max(softmax_map) > 0:
+        return softmax_map / np.max(softmax_map)
+    return softmax_map
+
+def _to_numpy(tensor):
+    if isinstance(tensor, torch.Tensor):
+        return tensor.detach().cpu().numpy()
+    return np.array(tensor)

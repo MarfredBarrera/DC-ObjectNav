@@ -17,32 +17,63 @@ class MPPIPlanner:
         if occ_map is not None:
             # Avoid unseen space (0)
             target_sim[occ_map == 0] = 0
-            
+
         y, x = np.where(target_sim == target_sim.max())
         if len(y) == 0:
             return None
-        
+
         goal = (int(y[0]), int(x[0]))
-        
+
         # If the best point is an obstacle, redirect to nearest free space
         if occ_map is not None and occ_map[goal[0], goal[1]] >= obstacle_val:
             goal_free = find_nearest_free_cell(occ_map, goal, obstacle_val)
             if goal_free is not None:
                 return goal_free
-                
+
         return goal
 
-    def optimize_trajectory(self, ref_traj, epi_map, occ_map, num_samples=30, num_iters=3, lambda_weight=0.5, w_ref=0.1, w_ig=10.0, w_occ=1000.0, stride=3, max_horizon=25, intrinsics=None, sensor_height=1.5):
+    def get_top_k_sim_goals(self, sim_map, occ_map=None, k=10, obstacle_val=2, min_separation=10):
+        """
+        Return up to k goal candidates ranked by semantic similarity. Each candidate
+        is snapped to the nearest free cell if it lands on an obstacle. Candidates
+        are spaced at least `min_separation` cells apart so the fallback list
+        explores genuinely different goals rather than near-duplicates.
+        """
+        target_sim = sim_map.copy().astype(np.float32)
+        if occ_map is not None:
+            target_sim[occ_map == 0] = -np.inf  # exclude unseen
+
+        flat = target_sim.flatten()
+        # Argsort descending; -inf entries naturally land at the end
+        order = np.argsort(-flat)
+
+        H, W = target_sim.shape
+        chosen = []
+        for idx in order:
+            if not np.isfinite(flat[idx]):
+                break
+            y, x = int(idx // W), int(idx % W)
+            cand = (y, x)
+            if occ_map is not None and occ_map[y, x] >= obstacle_val:
+                cand = find_nearest_free_cell(occ_map, cand, obstacle_val)
+                if cand is None:
+                    continue
+            # Enforce separation from already-chosen goals
+            if any(abs(cand[0] - cy) + abs(cand[1] - cx) < min_separation for cy, cx in chosen):
+                continue
+            chosen.append(cand)
+            if len(chosen) >= k:
+                break
+        return chosen
+
+    def optimize_trajectory(self, ref_traj, epi_map, occ_map, num_samples=30, num_iters=3, lambda_weight=1.0, w_ref=0.0, w_ig=10.0, w_occ=1e5, intrinsics=None, sensor_height=1.5, initial_heading=None):
         """
         Optimize a nominal A* trajectory using MPPI unicycle kinematic sampling.
         Subsamples the reference trajectory to save computation time on IG scoring.
         """
         if not ref_traj or len(ref_traj) < 2:
-            return ref_traj, None
-            
-        # ref_traj = ref_traj[::stride]
-        # if len(ref_traj) > max_horizon:
-            # ref_traj = ref_traj[:max_horizon]
+            return ref_traj, None, None
+
         
         epi_torch = torch.from_numpy(epi_map).to(self.device).float()
         occ_torch = torch.from_numpy(occ_map).to(self.device).long()
@@ -59,6 +90,14 @@ class MPPIPlanner:
         
         theta_ref = torch.atan2(dZ, dX)
         theta_ref = torch.cat([theta_ref, theta_ref[-1:]], dim=0) # Padding last state
+
+        # Use agent's actual heading as the rollout starting orientation when provided.
+        # Without this, MPPI rolls out from the heading inferred from the first ref-path
+        # segment, which may not match the agent's real pose at replan time.
+        if initial_heading is not None:
+            theta_start = torch.tensor(float(initial_heading), device=self.device, dtype=torch.float32)
+        else:
+            theta_start = theta_ref[0]
         
         v_nom = torch.sqrt(dZ**2 + dX**2)
         w_nom = theta_ref[1:] - theta_ref[:-1]
@@ -74,6 +113,7 @@ class MPPIPlanner:
         cov_matrix = torch.tensor([[0.5, 0.0], [0.0, np.pi/4]], device=self.device) 
         
         best_traj = ref_traj
+        best_U = None
         best_mask = None
         best_score = -float('inf')
         
@@ -82,13 +122,20 @@ class MPPIPlanner:
              noise = torch.randn((num_samples, horizon, 2), device=self.device) @ cov_matrix # [K, H, 2]
              U_samples = U_nom.unsqueeze(0) + noise
              
-             # Limit backward driving to maintain forward progress
-             U_samples[:, :, 0] = torch.clamp(U_samples[:, :, 0], min=0.0)
+             # Calculate limits based on voxel resolution and timestep
+             max_v_cells = (getattr(self.cfg, "mppi_max_v_mps", 1.0) * self.cfg.mppi_dt) / self.cfg.voxel_resolution
+             min_v_cells = (getattr(self.cfg, "mppi_min_v_mps", 0.0) * self.cfg.mppi_dt) / self.cfg.voxel_resolution
+             max_w_rad = getattr(self.cfg, "mppi_max_w_rps", 2.0) * self.cfg.mppi_dt
+             
+             # Clamp linear velocity bounds
+             U_samples[:, :, 0] = torch.clamp(U_samples[:, :, 0], min=min_v_cells, max=max_v_cells)
+             # Clamp angular velocity bounds
+             U_samples[:, :, 1] = torch.clamp(U_samples[:, :, 1], min=-max_w_rad, max=max_w_rad)
              
              # Rollout kinematics - Vectorized
              Theta_samples = torch.zeros((num_samples, horizon), device=self.device)
-             Theta_samples[:, 0] = theta_ref[0]
-             Theta_samples[:, 1:] = theta_ref[0] + torch.cumsum(U_samples[:, :-1, 1], dim=1)
+             Theta_samples[:, 0] = theta_start
+             Theta_samples[:, 1:] = theta_start + torch.cumsum(U_samples[:, :-1, 1], dim=1)
 
              Z_samples = torch.zeros((num_samples, horizon), device=self.device)
              X_samples = torch.zeros((num_samples, horizon), device=self.device)
@@ -111,10 +158,13 @@ class MPPIPlanner:
              # Cost 2: Collision Penalty
              occ_vals = occ_torch[Z_idx, X_idx]
              collision_cost = torch.sum((occ_vals >= 2).float(), dim=1)
+             
+             # Massive penalty for colliding trajectories to ensure they carry minimal weight in softmax
              scores -= w_occ * collision_cost
              
              # Cost 3: Information Gain (Vectorized)
-             valid_k_mask = collision_cost < 3
+             # Only calculate and reward IG for completely collision-free trajectories
+             valid_k_mask = collision_cost == 0
              if valid_k_mask.any():
                  batch_ig, _ = compute_batch_fov_ig(
                      Z_idx[valid_k_mask],
@@ -132,9 +182,10 @@ class MPPIPlanner:
                      
              # Extract best for current iteration
              iter_best_idx = torch.argmax(scores)
-             if scores[iter_best_idx] > best_score and collision_cost[iter_best_idx] == 0:
+             if scores[iter_best_idx] > best_score:
                  best_score = scores[iter_best_idx].item()
                  best_traj = [(int(Z_idx[iter_best_idx, t]), int(X_idx[iter_best_idx, t])) for t in range(horizon)]
+                 best_U = U_samples[iter_best_idx].detach().cpu().numpy()  # [H, 2] (v_cells_per_step, w_rad_per_step)
                  _, best_mask = compute_fov_ig(best_traj, epi_torch, occ_torch, self.cfg, self.device, gamma_ig=0.95, intrinsics=intrinsics, sensor_height=sensor_height)
                  
              # MPPI Update Rule
@@ -147,4 +198,4 @@ class MPPIPlanner:
              U_nom = U_nom + torch.sum(weights.view(-1, 1, 1) * noise, dim=0)
 
         best_mask_np = best_mask.cpu().numpy() if best_mask is not None else None
-        return best_traj, best_mask_np
+        return best_traj, best_U, best_mask_np

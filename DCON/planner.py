@@ -359,7 +359,7 @@ class Planner:
                 return [], None
                 
             # 3. MPPI Optimization
-            optimized_path, seen_mask = self.mppi_planner.optimize_trajectory(
+            optimized_path, _U_opt, seen_mask = self.mppi_planner.optimize_trajectory(
                 ref_path, self.bev_epi_map, self.bev_occ_map,
                 intrinsics=self.sim_iface.intrinsics, sensor_height=self.cfg.sensor_height
             )
@@ -468,11 +468,11 @@ if __name__ == "__main__":
         planner.set_sim_map(smap)
 
 
-        # Test planning
-        start_world = (-1.0, -6.5)
-        start_point = planner.world_to_grid(*start_world)
-        scores, best_idx = planner.plan_paths(start_point, num_modes=20, alpha=10.0, beta=1.0, gamma=0.01, strategy="mppi")
-        print(f"Plan Time: {time.time() - t0:.4f}s")
+        # # Test planning
+        # start_world = (-1.0, -6.5)
+        # start_point = planner.world_to_grid(*start_world)
+        # scores, best_idx = planner.plan_paths(start_point, num_modes=20, alpha=10.0, beta=1.0, gamma=0.01, strategy="mppi")
+        # print(f"Plan Time: {time.time() - t0:.4f}s")
 
         # 1. Prepare Maps for Combined Grid
         rgb = planner.load_rgb(step)

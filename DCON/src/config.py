@@ -98,6 +98,13 @@ class Config:
         self.voxel_resolution = 0.05
         self.grid_max_height = 2.0
 
+        # Planning
+        self.mppi_dt = 0.5
+        self.mppi_w_sign = -1.0  # flip if Habitat ω rotates opposite of MPPI's heading convention
+        self.mppi_max_w_rps = 2.0  # rad/s clamp — prevents huge spins from sharp A* turns
+        self.mppi_min_v_mps = 0.0
+        self.mppi_max_v_mps = 1.0
+
         # Visualization
         self.viz_interval = 2000
         
@@ -262,3 +269,17 @@ class Config:
                 self.voxel_resolution = grid['voxel_resolution']
             if 'max_height' in grid:
                 self.grid_max_height = grid['max_height']
+
+        # Planning
+        if 'planning' in yaml_data:
+            planning = yaml_data['planning']
+            if 'mppi_dt' in planning:
+                self.mppi_dt = planning['mppi_dt']
+            if 'mppi_w_sign' in planning:
+                self.mppi_w_sign = planning['mppi_w_sign']
+            if 'mppi_max_w_rps' in planning:
+                self.mppi_max_w_rps = planning['mppi_max_w_rps']
+            if 'mppi_min_v_mps' in planning:
+                self.mppi_min_v_mps = planning['mppi_min_v_mps']
+            if 'mppi_max_v_mps' in planning:
+                self.mppi_max_v_mps = planning['mppi_max_v_mps']

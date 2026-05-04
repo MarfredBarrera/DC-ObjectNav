@@ -230,11 +230,22 @@ class OccupancyGrid(VoxelGrid):
         v_u, v_v, v_dist = u[in_view].long(), v[in_view].long(), valid_cam[in_view, 2]
         obs_depth = depth[v_v, v_u]
         
-        new_states = torch.full_like(v_dist, self.unseen_val, dtype=torch.uint8)
-        new_states[v_dist < (obs_depth - thickness)] = self.free_val
-        new_states[torch.abs(v_dist - obs_depth) < thickness] = self.occupied_val
+        is_free = v_dist < (obs_depth - thickness)
+        is_occ = torch.abs(v_dist - obs_depth) < thickness
+        update_mask = is_free | is_occ
         
-        self.voxels[Y_idx.flatten()[final_mask], Z_idx.flatten()[final_mask], X_idx.flatten()[final_mask]] = new_states
+        if not update_mask.any(): return
+        
+        # Create a mask that filters final_mask down to ONLY the cells we want to update
+        update_global_mask = final_mask.clone()
+        update_global_mask[final_mask] = update_mask
+        
+        # Get the new states just for the valid update cells
+        new_states = torch.full_like(v_dist[update_mask], self.free_val, dtype=torch.uint8)
+        new_states[is_occ[update_mask]] = self.occupied_val
+        
+        # Overwrite the grid only for unoccluded cells
+        self.voxels[Y_idx.flatten()[update_global_mask], Z_idx.flatten()[update_global_mask], X_idx.flatten()[update_global_mask]] = new_states
 
     def get_2d_map(self, min_y=0.2, max_y=1.5):
         y_start, y_end = self.get_y_indices(min_y, max_y)
