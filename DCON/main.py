@@ -87,7 +87,7 @@ def plan_one_action(perception, sim_iface, astar, mppi, cfg, action_queue: deque
 
     if bev_sim is None or bev_epi is None or bev_occ is None:
         print("  plan: missing map(s); idling")
-        return (action_queue.popleft() if action_queue else None), None, None
+        return (action_queue.popleft() if action_queue else None), None, None, None
 
     pos = sim_iface.agent_position
     heading = get_agent_heading(sim_iface.agent)
@@ -103,10 +103,10 @@ def plan_one_action(perception, sim_iface, astar, mppi, cfg, action_queue: deque
     approach_points = mppi.get_goals_near_highest_sim(bev_sim, bev_occ, max_candidates=1)
     if not approach_points:
         print("  plan: no observed cells, can't pick a goal")
-        return (action_queue.popleft() if action_queue else None), None, None
+        return (action_queue.popleft() if action_queue else None), None, None, None
     goal = approach_points[0]
 
-    opt_path, U_opt, _seen = mppi.optimize_trajectory(
+    opt_path, U_opt, _seen, mppi_score = mppi.optimize_trajectory(
         start_grid, goal, bev_epi, bev_occ,
         initial_heading=heading,
         intrinsics=sim_iface.intrinsics,
@@ -120,7 +120,7 @@ def plan_one_action(perception, sim_iface, astar, mppi, cfg, action_queue: deque
         # geometry that makes the next replan more likely to find a safe plan.
         print("  plan: MPPI returned no safe control sequence; spinning in place")
         action_queue.clear()
-        return [0.0, cfg.mppi_w_sign * cfg.mppi_max_w_rps], None, None
+        return [0.0, cfg.mppi_w_sign * cfg.mppi_max_w_rps], None, None, None
 
     # Successful plan: replace queue with full MPPI control sequence.
     # MPPI U units: v in [grid cells / mppi_step], w in [rad / mppi_step].
@@ -130,7 +130,7 @@ def plan_one_action(perception, sim_iface, astar, mppi, cfg, action_queue: deque
         v_mps = float(U_opt[i, 0]) * cfg.voxel_resolution / cfg.mppi_dt
         w_rps = cfg.mppi_w_sign * float(U_opt[i, 1]) / cfg.mppi_dt
         action_queue.append([v_mps, w_rps])
-    return action_queue.popleft(), None, opt_path
+    return action_queue.popleft(), None, opt_path, mppi_score
 
 
 def run(cfg: Config, save_enabled: bool = True) -> None:
@@ -220,7 +220,7 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
             pos = sim_iface.agent_position.copy()
             heading = get_agent_heading(sim_iface.agent)
             progress = step / max(1, cfg.iterations)
-            action, ref_traj, opt_traj = plan_one_action(
+            action, ref_traj, opt_traj, score = plan_one_action(
                 perception, sim_iface, astar, mppi, cfg, action_queue, progress=progress
             )
             if action is not None:
@@ -231,6 +231,8 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | no action")
 
             with open(traj_log_path, 'a') as _f:
+                # Convert score to cost: higher score is better, so cost is -score.
+                cost = -float(score) if score is not None else None
                 _f.write(json.dumps({
                     'step': step,
                     'pos': [float(pos[0]), float(pos[2])],
@@ -238,6 +240,7 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
                     'action': [float(action[0]), float(action[1])] if action is not None else [0.0, 0.0],
                     'ref_traj': [[int(p[0]), int(p[1])] for p in ref_traj] if ref_traj else [],
                     'opt_traj': [[int(p[0]), int(p[1])] for p in opt_traj] if opt_traj else [],
+                    'mppi_cost': cost,
                 }) + '\n')
 
         # C. refresh buffer + maps (slowest cadence — bottleneck)

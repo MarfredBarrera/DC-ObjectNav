@@ -127,7 +127,7 @@ class MPPIPlanner:
         """
         p = float(np.clip(progress, 0.0, 1.0))
         # Delayed half-run ramp for goal pull: 0 for p<0.5, then linear 0→1.
-        p_goal = max(0.0, (p - 0.75))
+        p_goal = max(0.0, (p - 0.5))
         def lerp(a, b, t=p):
             return a + t * (b - a)
         return {
@@ -137,7 +137,7 @@ class MPPIPlanner:
             "cov_scale":     lerp(self.cfg.mppi_cov_scale_start, self.cfg.mppi_cov_scale_end),
         }
 
-    def optimize_trajectory(self, start, goal, epi_map, occ_map, num_samples=100, num_iters=3, horizon=100, lambda_weight=None, w_goal=None, w_ig=None, w_occ=1e6, w_unseen=0, intrinsics=None, sensor_height=1.5, initial_heading=None, progress=0.0, cov_scale=None):
+    def optimize_trajectory(self, start, goal, epi_map, occ_map, num_samples=100, num_iters=None, horizon=100, lambda_weight=None, w_goal=None, w_ig=None, w_occ=1e6, w_unseen=0, intrinsics=None, sensor_height=1.5, initial_heading=None, progress=0.0, cov_scale=None):
         """
         Optimize a trajectory from `start` to `goal` using MPPI unicycle
         sampling. No A* reference; nominal controls start at zero and MPPI
@@ -152,7 +152,7 @@ class MPPIPlanner:
         scalar to pin any single parameter and bypass the schedule for it.
         """
         if start is None or goal is None:
-            return [(int(start[0]), int(start[1]))] if start is not None else [], None, None
+            return ([(int(start[0]), int(start[1]))] if start is not None else []), None, None, None
 
         # Resolve schedule. Caller-supplied scalars take precedence.
         sched = self.scheduled_params(progress)
@@ -160,6 +160,7 @@ class MPPIPlanner:
         if w_ig is None:          w_ig = sched["w_ig"]
         if w_goal is None:        w_goal = sched["w_goal"]
         if cov_scale is None:     cov_scale = sched["cov_scale"]
+        if num_iters is None:     num_iters = getattr(self.cfg, "mppi_num_iters", 5)
 
         epi_torch = torch.from_numpy(epi_map).to(self.device).float()
         occ_torch = torch.from_numpy(occ_map).to(self.device).long()
@@ -195,7 +196,16 @@ class MPPIPlanner:
         # v noise scales with typical cell size (1.0), w noise allows sufficient turning.
         # cov_scale (schedule-controlled) widens or tightens the sampling envelope.
         cov_matrix = float(cov_scale) * torch.tensor([[0.5, 0.0], [0.0, np.pi/4]], device=self.device)
-        
+
+        # DIAL-MPC action-level annealing: noise variance grows with horizon
+        # index, so early steps (which we'll actually commit to) stay near the
+        # warm-started controls while tail steps explore widely. Precomputed
+        # once: shape [H], values in (0, 1], h=H-1 is full noise.
+        beta_action = float(getattr(self.cfg, "mppi_anneal_beta_action", 1.0))
+        beta_traj   = float(getattr(self.cfg, "mppi_anneal_beta_traj", 1.0))
+        h_idx = torch.arange(horizon, device=self.device, dtype=torch.float32)
+        action_scale = torch.exp(-(horizon - 1 - h_idx) / (beta_action * horizon))  # [H]
+
         best_traj = [(int(start_z), int(start_x))]
         best_U = None
         best_mask = None
@@ -203,6 +213,13 @@ class MPPIPlanner:
         for it in range(num_iters):
              # Sample control noise
              noise = torch.randn((num_samples, horizon, 2), device=self.device) @ cov_matrix # [K, H, 2]
+             # DIAL-MPC trajectory-level annealing: iter 0 = full noise (wide
+             # exploration), iter N-1 = shrunken noise (local refinement).
+             # Combined with action-level scaling so iter N-1 + h=0 is the
+             # most concentrated sample (refining the immediately-committed
+             # action), iter 0 + h=H-1 is the widest (rough global coverage).
+             traj_scale = float(np.exp(-it / (beta_traj * max(num_iters, 1))))
+             noise = noise * (traj_scale * action_scale).view(1, horizon, 1)
              # Pin sample 0 to zero noise so the unmutated warm-start is always
              # evaluated as-is — protects against the case where every noisy
              # variant happens to be worse than the carried-over plan.
@@ -373,4 +390,4 @@ class MPPIPlanner:
             self.last_U = best_U.copy()
 
         best_mask_np = best_mask.cpu().numpy() if best_mask is not None else None
-        return best_traj, best_U, best_mask_np
+        return best_traj, best_U, best_mask_np, best_score

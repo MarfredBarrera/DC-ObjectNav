@@ -353,7 +353,7 @@ class Planner:
                 return [], None
 
             # 2. MPPI Optimization directly from start → goal (no A* reference).
-            optimized_path, _U_opt, seen_mask = self.mppi_planner.optimize_trajectory(
+            optimized_path, _U_opt, seen_mask, score = self.mppi_planner.optimize_trajectory(
                 start_pos, best_goal, self.bev_epi_map, self.bev_occ_map,
                 intrinsics=self.sim_iface.intrinsics, sensor_height=self.cfg.sensor_height
             )
@@ -361,10 +361,10 @@ class Planner:
             # 3. Pack into standard scores format for visualizer compatibility
             scores = [{
                 'idx': 0,
-                'score': 100.0, # Placeholder for now
+                'score': float(score) if score is not None else 0.0,
                 'semantic': 0.0,
                 'ig': 0.0,
-                'cost': 0.0,
+                'cost': -float(score) if score is not None else 0.0,
                 'traj': optimized_path,
                 'ref_traj': None,
                 'seen_mask': seen_mask

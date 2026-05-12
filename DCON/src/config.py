@@ -109,14 +109,27 @@ class Config:
 
         # MPPI exploration→exploitation schedule. progress=0 uses *_start,
         # progress=1 uses *_end, linearly interpolated.
-        self.mppi_lambda_start = 4.0     # softmax temperature: high = flatter weights, wider sampling
-        self.mppi_lambda_end = 4.0
+        self.mppi_lambda_start = 1.0     # softmax temperature: high = flatter weights, wider sampling
+        self.mppi_lambda_end = 1.0
         self.mppi_w_ig_start = 30.0      # information-gain reward: high = chase uncertainty
         self.mppi_w_ig_end = 30.0
         self.mppi_w_goal_start = 0.0     # goal-distance pull: low early = pure IG exploration
         self.mppi_w_goal_end = 0.0       # bump end value to pull rollouts toward goal late
         self.mppi_cov_scale_start = 4.0  # scalar on noise covariance: high = explore wider controls
         self.mppi_cov_scale_end = 4.0
+
+        # DIAL-MPC dual annealing. Per-(iter, horizon-step) noise scaling
+        #   factor(it, h) = exp(-it / (β_traj * N) - (H - h) / (β_action * H))
+        # for MPPI iter `it` ∈ [0, N) and horizon step `h` ∈ [0, H). Smaller
+        # β → more aggressive annealing. β_traj shrinks variance across iters
+        # (iter 0 widest, iter N-1 narrowest); β_action shrinks variance across
+        # horizon (step 0 narrowest, step H-1 widest). The action-level schedule
+        # pairs naturally with the warm-start: early horizon steps are inherited
+        # from a known-safe plan and get small perturbation; tail steps are
+        # zero-padded and explore widely.
+        self.mppi_num_iters = 5
+        self.mppi_anneal_beta_traj = 1.0
+        self.mppi_anneal_beta_action = 1.0
 
         # Visualization
         self.viz_interval = 1000
@@ -305,6 +318,8 @@ class Config:
                 'mppi_w_ig_start', 'mppi_w_ig_end',
                 'mppi_w_goal_start', 'mppi_w_goal_end',
                 'mppi_cov_scale_start', 'mppi_cov_scale_end',
+                'mppi_num_iters',
+                'mppi_anneal_beta_traj', 'mppi_anneal_beta_action',
             ):
                 if key in planning:
                     setattr(self, key, planning[key])

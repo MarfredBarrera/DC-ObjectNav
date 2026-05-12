@@ -152,13 +152,18 @@ class Visualizer:
 
     def render_combined_grid(self, maps_dict, extent, agent_trail=None, ref_traj_world=None,
                              opt_traj_world=None, current_pos=None, current_heading=0.0,
-                             step=None, save_path=None):
+                             step=None, save_path=None, avg_cost=None, current_cost=None):
         """
         Renders a diagnostic grid of maps with trajectory overlays:
         [RGB, ViewSim]
         [Uncertainty, Occupancy, BEVSim]
         """
         fig = plt.figure(figsize=(16, 10))
+        if avg_cost is not None and current_cost is not None:
+            fig.suptitle(f"Step {step} | Current Cost: {current_cost:.2f} | Avg Cost: {avg_cost:.2f}", fontsize=16)
+        elif step is not None:
+            fig.suptitle(f"Step {step}", fontsize=16)
+
         gs = fig.add_gridspec(2, 3)
         
         # We will use 5 axes

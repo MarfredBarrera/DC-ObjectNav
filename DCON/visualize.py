@@ -103,6 +103,11 @@ def main():
               "Run main.py with save_enabled=True.")
         return
     print(f"Using {len(map_steps)} map snapshots (step 0 to {map_steps[-1]} every {cfg.viz_interval}) and {len(traj_log)} trajectory log entries.")
+    
+    # Calculate average MPPI cost
+    costs = [e['mppi_cost'] for e in traj_log if 'mppi_cost' in e and e['mppi_cost'] is not None]
+    avg_cost = np.mean(costs) if costs else 0.0
+    print(f"Average achieved MPPI cost: {avg_cost:.2f}")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
@@ -153,12 +158,16 @@ def main():
         # Optional: compute CombinedZ if we want to match analysis.py perfectly
         # For now, let's just pass the dict. Visualizer handles it.
         
+        # Get cost for this specific step from traj_log
+        current_cost = next((e['mppi_cost'] for e in trail_entries[::-1] if 'mppi_cost' in e and e['mppi_cost'] is not None), 0.0)
+
         fig = viz.render_combined_grid(
             maps_dict, extent,
             agent_trail=agent_trail, ref_traj_world=ref_traj_world, 
             opt_traj_world=opt_traj_world, current_pos=current_pos, 
             current_heading=current_heading,
             step=map_step,
+            avg_cost=avg_cost, current_cost=current_cost
         )
         frames.append(viz.fig_to_numpy(fig))
         plt.close(fig)
