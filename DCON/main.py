@@ -70,15 +70,16 @@ def _to_numpy(maybe_tensor):
     return maybe_tensor
 
 
-def plan_one_action(perception, sim_iface, astar, mppi, cfg, action_queue: deque, k_max: int = 5):
+def plan_one_action(perception, sim_iface, astar, mppi, cfg, action_queue: deque, k_max: int = 5, progress: float = 0.0):
     """Run MPPI from current pose and return (action, ref_traj, opt_traj).
 
     action is [v_mps, w_rad_per_s] or None if idling.
-    ref_traj / opt_traj are grid-coord lists [(z_idx, x_idx), ...]; None when falling
-    back to the queue or idling (no new plan was computed).
+    ref_traj / opt_traj are grid-coord lists [(z_idx, x_idx), ...]; None when
+    falling back to the queue or idling (no new plan was computed).
 
     On a successful plan the full MPPI control sequence replaces the queue.
-    If every A* goal is unreachable the queue is consumed so the agent keeps moving.
+    If every A* goal is unreachable the queue is consumed so the agent keeps
+    moving.
     """
     bev_sim = _to_numpy(perception.similarity_grid.get_2d_map(min_y=0.1, max_y=1.5))
     bev_epi = _to_numpy(perception.ugrid.get_2d_map(type='epistemic'))
@@ -88,61 +89,48 @@ def plan_one_action(perception, sim_iface, astar, mppi, cfg, action_queue: deque
         print("  plan: missing map(s); idling")
         return (action_queue.popleft() if action_queue else None), None, None
 
-    # import cv2
-    # # Dilate obstacles (value == 2) to give the agent a safety margin
-    # # 2 iterations = roughly 2 cells = ~0.2m buffer radius depending on voxel_resolution
-    # obstacle_mask = (bev_occ == 2).astype(np.uint8)
-    # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    # dilated_mask = cv2.dilate(obstacle_mask, kernel, iterations=2)
-    # # Inflate into free space (value == 1). We don't inflate into unseen space (0) so exploration stands.
-    # bev_occ[(bev_occ == 1) & (dilated_mask == 1)] = 2
-
-    # normalize sim map
-    bev_sim = normalize_sim(bev_sim)
-    
     pos = sim_iface.agent_position
     heading = get_agent_heading(sim_iface.agent)
     start_grid = world_to_grid(pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution)
 
-    goals = mppi.get_top_k_sim_goals(bev_sim, occ_map=bev_occ, k=k_max)
-    if not goals:
-        print("  plan: no candidate goals in explored space")
+    # Approach points around the single highest-similarity peak, ordered by
+    # proximity. Target objects (e.g. a bed) are marked as obstacles in the
+    # occupancy grid, so the peak itself is usually unreachable — we A* to
+    # the closest free cell next to it.
+    # Closest free cell to the highest-similarity peak. Target objects (e.g.
+    # a bed) are marked as obstacles in the occupancy grid, so the sim peak
+    # itself is usually unreachable — we just need to get close.
+    approach_points = mppi.get_goals_near_highest_sim(bev_sim, bev_occ, max_candidates=1)
+    if not approach_points:
+        print("  plan: no observed cells, can't pick a goal")
         return (action_queue.popleft() if action_queue else None), None, None
+    goal = approach_points[0]
 
-    for rank, goal in enumerate(goals):
-        ref_path = astar.plan(bev_occ, start_grid, goal)
-        if ref_path is None or len(ref_path) < 2:
-            continue
-        opt_path, U_opt, _seen = mppi.optimize_trajectory(
-            ref_path, bev_epi, bev_occ,
-            initial_heading=heading,
-            intrinsics=sim_iface.intrinsics,
-            sensor_height=cfg.sensor_height,
-        )
-        if U_opt is None or U_opt.shape[0] == 0:
-            continue
-
-        if rank > 0:
-            print(f"  plan: fell back to goal rank {rank} (top {rank} unreachable by A*)")
-
-        # Successful plan: replace queue with full MPPI control sequence.
-        # MPPI U units: v in [grid cells / mppi_step], w in [rad / mppi_step].
-        # sim_iface.step expects [m/s, rad/s].
+    opt_path, U_opt, _seen = mppi.optimize_trajectory(
+        start_grid, goal, bev_epi, bev_occ,
+        initial_heading=heading,
+        intrinsics=sim_iface.intrinsics,
+        sensor_height=cfg.sensor_height,
+        progress=progress,
+    )
+    if U_opt is None or U_opt.shape[0] == 0:
+        # No safe MPPI plan this replan — spin in place to scan for new
+        # options. Rotating doesn't translate the agent, so it's always safe
+        # in a free start cell, and the heading change usually reveals new
+        # geometry that makes the next replan more likely to find a safe plan.
+        print("  plan: MPPI returned no safe control sequence; spinning in place")
         action_queue.clear()
-        for i in range(U_opt.shape[0]):
-            v_mps = float(U_opt[i, 0]) * cfg.voxel_resolution / cfg.mppi_dt
-            w_rps = cfg.mppi_w_sign * float(U_opt[i, 1]) / cfg.mppi_dt
-            action_queue.append([v_mps, w_rps])
-        return action_queue.popleft(), ref_path, opt_path
+        return [0.0, cfg.mppi_w_sign * cfg.mppi_max_w_rps], None, None
 
-    # All goals unreachable — drain the queue from the previous successful plan.
-    if action_queue:
-        print(f"  plan: all {len(goals)} goals unreachable by A*, executing queued action "
-              f"({len(action_queue)} remaining)")
-        return action_queue.popleft(), None, None
-
-    print(f"  plan: all {len(goals)} goals unreachable and queue empty; idling")
-    return None, None, None
+    # Successful plan: replace queue with full MPPI control sequence.
+    # MPPI U units: v in [grid cells / mppi_step], w in [rad / mppi_step].
+    # sim_iface.step expects [m/s, rad/s].
+    action_queue.clear()
+    for i in range(U_opt.shape[0]):
+        v_mps = float(U_opt[i, 0]) * cfg.voxel_resolution / cfg.mppi_dt
+        w_rps = cfg.mppi_w_sign * float(U_opt[i, 1]) / cfg.mppi_dt
+        action_queue.append([v_mps, w_rps])
+    return action_queue.popleft(), None, opt_path
 
 
 def run(cfg: Config, save_enabled: bool = True) -> None:
@@ -165,8 +153,8 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
     print(f"[bootstrap A] spinning {SPIN_FRAMES} frames (~360°)...")
     for f in range(SPIN_FRAMES):
         sim_iface.step([0.0, SPIN_OMEGA])
-        pts, feats, depth, c2w, rgb = perception.observe(sim_iface)
-        perception.update_replay_buffer(pts, feats)
+        rgb, depth, c2w = perception.observe(sim_iface)
+        perception.update_replay_buffer(rgb, depth, c2w, sim_iface.intrinsics)
         perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
         
         if save_enabled:
@@ -231,8 +219,9 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
             t_plan = time.time()
             pos = sim_iface.agent_position.copy()
             heading = get_agent_heading(sim_iface.agent)
+            progress = step / max(1, cfg.iterations)
             action, ref_traj, opt_traj = plan_one_action(
-                perception, sim_iface, astar, mppi, cfg, action_queue
+                perception, sim_iface, astar, mppi, cfg, action_queue, progress=progress
             )
             if action is not None:
                 sim_iface.step(action, dt=cfg.mppi_dt)
@@ -246,7 +235,7 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
                     'step': step,
                     'pos': [float(pos[0]), float(pos[2])],
                     'heading': float(heading),
-                    'action': [float(action[0]), float(action[1])] if action else [0.0, 0.0],
+                    'action': [float(action[0]), float(action[1])] if action is not None else [0.0, 0.0],
                     'ref_traj': [[int(p[0]), int(p[1])] for p in ref_traj] if ref_traj else [],
                     'opt_traj': [[int(p[0]), int(p[1])] for p in opt_traj] if opt_traj else [],
                 }) + '\n')
@@ -254,8 +243,8 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
         # C. refresh buffer + maps (slowest cadence — bottleneck)
         if step % cfg.hash_buffer_refresh_interval == 0:
             t_refresh = time.time()
-            pts, feats, depth, c2w, rgb = perception.observe(sim_iface)
-            perception.update_replay_buffer(pts, feats)
+            rgb, depth, c2w = perception.observe(sim_iface)
+            perception.update_replay_buffer(rgb, depth, c2w, sim_iface.intrinsics)
             perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
 
             if save_enabled:

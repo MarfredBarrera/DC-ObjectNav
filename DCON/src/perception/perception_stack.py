@@ -42,18 +42,10 @@ class PerceptionStack:
             cfg, ensemble=self.ensemble, semantics=self.mask_clip, scene_bounds=scene_bounds,
         )
 
-        self._replay_buffer = []  # list of (points_cpu, features_cpu)
+        self._replay_buffer = []  # list of (rgb, depth, c2w, intrinsics)
         self.target_query = cfg.target_query
-
-    def observe(
-        self,
-        sim_iface,
-        depth_near: float = 0.1,
-        depth_far: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (world_points, gt_features, depth, c2w, rgb) — all on CPU."""
-        rgb, depth, c2w = sim_iface.get_observations()
-
+        
+    def extract_and_unproject(self, rgb, depth, c2w, intrinsics, depth_near=None, depth_far=None) -> Tuple[torch.Tensor, torch.Tensor]:
         depth_gpu = depth.to(self.device)
         c2w_gpu = c2w.to(self.device)
 
@@ -61,25 +53,31 @@ class PerceptionStack:
         rgb_gpu = rgb.to(self.device)
         clip_features = self.mask_clip.extract_dense_features(rgb_gpu)
 
+        if depth_near is None:
+            depth_near = self.cfg.min_sensor_dist
         if depth_far is None:
             depth_far = self.cfg.max_sensor_dist
-            
+
         mask = (depth_gpu > depth_near) & (depth_gpu < depth_far)
-        world_points = unprojection(depth_gpu, sim_iface.intrinsics, c2w_gpu, self.device, mask=mask)
+        world_points = unprojection(depth_gpu, intrinsics, c2w_gpu, self.device, mask=mask)
         gt_features = clip_features[mask]
 
         valid = gt_features.norm(dim=-1) > 1e-6
         world_points = world_points[valid]
         gt_features = gt_features[valid]
 
-        return world_points.cpu(), gt_features.cpu(), depth.cpu(), c2w.cpu(), rgb.cpu()
+        return world_points, gt_features
 
-    def update_replay_buffer(self, world_points: torch.Tensor, gt_features: torch.Tensor) -> None:
-        if len(self._replay_buffer) >= self.cfg.hash_replay_buffer_size:
-            old_pts, old_feats = self._replay_buffer.pop(0)
-            del old_pts, old_feats
-            gc.collect()
-        self._replay_buffer.append((world_points, gt_features))
+    def observe(
+        self,
+        sim_iface,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (rgb, depth, c2w) — all on CPU."""
+        rgb, depth, c2w = sim_iface.get_observations()
+        return rgb.cpu(), depth.cpu(), c2w.cpu()
+
+    def update_replay_buffer(self, rgb: torch.Tensor, depth: torch.Tensor, c2w: torch.Tensor, intrinsics: tuple) -> None:
+        self._replay_buffer.append((rgb, depth, c2w, intrinsics))
 
     def update_occupancy(self, depth: torch.Tensor, c2w: torch.Tensor, intrinsics: tuple) -> None:
         self.occupancy_grid.update_from_observation(
@@ -100,24 +98,31 @@ class PerceptionStack:
         gpu_pts_chunks = []
         gpu_feat_chunks = []
 
-        recent_pts, recent_feats = self._replay_buffer[-1]
+        recent_rgb, recent_depth, recent_c2w, recent_intrinsics = self._replay_buffer[-1]
+        recent_pts, recent_feats = self.extract_and_unproject(recent_rgb, recent_depth, recent_c2w, recent_intrinsics)
+        
         n_recent = int(staging_size * recent_sample_portion)
         if recent_pts.shape[0] > 0:
             n = min(n_recent, recent_pts.shape[0])
             idx = torch.randint(0, recent_pts.shape[0], (n,))
-            gpu_pts_chunks.append(recent_pts[idx].to(self.device))
-            gpu_feat_chunks.append(recent_feats[idx].to(self.device))
+            gpu_pts_chunks.append(recent_pts[idx])
+            gpu_feat_chunks.append(recent_feats[idx])
 
         n_history = staging_size - n_recent
         history = self._replay_buffer[:-1]
         if history and n_history > 0:
-            per_frame = n_history // len(history)
-            for pts, feats in history:
+            num_history_to_sample = min(len(history), self.cfg.hash_replay_buffer_size) 
+            sampled_indices = torch.randperm(len(history))[:num_history_to_sample]
+            
+            per_frame = n_history // num_history_to_sample
+            for i in sampled_indices:
+                h_rgb, h_depth, h_c2w, h_intrinsics = history[i]
+                pts, feats = self.extract_and_unproject(h_rgb, h_depth, h_c2w, h_intrinsics)
                 if pts.shape[0] > 0:
                     n = min(per_frame, pts.shape[0])
                     idx = torch.randint(0, pts.shape[0], (n,))
-                    gpu_pts_chunks.append(pts[idx].to(self.device))
-                    gpu_feat_chunks.append(feats[idx].to(self.device))
+                    gpu_pts_chunks.append(pts[idx])
+                    gpu_feat_chunks.append(feats[idx])
 
         if not gpu_pts_chunks:
             return None, None
@@ -235,7 +240,7 @@ class PerceptionStack:
 
         # 2. Project View to 3D
         fx, fy, cx, cy, H, W = intrinsics
-        mask = (depth > 0.1) & (depth < self.cfg.max_sensor_dist)
+        mask = (depth > self.cfg.min_sensor_dist) & (depth < self.cfg.max_sensor_dist)
         world_points = unprojection(depth.to(self.device), intrinsics, c2w.to(self.device), self.device, mask=mask)
 
         if world_points.shape[0] == 0:

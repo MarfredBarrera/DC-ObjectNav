@@ -200,7 +200,7 @@ class FeatureField(nn.Module):
         feature_map = torch.zeros((H, W, self.feature_dim), device=self.device)
         uncertainty_map = torch.zeros((H, W), device=self.device)
         
-        mask = (depth > 0.1) & (depth < 10.0)
+        mask = (depth > self.cfg.min_sensor_dist) & (depth < self.cfg.max_sensor_dist)
         world_points = unprojection(depth, intrinsics, c2w, self.device, mask=mask)
         
         batch_size = self.cfg.hash_inference_batch_size

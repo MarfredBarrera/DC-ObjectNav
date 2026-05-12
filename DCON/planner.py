@@ -205,7 +205,7 @@ class Planner:
         intrinsics = self.sim_iface.intrinsics
         fx, fy, cx, cy, H, W = intrinsics
 
-        mask = (depth > 0.1) & (depth < self.cfg.max_sensor_dist)
+        mask = (depth > self.cfg.min_sensor_dist) & (depth < self.cfg.max_sensor_dist)
         world_points = unprojection(depth, intrinsics, c2w, self.device, mask=mask)
 
         if world_points.shape[0] == 0:
@@ -351,20 +351,14 @@ class Planner:
             if best_goal is None:
                 print("No valid goals found for MPPI.")
                 return [], None
-            
-            # 2. Get Nominal Trajectory
-            ref_path = self.astar_planner.plan(self.bev_occ_map, start_pos, best_goal)
-            if ref_path is None:
-                print(f"Goal {best_goal} is unreachable by A* reference.")
-                return [], None
-                
-            # 3. MPPI Optimization
+
+            # 2. MPPI Optimization directly from start → goal (no A* reference).
             optimized_path, _U_opt, seen_mask = self.mppi_planner.optimize_trajectory(
-                ref_path, self.bev_epi_map, self.bev_occ_map,
+                start_pos, best_goal, self.bev_epi_map, self.bev_occ_map,
                 intrinsics=self.sim_iface.intrinsics, sensor_height=self.cfg.sensor_height
             )
-            
-            # 4. Pack into standard scores format for visualizer compatibility
+
+            # 3. Pack into standard scores format for visualizer compatibility
             scores = [{
                 'idx': 0,
                 'score': 100.0, # Placeholder for now
@@ -372,7 +366,7 @@ class Planner:
                 'ig': 0.0,
                 'cost': 0.0,
                 'traj': optimized_path,
-                'ref_traj': ref_path,
+                'ref_traj': None,
                 'seen_mask': seen_mask
             }]
             return scores, 0

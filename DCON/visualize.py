@@ -56,20 +56,6 @@ def load_map(directory, filename):
     return np.load(path) if os.path.exists(path) else None
 
 
-def find_saved_steps(output_dir):
-    """Return sorted list of steps for which all three BEV maps are saved."""
-    umaps_dir = os.path.join(output_dir, "umaps")
-    if not os.path.exists(umaps_dir):
-        return []
-    steps = []
-    for fname in os.listdir(umaps_dir):
-        if fname.startswith("bev_epistemic_uncertainty_") and fname.endswith(".npy"):
-            try:
-                step = int(fname.replace("bev_epistemic_uncertainty_", "").replace(".npy", ""))
-                steps.append(step)
-            except ValueError:
-                pass
-    return sorted(steps)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -106,12 +92,17 @@ def main():
     if not traj_log:
         print("WARNING: traj_log.jsonl is empty or missing — trajectories won't be shown.")
 
-    # Find steps with saved maps
-    map_steps = find_saved_steps(output_dir)
+    # Determine map steps from config
+    map_steps = [s for s in range(0, cfg.iterations + 1, cfg.viz_interval)]
+    
+    # Filter to only those that actually exist (optional but keeps it robust)
+    map_steps = [s for s in map_steps if os.path.exists(os.path.join(output_dir, "umaps", f"bev_epistemic_uncertainty_{s}.npy"))]
+
     if not map_steps:
-        print("ERROR: No saved BEV maps found. Run main.py with save_enabled=True.")
+        print(f"ERROR: No saved BEV maps found in {output_dir} following viz_interval {cfg.viz_interval}. "
+              "Run main.py with save_enabled=True.")
         return
-    print(f"Found {len(map_steps)} map snapshots and {len(traj_log)} trajectory log entries.")
+    print(f"Using {len(map_steps)} map snapshots (step 0 to {map_steps[-1]} every {cfg.viz_interval}) and {len(traj_log)} trajectory log entries.")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 

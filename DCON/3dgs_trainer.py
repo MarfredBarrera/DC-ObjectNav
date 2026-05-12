@@ -179,7 +179,7 @@ class Runner:
             depth = self.gt_depths[idx]
             color = self.gt_images[idx]
             c2w = self.c2ws[idx]
-            mask = (depth > 0.1) & (depth < 10.0)
+            mask = (depth > self.cfg.min_sensor_dist) & (depth < self.cfg.max_sensor_dist)
 
             x_c, y_c, z_c = unprojection(depth, self.intrinsics, self.device)
             x_c, y_c, z_c = x_c[mask], y_c[mask], z_c[mask]

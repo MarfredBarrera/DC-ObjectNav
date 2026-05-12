@@ -60,8 +60,8 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True,
     print(f"Seeding replay buffer with {min_frames} frames...")
     for i in range(min_frames):
         sim_iface.step(policy_fn(perception))
-        pts, feats, depth, c2w = perception.observe(sim_iface)
-        perception.update_replay_buffer(pts, feats)
+        rgb, depth, c2w = perception.observe(sim_iface)
+        perception.update_replay_buffer(rgb, depth, c2w, sim_iface.intrinsics)
         perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
         print(f"  Buffered seed frame {i + 1}/{min_frames}")
         torch.cuda.empty_cache()
@@ -83,9 +83,9 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True,
             if step > 0:
                 sim_iface.step(policy_fn(perception))
                 t0 = time.time()
-                pts, feats, depth, c2w = perception.observe(sim_iface)
+                rgb, depth, c2w = perception.observe(sim_iface)
                 print(f"Step {step}: observe time {time.time() - t0:.3f}s")
-                perception.update_replay_buffer(pts, feats)
+                perception.update_replay_buffer(rgb, depth, c2w, sim_iface.intrinsics)
                 perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
                 print(f"Step {step}: buffer {perception.buffer_size}/{cfg.hash_replay_buffer_size}, "
                       f"frames {sim_iface.frames_processed}")

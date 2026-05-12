@@ -195,9 +195,13 @@ class OccupancyGrid(VoxelGrid):
         self.unseen_val, self.free_val, self.occupied_val = 0, 1, 2
         self.voxels = torch.full((self.num_y, self.num_z, self.num_x), self.unseen_val, device=self.device, dtype=torch.uint8)
 
-    def update_from_observation(self, depth, c2w, intrinsics, max_dist=None, thickness=0.05):
+    def update_from_observation(self, depth, c2w, intrinsics, max_dist=None):
         if max_dist is None:
             max_dist = self.cfg.max_sensor_dist
+
+        thickness = self.cfg.voxel_resolution * 1.2
+        # thickness = 0.075
+
         if not self.initialized: return
         fx, fy, cx, cy, H, W = intrinsics
         
@@ -215,7 +219,7 @@ class OccupancyGrid(VoxelGrid):
         
         pts_cam = (torch.inverse(c2w) @ pts_world.T).T
         dist = pts_cam[:, 2]
-        frustum_mask = (dist > 0.1) & (dist < max_dist)
+        frustum_mask = (dist > self.cfg.min_sensor_dist) & (dist < max_dist)
         if not frustum_mask.any(): return
             
         valid_cam = pts_cam[frustum_mask]
@@ -251,6 +255,30 @@ class OccupancyGrid(VoxelGrid):
         y_start, y_end = self.get_y_indices(min_y, max_y)
         if y_start >= y_end: return torch.zeros((self.num_z, self.num_x), device=self.device)
         return self.voxels[y_start:y_end].max(dim=0)[0]
+
+    def get_2d_map_dilated(self, min_y=0.2, max_y=1.5, radius=1):
+        """Return a 2D occupancy BEV with obstacles dilated by `radius` cells.
+
+        Only free cells (val==1) adjacent to obstacles are promoted to
+        obstacle; unseen cells (val==0) are never changed, so exploration
+        through unseen space is unaffected.
+        """
+        raw = self.get_2d_map(min_y, max_y)
+        if radius <= 0:
+            return raw
+        # Binary obstacle mask
+        obstacle_mask = (raw >= self.occupied_val).float()  # [Z, X]
+        # Max-pool dilates the mask by `radius` in every direction
+        kernel = 2 * radius + 1
+        dilated = torch.nn.functional.max_pool2d(
+            obstacle_mask.unsqueeze(0).unsqueeze(0),
+            kernel_size=kernel, stride=1, padding=radius)
+        dilated = dilated.squeeze(0).squeeze(0)  # back to [Z, X]
+        # Promote only free→obstacle; leave unseen (0) untouched
+        out = raw.clone()
+        promote = (dilated > 0.5) & (raw == self.free_val)
+        out[promote] = self.occupied_val
+        return out
 
     def save(self, step):
         occ_2d = self.get_2d_map()

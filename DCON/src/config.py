@@ -26,7 +26,8 @@ class Config:
         self.fov = 90
         self.data_queue_size = 30
         self.training_queue_size = 10
-        self.sensor_height = 1.5
+        self.sensor_height = 1.0
+        self.min_sensor_dist = 0.00
         self.max_sensor_dist = 10.0
         
         # Semantics Settings (MaskCLIP)
@@ -105,6 +106,17 @@ class Config:
         self.mppi_min_v_mps = 0.0
         self.mppi_max_v_mps = 1.0
 
+        # MPPI exploration→exploitation schedule. progress=0 uses *_start,
+        # progress=1 uses *_end, linearly interpolated.
+        self.mppi_lambda_start = 4.0     # softmax temperature: high = flatter weights, wider sampling
+        self.mppi_lambda_end = 4.0
+        self.mppi_w_ig_start = 30.0      # information-gain reward: high = chase uncertainty
+        self.mppi_w_ig_end = 30.0
+        self.mppi_w_goal_start = 0.0     # goal-distance pull: low early = pure IG exploration
+        self.mppi_w_goal_end = 0.0       # bump end value to pull rollouts toward goal late
+        self.mppi_cov_scale_start = 4.0  # scalar on noise covariance: high = explore wider controls
+        self.mppi_cov_scale_end = 4.0
+
         # Visualization
         self.viz_interval = 2000
         
@@ -139,6 +151,8 @@ class Config:
                 self.data_queue_size = habitat['data_queue_size']
             if 'sensor_height' in habitat:
                 self.sensor_height = habitat['sensor_height']
+            if 'min_sensor_dist' in habitat:
+                self.min_sensor_dist = habitat['min_sensor_dist']
             if 'max_sensor_dist' in habitat:
                 self.max_sensor_dist = habitat['max_sensor_dist']
             if 'training_queue_size' in habitat:
@@ -283,3 +297,11 @@ class Config:
                 self.mppi_min_v_mps = planning['mppi_min_v_mps']
             if 'mppi_max_v_mps' in planning:
                 self.mppi_max_v_mps = planning['mppi_max_v_mps']
+            for key in (
+                'mppi_lambda_start', 'mppi_lambda_end',
+                'mppi_w_ig_start', 'mppi_w_ig_end',
+                'mppi_w_goal_start', 'mppi_w_goal_end',
+                'mppi_cov_scale_start', 'mppi_cov_scale_end',
+            ):
+                if key in planning:
+                    setattr(self, key, planning[key])

@@ -10,6 +10,7 @@ habitat:
   img_width: 512
   img_height: 512
   fov: 90
+  sensor_height: 1.0
   data_queue_size: 30
   training_queue_size: 20
 
@@ -21,7 +22,7 @@ semantics:
 
 # Training Settings
 training:
-  iterations: 30000
+  iterations: 60000
   device: "cuda"
   gpu_indices: "6"
   near_plane: 0.01
@@ -85,9 +86,9 @@ ensemble:
   num_models: 3
  
 grid:
-  voxel_resolution: 0.1
+  voxel_resolution: 0.10
   max_height: 2.0
 
 planning:
-  mppi_dt: 0.5
+  mppi_dt: 0.1
   mppi_w_sign: -1.0
