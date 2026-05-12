@@ -64,7 +64,7 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize DC-ObjectNav navigation history")
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--output", default="./figs/nav_history.mp4")
-    parser.add_argument("--fps", type=int, default=2)
+    parser.add_argument("--fps", type=int, default=5)
     args = parser.parse_args()
 
     cfg = Config(args.config)

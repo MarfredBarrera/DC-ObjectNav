@@ -89,6 +89,7 @@ class Config:
         self.hash_inference_batch_size = 16384
         self.hash_replay_buffer_size = 10
         self.hash_buffer_refresh_interval = 200
+        self.hash_per_frame_cache_size = 8192
         self.hash_train_every_n_steps = 1
         self.hash_warmup_steps = 0
 
@@ -118,7 +119,7 @@ class Config:
         self.mppi_cov_scale_end = 4.0
 
         # Visualization
-        self.viz_interval = 2000
+        self.viz_interval = 1000
         
         # Load from YAML if path provided
         if yaml_path is not None:
@@ -265,6 +266,8 @@ class Config:
                 self.hash_replay_buffer_size = hg['replay_buffer_size']
             if 'buffer_refresh_interval' in hg:
                 self.hash_buffer_refresh_interval = hg['buffer_refresh_interval']
+            if 'per_frame_cache_size' in hg:
+                self.hash_per_frame_cache_size = hg['per_frame_cache_size']
             if 'train_every_n_steps' in hg:
                 self.hash_train_every_n_steps = hg['train_every_n_steps']
             if 'warmup_steps' in hg:

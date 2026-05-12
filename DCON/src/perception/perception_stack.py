@@ -42,7 +42,16 @@ class PerceptionStack:
             cfg, ensemble=self.ensemble, semantics=self.mask_clip, scene_bounds=scene_bounds,
         )
 
-        self._replay_buffer = []  # list of (rgb, depth, c2w, intrinsics)
+        # Buffer stores already-unprojected, subsampled (pts, feats) tuples on
+        # CPU. Unprojection runs once per frame (at insert), not per refresh,
+        # which lets super-batches sample uniformly across history without
+        # paying the unprojection cost for every buffered frame on every refresh.
+        # Reservoir-sampled (Algorithm R), so old frames are retained with
+        # probability k/n_promoted instead of FIFO-evicted — keeps the buffer
+        # representative of the *entire* run history at bounded memory.
+        self._replay_buffer = []          # reservoir of (pts_cpu, feats_cpu)
+        self._latest_frame = None         # most-recent (pts_cpu, feats_cpu), held out
+        self._n_promoted = 0              # frames promoted from latest into reservoir
         self.target_query = cfg.target_query
         
     def extract_and_unproject(self, rgb, depth, c2w, intrinsics, depth_near=None, depth_far=None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -77,7 +86,33 @@ class PerceptionStack:
         return rgb.cpu(), depth.cpu(), c2w.cpu()
 
     def update_replay_buffer(self, rgb: torch.Tensor, depth: torch.Tensor, c2w: torch.Tensor, intrinsics: tuple) -> None:
-        self._replay_buffer.append((rgb, depth, c2w, intrinsics))
+        pts, feats = self.extract_and_unproject(rgb, depth, c2w, intrinsics)
+        cache_size = self.cfg.hash_per_frame_cache_size
+        if pts.shape[0] > cache_size:
+            idx = torch.randperm(pts.shape[0], device=pts.device)[:cache_size]
+            pts = pts[idx]
+            feats = feats[idx]
+        new_entry = (pts.cpu(), feats.cpu())
+
+        # The previous latest frame is now eligible for the reservoir; the
+        # newly arrived frame takes its place as latest.
+        if self._latest_frame is not None:
+            self._reservoir_insert(self._latest_frame)
+        self._latest_frame = new_entry
+
+    def _reservoir_insert(self, entry) -> None:
+        """Algorithm R: keep `entry` with probability k/n where n = total
+        frames promoted so far. Result: at any time, the reservoir is a
+        uniform random sample of all promoted frames. Frames from early in
+        the run keep a non-zero chance of surviving indefinitely."""
+        k = self.cfg.hash_replay_buffer_size
+        self._n_promoted += 1
+        if len(self._replay_buffer) < k:
+            self._replay_buffer.append(entry)
+            return
+        if torch.rand(1).item() < k / self._n_promoted:
+            slot = int(torch.randint(0, k, (1,)).item())
+            self._replay_buffer[slot] = entry
 
     def update_occupancy(self, depth: torch.Tensor, c2w: torch.Tensor, intrinsics: tuple) -> None:
         self.occupancy_grid.update_from_observation(
@@ -88,8 +123,15 @@ class PerceptionStack:
         self,
         recent_sample_portion: float = 0.2,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Sample a GPU super-batch from the replay buffer. Returns (None, None) if empty."""
-        if not self._replay_buffer:
+        """Sample a GPU super-batch from the replay buffer. Returns (None, None) if empty.
+
+        Sampling is *point-wise* uniform across all frames in the history (not
+        frame-wise then point-wise), so consecutive super-batches don't change
+        in discrete chunks when the random frame subset shifts. The most-recent
+        frame is still oversampled by `recent_sample_portion` to keep fresh
+        observations weighted.
+        """
+        if self._latest_frame is None and not self._replay_buffer:
             print("Warning: replay buffer is empty — cannot build super-batch.")
             return None, None
 
@@ -98,31 +140,30 @@ class PerceptionStack:
         gpu_pts_chunks = []
         gpu_feat_chunks = []
 
-        recent_rgb, recent_depth, recent_c2w, recent_intrinsics = self._replay_buffer[-1]
-        recent_pts, recent_feats = self.extract_and_unproject(recent_rgb, recent_depth, recent_c2w, recent_intrinsics)
-        
-        n_recent = int(staging_size * recent_sample_portion)
-        if recent_pts.shape[0] > 0:
-            n = min(n_recent, recent_pts.shape[0])
-            idx = torch.randint(0, recent_pts.shape[0], (n,))
-            gpu_pts_chunks.append(recent_pts[idx])
-            gpu_feat_chunks.append(recent_feats[idx])
+        # Recent-frame oversample: pull n_recent points from the held-out
+        # latest frame. Cap at the cache size — sampling more than the pool
+        # size with replacement just duplicates points and blows GPU memory.
+        if self._latest_frame is not None:
+            recent_pts, recent_feats = self._latest_frame
+            n_recent = min(int(staging_size * recent_sample_portion), recent_pts.shape[0])
+            if n_recent > 0:
+                idx = torch.randperm(recent_pts.shape[0])[:n_recent]
+                gpu_pts_chunks.append(recent_pts[idx].to(self.device))
+                gpu_feat_chunks.append(recent_feats[idx].to(self.device))
+        else:
+            n_recent = 0
 
-        n_history = staging_size - n_recent
-        history = self._replay_buffer[:-1]
-        if history and n_history > 0:
-            num_history_to_sample = min(len(history), self.cfg.hash_replay_buffer_size) 
-            sampled_indices = torch.randperm(len(history))[:num_history_to_sample]
-            
-            per_frame = n_history // num_history_to_sample
-            for i in sampled_indices:
-                h_rgb, h_depth, h_c2w, h_intrinsics = history[i]
-                pts, feats = self.extract_and_unproject(h_rgb, h_depth, h_c2w, h_intrinsics)
-                if pts.shape[0] > 0:
-                    n = min(per_frame, pts.shape[0])
-                    idx = torch.randint(0, pts.shape[0], (n,))
-                    gpu_pts_chunks.append(pts[idx])
-                    gpu_feat_chunks.append(feats[idx])
+        # History: draw uniformly across the reservoir pool, capped at the
+        # pool size. Reservoir membership is a uniform random sample of all
+        # frames ever observed, so old frames are represented in expectation.
+        if self._replay_buffer:
+            hist_pts = torch.cat([p for p, _ in self._replay_buffer], dim=0)
+            hist_feats = torch.cat([f for _, f in self._replay_buffer], dim=0)
+            n_history = min(staging_size - n_recent, hist_pts.shape[0])
+            if n_history > 0:
+                idx = torch.randperm(hist_pts.shape[0])[:n_history]
+                gpu_pts_chunks.append(hist_pts[idx].to(self.device))
+                gpu_feat_chunks.append(hist_feats[idx].to(self.device))
 
         if not gpu_pts_chunks:
             return None, None
