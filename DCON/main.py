@@ -40,7 +40,7 @@ from src.planning.mppi import MPPIPlanner
 from src.planning.utils import normalize_sim
 
 
-REPLAN_INTERVAL = 200
+REPLAN_INTERVAL = 100
 SPIN_FRAMES = 36                       # 36 * 10° = full circle
 SPIN_OMEGA = np.deg2rad(10) / 0.1      # 10° per 0.1s sim step
 BOOTSTRAP_TRAIN_STEPS = 2000

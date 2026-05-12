@@ -8,6 +8,9 @@ class MPPIPlanner:
     def __init__(self, cfg, device="cuda"):
         self.cfg = cfg
         self.device = device
+        # Previous safe control sequence, used to warm-start the next call.
+        # None until the first successful optimize_trajectory.
+        self.last_U = None
 
     def get_highest_sim_goal(self, sim_map, obstacle_val=2, occ_map=None):
         """
@@ -178,10 +181,15 @@ class MPPIPlanner:
             theta_start = torch.tensor(float(np.arctan2(goal_z - start_z, goal_x - start_x)),
                                        device=self.device, dtype=torch.float32)
 
-        # Zero nominal each call — no warm-start. MPPI explores symmetrically
-        # from "stay still" and the softmax-weighted update concentrates U_nom
-        # on whatever rollouts actually score well within this single call.
+        # Warm-start: shift the previously committed control sequence left by
+        # one (drop the action already executed) and zero-pad the tail. On the
+        # first call (or after a manual reset), last_U is None and U_nom = 0.
         U_nom = torch.zeros((horizon, 2), device=self.device, dtype=torch.float32)
+        if self.last_U is not None:
+            last_U_t = torch.as_tensor(self.last_U, device=self.device, dtype=torch.float32)
+            shifted_len = min(last_U_t.shape[0] - 1, horizon)
+            if shifted_len > 0:
+                U_nom[:shifted_len] = last_U_t[1:1 + shifted_len]
         
         # Control noise covariance [v_noise, w_noise]
         # v noise scales with typical cell size (1.0), w noise allows sufficient turning.
@@ -195,6 +203,10 @@ class MPPIPlanner:
         for it in range(num_iters):
              # Sample control noise
              noise = torch.randn((num_samples, horizon, 2), device=self.device) @ cov_matrix # [K, H, 2]
+             # Pin sample 0 to zero noise so the unmutated warm-start is always
+             # evaluated as-is — protects against the case where every noisy
+             # variant happens to be worse than the carried-over plan.
+             noise[0] = 0.0
              U_samples = U_nom.unsqueeze(0) + noise
 
              # Clamp linear / angular velocity bounds
@@ -324,6 +336,41 @@ class MPPIPlanner:
              
              # Update nominal controls
              U_nom = U_nom + torch.sum(weights.view(-1, 1, 1) * noise, dim=0)
+
+        # Final fallback: no safe rollout was ever found across all iters.
+        # Rather than returning None and forcing the caller to idle, reconstruct
+        # a trajectory from the shifted previous plan and return that so the
+        # agent keeps moving along its last-known-safe controls.
+        if best_U is None and self.last_U is not None:
+            print("MPPI: No safe rollout found, falling back to shifted previous plan")
+            last_U_t = torch.as_tensor(self.last_U, device=self.device, dtype=torch.float32)
+            U_fallback = torch.zeros((horizon, 2), device=self.device, dtype=torch.float32)
+            shifted_len = min(last_U_t.shape[0] - 1, horizon)
+            if shifted_len > 0:
+                U_fallback[:shifted_len] = last_U_t[1:1 + shifted_len]
+            U_fallback[:, 0] = torch.clamp(U_fallback[:, 0], min=min_v_cells, max=max_v_cells)
+            U_fallback[:, 1] = torch.clamp(U_fallback[:, 1], min=-max_w_rad, max=max_w_rad)
+
+            Theta_fb = torch.zeros(horizon, device=self.device)
+            Theta_fb[0] = theta_start
+            Theta_fb[1:] = theta_start + torch.cumsum(U_fallback[:-1, 1], dim=0)
+            Z_fb = torch.zeros(horizon, device=self.device)
+            X_fb = torch.zeros(horizon, device=self.device)
+            Z_fb[0] = start_z
+            X_fb[0] = start_x
+            Z_fb[1:] = start_z + torch.cumsum(U_fallback[:-1, 0] * torch.sin(Theta_fb[1:]), dim=0)
+            X_fb[1:] = start_x + torch.cumsum(U_fallback[:-1, 0] * torch.cos(Theta_fb[1:]), dim=0)
+            Z_fb_idx = torch.clamp(Z_fb.round().long(), 0, Z_dim - 1)
+            X_fb_idx = torch.clamp(X_fb.round().long(), 0, X_dim - 1)
+
+            best_U = U_fallback.detach().cpu().numpy()
+            best_traj = [(int(Z_fb_idx[t]), int(X_fb_idx[t])) for t in range(horizon)]
+            # Don't update self.last_U here — the fallback isn't certified safe.
+
+        # Save the committed plan for next call's warm-start, but only when MPPI
+        # actually found a safe rollout this call (not the fallback path).
+        if best_U is not None and best_score > -float('inf'):
+            self.last_U = best_U.copy()
 
         best_mask_np = best_mask.cpu().numpy() if best_mask is not None else None
         return best_traj, best_U, best_mask_np
