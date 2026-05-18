@@ -106,6 +106,7 @@ def main():
     
     # Calculate average MPPI cost
     costs = [e['mppi_cost'] for e in traj_log if 'mppi_cost' in e and e['mppi_cost'] is not None]
+    costs = [c for c in costs if np.isfinite(c)]
     avg_cost = np.mean(costs) if costs else 0.0
     print(f"Average achieved MPPI cost: {avg_cost:.2f}")
 
@@ -159,7 +160,7 @@ def main():
         # For now, let's just pass the dict. Visualizer handles it.
         
         # Get cost for this specific step from traj_log
-        current_cost = next((e['mppi_cost'] for e in trail_entries[::-1] if 'mppi_cost' in e and e['mppi_cost'] is not None), 0.0)
+        current_cost = next((e['mppi_cost'] for e in trail_entries[::-1] if 'mppi_cost' in e and e['mppi_cost'] is not None and np.isfinite(e['mppi_cost'])), 0.0)
 
         fig = viz.render_combined_grid(
             maps_dict, extent,

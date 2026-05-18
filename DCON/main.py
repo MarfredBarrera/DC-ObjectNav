@@ -269,10 +269,10 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
             gc.collect()
             torch.cuda.empty_cache()
             print(f"step {step}: refresh+maps {time.time()-t_refresh:.2f}s | "
-                  f"buffer {perception.buffer_size}/{cfg.hash_replay_buffer_size}")
+                  f"history {perception.buffer_size}/{perception.buffer_capacity} pts")
 
-        if step % 100 == 0:
-            print(f"  step {step:05d} | loss {loss:.5f} | t {time.time()-start_time:.1f}s")
+        # if step % 100 == 0:
+        #     print(f"  step {step:05d} | loss {loss:.5f} | t {time.time()-start_time:.1f}s")
 
     perception.save_models()
     sim.close()

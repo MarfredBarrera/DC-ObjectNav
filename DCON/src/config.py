@@ -87,9 +87,12 @@ class Config:
         self.hash_per_image_batch_size = 4096
         self.hash_train_batch_size = 8192
         self.hash_inference_batch_size = 16384
-        self.hash_replay_buffer_size = 10
+        self.hash_replay_buffer_size = 10  # legacy: still used by offline.py's own buffer
         self.hash_buffer_refresh_interval = 200
         self.hash_per_frame_cache_size = 8192
+        # Flat history buffer: bounded ring of (pt, feat) rows. Memory cost is
+        # capacity * (3 + hash_feature_dim) * 4 bytes (~412MB at 200k & 512-dim).
+        self.history_buffer_capacity = 200_000
         self.hash_train_every_n_steps = 1
         self.hash_warmup_steps = 0
 
@@ -129,7 +132,7 @@ class Config:
         # zero-padded and explore widely.
         self.mppi_num_iters = 5
         self.mppi_anneal_beta_traj = 1.0
-        self.mppi_anneal_beta_action = 1.0
+        self.mppi_anneal_beta_action = 5.0
 
         # Visualization
         self.viz_interval = 1000
@@ -281,6 +284,8 @@ class Config:
                 self.hash_buffer_refresh_interval = hg['buffer_refresh_interval']
             if 'per_frame_cache_size' in hg:
                 self.hash_per_frame_cache_size = hg['per_frame_cache_size']
+            if 'history_buffer_capacity' in hg:
+                self.history_buffer_capacity = hg['history_buffer_capacity']
             if 'train_every_n_steps' in hg:
                 self.hash_train_every_n_steps = hg['train_every_n_steps']
             if 'warmup_steps' in hg:

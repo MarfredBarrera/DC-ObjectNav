@@ -13,12 +13,55 @@ from src.perception.grid import UncertaintyGrid, OccupancyGrid, SimilarityGrid
 from src.perception.utils import unprojection
 
 
+class _HistoryBuffer:
+    """Flat history of observed points with bounded memory.
+
+    Phase 1 (buffer not full): append in arrival order.
+    Phase 2 (buffer full): every new point enters and overwrites a uniformly
+    random existing slot. New data always wins; old data is continuously
+    displaced. Sampling is one randint + one gather — no concat, no per-cell
+    loop, no Algorithm R.
+    """
+
+    def __init__(self, capacity: int, feat_dim: int):
+        self.cap = int(capacity)
+        self.pts   = torch.empty((self.cap, 3),        dtype=torch.float32)
+        self.feats = torch.empty((self.cap, feat_dim), dtype=torch.float32)
+        self.fill = 0
+
+    def insert(self, pts: torch.Tensor, feats: torch.Tensor) -> None:
+        if pts.numel() == 0:
+            return
+        m = pts.shape[0]
+        # Phase 1: fill empty slots.
+        free = self.cap - self.fill
+        take = min(free, m)
+        if take > 0:
+            s = self.fill
+            self.pts[s:s + take]   = pts[:take]
+            self.feats[s:s + take] = feats[:take]
+            self.fill += take
+        # Phase 2: random eviction for the rest, fully vectorized.
+        rest = m - take
+        if rest > 0:
+            slots = torch.randint(0, self.cap, (rest,))
+            self.pts[slots]   = pts[take:]
+            self.feats[slots] = feats[take:]
+
+    def sample(self, n: int):
+        if self.fill == 0:
+            return None, None
+        n = min(n, self.fill)
+        idx = torch.randint(0, self.fill, (n,))
+        return self.pts[idx], self.feats[idx]
+
+
 class PerceptionStack:
     """Perception pipeline: feature fields, uncertainty, occupancy, and similarity grids.
 
     Key methods and their intended cadence:
         observe()             — pull one RGB-D frame, extract world-space points + CLIP features
-        update_replay_buffer()— add observation to CPU replay buffer (evicts oldest if full)
+        update_replay_buffer()— insert observation points into the flat history buffer
         update_occupancy()    — update occupancy grid from depth + pose
         make_super_batch()    — stage a random sample from the buffer onto GPU
         train_step()          — one gradient step over the ensemble  [HIGH FREQUENCY]
@@ -42,16 +85,15 @@ class PerceptionStack:
             cfg, ensemble=self.ensemble, semantics=self.mask_clip, scene_bounds=scene_bounds,
         )
 
-        # Buffer stores already-unprojected, subsampled (pts, feats) tuples on
-        # CPU. Unprojection runs once per frame (at insert), not per refresh,
-        # which lets super-batches sample uniformly across history without
-        # paying the unprojection cost for every buffered frame on every refresh.
-        # Reservoir-sampled (Algorithm R), so old frames are retained with
-        # probability k/n_promoted instead of FIFO-evicted — keeps the buffer
-        # representative of the *entire* run history at bounded memory.
-        self._replay_buffer = []          # reservoir of (pts_cpu, feats_cpu)
+        # Flat history buffer: bounded-memory ring over all observed points
+        # (minus the held-out latest frame). New points always enter and
+        # displace a uniformly random existing slot once full, so recent data
+        # is never silently dropped. Sampling is one randint + gather.
+        self._history_buffer = _HistoryBuffer(
+            capacity=cfg.history_buffer_capacity,
+            feat_dim=cfg.hash_feature_dim,
+        )
         self._latest_frame = None         # most-recent (pts_cpu, feats_cpu), held out
-        self._n_promoted = 0              # frames promoted from latest into reservoir
         self.target_query = cfg.target_query
         
     def extract_and_unproject(self, rgb, depth, c2w, intrinsics, depth_near=None, depth_far=None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -94,25 +136,13 @@ class PerceptionStack:
             feats = feats[idx]
         new_entry = (pts.cpu(), feats.cpu())
 
-        # The previous latest frame is now eligible for the reservoir; the
-        # newly arrived frame takes its place as latest.
+        # Previous latest frame is folded into the history buffer; the newly
+        # arrived frame takes its place as the held-out latest for the
+        # recent-oversample.
         if self._latest_frame is not None:
-            self._reservoir_insert(self._latest_frame)
+            prev_pts, prev_feats = self._latest_frame
+            self._history_buffer.insert(prev_pts, prev_feats)
         self._latest_frame = new_entry
-
-    def _reservoir_insert(self, entry) -> None:
-        """Algorithm R: keep `entry` with probability k/n where n = total
-        frames promoted so far. Result: at any time, the reservoir is a
-        uniform random sample of all promoted frames. Frames from early in
-        the run keep a non-zero chance of surviving indefinitely."""
-        k = self.cfg.hash_replay_buffer_size
-        self._n_promoted += 1
-        if len(self._replay_buffer) < k:
-            self._replay_buffer.append(entry)
-            return
-        if torch.rand(1).item() < k / self._n_promoted:
-            slot = int(torch.randint(0, k, (1,)).item())
-            self._replay_buffer[slot] = entry
 
     def update_occupancy(self, depth: torch.Tensor, c2w: torch.Tensor, intrinsics: tuple) -> None:
         self.occupancy_grid.update_from_observation(
@@ -131,7 +161,7 @@ class PerceptionStack:
         frame is still oversampled by `recent_sample_portion` to keep fresh
         observations weighted.
         """
-        if self._latest_frame is None and not self._replay_buffer:
+        if self._latest_frame is None and self._history_buffer.fill == 0:
             print("Warning: replay buffer is empty — cannot build super-batch.")
             return None, None
 
@@ -153,17 +183,13 @@ class PerceptionStack:
         else:
             n_recent = 0
 
-        # History: draw uniformly across the reservoir pool, capped at the
-        # pool size. Reservoir membership is a uniform random sample of all
-        # frames ever observed, so old frames are represented in expectation.
-        if self._replay_buffer:
-            hist_pts = torch.cat([p for p, _ in self._replay_buffer], dim=0)
-            hist_feats = torch.cat([f for _, f in self._replay_buffer], dim=0)
-            n_history = min(staging_size - n_recent, hist_pts.shape[0])
-            if n_history > 0:
-                idx = torch.randperm(hist_pts.shape[0])[:n_history]
-                gpu_pts_chunks.append(hist_pts[idx].to(self.device))
-                gpu_feat_chunks.append(hist_feats[idx].to(self.device))
+        # History: one uniform draw over the flat buffer's current contents.
+        n_history = staging_size - n_recent
+        if n_history > 0:
+            hist_pts, hist_feats = self._history_buffer.sample(n_history)
+            if hist_pts is not None:
+                gpu_pts_chunks.append(hist_pts.to(self.device))
+                gpu_feat_chunks.append(hist_feats.to(self.device))
 
         if not gpu_pts_chunks:
             return None, None
@@ -320,4 +346,8 @@ class PerceptionStack:
 
     @property
     def buffer_size(self) -> int:
-        return len(self._replay_buffer)
+        return self._history_buffer.fill
+
+    @property
+    def buffer_capacity(self) -> int:
+        return self._history_buffer.cap

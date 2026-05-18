@@ -22,7 +22,7 @@ semantics:
 
 # Training Settings
 training:
-  iterations: 100000
+  iterations: 50000
   device: "cuda"
   gpu_indices: "6"
   near_plane: 0.01

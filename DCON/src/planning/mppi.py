@@ -197,14 +197,14 @@ class MPPIPlanner:
         # cov_scale (schedule-controlled) widens or tightens the sampling envelope.
         cov_matrix = float(cov_scale) * torch.tensor([[0.5, 0.0], [0.0, np.pi/4]], device=self.device)
 
-        # DIAL-MPC action-level annealing: noise variance grows with horizon
-        # index, so early steps (which we'll actually commit to) stay near the
-        # warm-started controls while tail steps explore widely. Precomputed
-        # once: shape [H], values in (0, 1], h=H-1 is full noise.
-        beta_action = float(getattr(self.cfg, "mppi_anneal_beta_action", 1.0))
-        beta_traj   = float(getattr(self.cfg, "mppi_anneal_beta_traj", 1.0))
-        h_idx = torch.arange(horizon, device=self.device, dtype=torch.float32)
-        action_scale = torch.exp(-(horizon - 1 - h_idx) / (beta_action * horizon))  # [H]
+        # # DIAL-MPC action-level annealing: noise variance grows with horizon
+        # # index, so early steps (which we'll actually commit to) stay near the
+        # # warm-started controls while tail steps explore widely. Precomputed
+        # # once: shape [H], values in (0, 1], h=H-1 is full noise.
+        # beta_action = self.cfg.mppi_anneal_beta_action
+        # beta_traj   = self.cfg.mppi_anneal_beta_traj
+        # h_idx = torch.arange(horizon, device=self.device, dtype=torch.float32)
+        # action_scale = torch.exp(-(horizon - 1 - h_idx) / (beta_action * horizon))  # [H]
 
         best_traj = [(int(start_z), int(start_x))]
         best_U = None
@@ -213,13 +213,15 @@ class MPPIPlanner:
         for it in range(num_iters):
              # Sample control noise
              noise = torch.randn((num_samples, horizon, 2), device=self.device) @ cov_matrix # [K, H, 2]
-             # DIAL-MPC trajectory-level annealing: iter 0 = full noise (wide
-             # exploration), iter N-1 = shrunken noise (local refinement).
-             # Combined with action-level scaling so iter N-1 + h=0 is the
-             # most concentrated sample (refining the immediately-committed
-             # action), iter 0 + h=H-1 is the widest (rough global coverage).
-             traj_scale = float(np.exp(-it / (beta_traj * max(num_iters, 1))))
-             noise = noise * (traj_scale * action_scale).view(1, horizon, 1)
+            #  # DIAL-MPC trajectory-level annealing: iter 0 = full noise (wide
+            #  # exploration), iter N-1 = shrunken noise (local refinement).
+            #  # Combined with action-level scaling so iter N-1 + h=0 is the
+            #  # most concentrated sample (refining the immediately-committed
+            #  # action), iter 0 + h=H-1 is the widest (rough global coverage).
+            #  traj_scale = float(np.exp(-it / (beta_traj * max(num_iters, 1))))
+
+            #  traj_scale = 1.0
+            #  noise = noise * (traj_scale * action_scale).view(1, horizon, 1)
              # Pin sample 0 to zero noise so the unmutated warm-start is always
              # evaluated as-is — protects against the case where every noisy
              # variant happens to be worse than the carried-over plan.
@@ -287,17 +289,17 @@ class MPPIPlanner:
              occ_vals[at_start] = 1 # Treated as free
              
              collision_cost = torch.sum((occ_vals >= 2).float(), dim=1)
-             # Unseen-traversal cost: cells with value 0 are not verified free.
-             # Penalizing these prevents rollouts from slipping through unseen-cell
-             # gaps in partially-observed walls. Exploration still works because
-             # IG is earned from observing unseen cells via raycasts launched from
-             # seen-free positions — the trajectory itself must stay in seen-free.
-             unseen_cost = torch.sum((occ_vals == 0).float(), dim=1)
+            #  # Unseen-traversal cost: cells with value 0 are not verified free.
+            #  # Penalizing these prevents rollouts from slipping through unseen-cell
+            #  # gaps in partially-observed walls. Exploration still works because
+            #  # IG is earned from observing unseen cells via raycasts launched from
+            #  # seen-free positions — the trajectory itself must stay in seen-free.
+            #  unseen_cost = torch.sum((occ_vals == 0).float(), dim=1)
 
-             # Penalties: obstacle is catastrophic, unseen is strong but smaller
-             # so "skim a frontier cell" remains strictly preferred to "crash".
-             scores -= w_occ * collision_cost
-             scores -= w_unseen * unseen_cost
+            #  # Penalties: obstacle is catastrophic, unseen is strong but smaller
+            #  # so "skim a frontier cell" remains strictly preferred to "crash".
+            #  scores -= w_occ * collision_cost
+            #  scores -= w_unseen * unseen_cost
 
              # Cost 3: Information Gain (Vectorized)
              # Only reward IG for collision-free rollouts (the FOV raycast
@@ -390,4 +392,5 @@ class MPPIPlanner:
             self.last_U = best_U.copy()
 
         best_mask_np = best_mask.cpu().numpy() if best_mask is not None else None
-        return best_traj, best_U, best_mask_np, best_score
+        final_score = best_score if best_score > -float('inf') else None
+        return best_traj, best_U, best_mask_np, final_score

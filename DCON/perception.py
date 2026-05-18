@@ -87,7 +87,7 @@ def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True,
                 print(f"Step {step}: observe time {time.time() - t0:.3f}s")
                 perception.update_replay_buffer(rgb, depth, c2w, sim_iface.intrinsics)
                 perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
-                print(f"Step {step}: buffer {perception.buffer_size}/{cfg.hash_replay_buffer_size}, "
+                print(f"Step {step}: history {perception.buffer_size}/{perception.buffer_capacity} pts, "
                       f"frames {sim_iface.frames_processed}")
                 gc.collect()
                 torch.cuda.empty_cache()
