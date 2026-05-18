@@ -22,7 +22,7 @@ class ObjectDetector:
     def __init__(
         self,
         device: str = "cuda",
-        model_name: str = "yolov8s-worldv2.pt",
+        model_name: str = "yolo/yolov8s-worldv2.pt",
         threshold: float = 0.1,
         imgsz: int = 640,
         half: bool = True,

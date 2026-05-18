@@ -51,26 +51,41 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 ENV TCNN_CUDA_ARCHITECTURES="89"
 RUN pip install --no-build-isolation git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
 
-# 4. Habitat-Sim (headless)
-RUN git clone --branch stable https://github.com/facebookresearch/habitat-sim.git /workspace/habitat-sim && \
+
+# # RUN pip install "numpy<2.0" "quaternion" "numpy-quaternion"
+# # 4. Habitat-Sim (headless)
+# RUN git clone --branch stable https://github.com/facebookresearch/habitat-sim.git /workspace/habitat-sim && \
+#     cd /workspace/habitat-sim && \
+#     pip install -r requirements.txt && \
+#     python setup.py install --headless --bullet
+
+# 4. Habitat-Sim (v0.3.1 - Compatible with Python 3.9)
+RUN git clone --branch v0.3.1 https://github.com/facebookresearch/habitat-sim.git /workspace/habitat-sim && \
     cd /workspace/habitat-sim && \
     pip install -r requirements.txt && \
     python setup.py install --headless --bullet
+
 
 # 5. Habitat-Lab
 RUN git clone --branch stable https://github.com/facebookresearch/habitat-lab.git /workspace/habitat-lab && \
     pip install -e /workspace/habitat-lab/habitat-lab && \
     pip install -e /workspace/habitat-lab/habitat-baselines
 
-# 6. Nerfstudio & Fixes
-RUN pip install nerfstudio && \
-    pip uninstall -y opencv-python-headless opencv-python && \
-    pip install opencv-python nerfview transformers ftfy regex
+# # 6. Nerfstudio & Fixes
+# RUN pip install nerfstudio && \
+#     pip uninstall -y opencv-python-headless opencv-python && \
+#     pip install opencv-python nerfview transformers ftfy regex
+
+# 6. Opencv
+RUN pip install opencv-python nerfview transformers ftfy regex
+
+# 7. YOLO
+RUN pip install ultralytics
 
 RUN pip install "numpy<2.0"
 
-#7. Segment Anything    
-RUN pip install git+https://github.com/facebookresearch/segment-anything.git
+# #7. Segment Anything    
+# RUN pip install git+https://github.com/facebookresearch/segment-anything.git
 
 WORKDIR /workspace
 

@@ -35,7 +35,6 @@ from src.habitat.habitat_utils import (
 )
 from src.habitat.sim_interface import SimInterface
 from src.perception.perception_stack import PerceptionStack
-from src.planning.astar import AStarPlanner
 from src.planning.mppi import MPPIPlanner
 from src.planning.utils import normalize_sim
 
@@ -70,7 +69,7 @@ def _to_numpy(maybe_tensor):
     return maybe_tensor
 
 
-def plan_one_action(perception, sim_iface, astar, mppi, cfg, action_queue: deque, k_max: int = 5, progress: float = 0.0):
+def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max: int = 5, progress: float = 0.0):
     """Run MPPI from current pose and return (action, ref_traj, opt_traj).
 
     action is [v_mps, w_rad_per_s] or None if idling.
@@ -145,7 +144,6 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
     perception = PerceptionStack(cfg, scene_bounds)
     perception.target_query = cfg.target_query
 
-    astar = AStarPlanner(cfg, device=cfg.device)
     mppi = MPPIPlanner(cfg, device=cfg.device)
     action_queue: deque = deque()
 
@@ -221,7 +219,7 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
             heading = get_agent_heading(sim_iface.agent)
             progress = step / max(1, cfg.iterations)
             action, ref_traj, opt_traj, score = plan_one_action(
-                perception, sim_iface, astar, mppi, cfg, action_queue, progress=progress
+                perception, sim_iface, mppi, cfg, action_queue, progress=progress
             )
             if action is not None:
                 sim_iface.step(action, dt=cfg.mppi_dt)

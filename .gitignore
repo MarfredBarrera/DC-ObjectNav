@@ -9,4 +9,4 @@ habitat-lab/
 # Ignore output directories
 output/
 outputs/
-SAM_models/
+yolo/
