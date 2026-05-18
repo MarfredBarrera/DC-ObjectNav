@@ -1,32 +1,43 @@
-"""OWLv2-based open-vocabulary object detector.
+"""YOLO-World open-vocabulary object detector.
 
 Given an RGB frame and a free-form text query, returns the highest-confidence
 detection's score and bounding box. Used to gate exploration→approach behavior
-on visible-target confidence.
+on visible-target confidence. Swapped from OWLv2 for ~20× lower inference time
+at the cost of some accuracy on unusual queries.
 """
 
 from typing import Optional, Tuple, Union
 import time
+
 import numpy as np
 import torch
 from PIL import Image
 
-from transformers import Owlv2ForObjectDetection, Owlv2Processor
+from ultralytics import YOLO
 
 
 class ObjectDetector:
-    """Wraps OWLv2 for single-image, single-query open-vocabulary detection."""
+    """Open-vocabulary detector using YOLO-World (via Ultralytics)."""
 
     def __init__(
         self,
         device: str = "cuda",
-        model_name: str = "google/owlv2-base-patch16",
+        model_name: str = "yolov8s-worldv2.pt",
         threshold: float = 0.1,
+        imgsz: int = 640,
+        half: bool = True,
     ):
         self.device = device
         self.threshold = float(threshold)
-        self.processor = Owlv2Processor.from_pretrained(model_name, use_fast=True)
-        self.model = Owlv2ForObjectDetection.from_pretrained(model_name).to(device).eval()
+        self.imgsz = int(imgsz)
+        # fp16 only on CUDA; Ultralytics silently no-ops it on CPU.
+        self.half = bool(half) and "cuda" in str(device)
+        self.model = YOLO(model_name)
+        self.model.to(device)
+        # set_classes() re-embeds the query through CLIP, which is non-trivial.
+        # Cache the current query so back-to-back calls with the same text
+        # skip the embedding step.
+        self._current_query: Optional[str] = None
 
     @torch.no_grad()
     def detect(
@@ -46,59 +57,63 @@ class ObjectDetector:
             (xmin, ymin, xmax, ymax) in pixel coordinates of the input image.
             If no detection clears `self.threshold`, returns (0.0, None).
         """
-        pil = self._to_pil(image)
-        text_labels = [[query]]
+        if query != self._current_query:
+            self.model.set_classes([query])
+            self._current_query = query
 
-        inputs = self.processor(text=text_labels, images=pil, return_tensors="pt").to(self.device)
-        with torch.autocast("cuda", dtype=torch.float16):
-            outputs = self.model(**inputs)
+        arr = self._to_uint8(image)
 
-        target_sizes = torch.tensor([(pil.height, pil.width)], device=self.device)
-        results = self.processor.post_process_grounded_object_detection(
-            outputs=outputs,
-            target_sizes=target_sizes,
-            threshold=self.threshold,
-            text_labels=text_labels,
-        )[0]
-
-        scores = results["scores"]
-        boxes = results["boxes"]
-        if scores.numel() == 0:
+        results = self.model.predict(
+            arr,
+            imgsz=self.imgsz,
+            half=self.half,
+            conf=self.threshold,
+            verbose=False,
+            device=self.device,
+        )
+        r = results[0]
+        if r.boxes is None or len(r.boxes) == 0:
             return 0.0, None
 
-        best = int(torch.argmax(scores))
-        score = float(scores[best])
-        box = tuple(float(v) for v in boxes[best].tolist())
+        confs = r.boxes.conf
+        best = int(torch.argmax(confs))
+        score = float(confs[best])
+        xyxy = r.boxes.xyxy[best].tolist()
+        box = (float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]))
         return score, box
 
     @staticmethod
-    def _to_pil(image: Union[torch.Tensor, np.ndarray, Image.Image]) -> Image.Image:
+    def _to_uint8(image: Union[torch.Tensor, np.ndarray, Image.Image]) -> np.ndarray:
         if isinstance(image, Image.Image):
-            return image
+            return np.asarray(image.convert("RGB"))
         if isinstance(image, torch.Tensor):
             arr = image.detach().cpu().numpy()
         else:
             arr = np.asarray(image)
-        # Float arrays are expected in [0, 1]; uint8 in [0, 255].
+        # Float arrays expected in [0, 1]; uint8 in [0, 255].
         if arr.dtype != np.uint8:
             if float(arr.max()) <= 1.0 + 1e-3:
                 arr = arr * 255.0
             arr = np.clip(arr, 0, 255).astype(np.uint8)
         if arr.ndim != 3 or arr.shape[2] != 3:
             raise ValueError(f"Expected (H, W, 3) RGB image, got shape {arr.shape}")
-        return Image.fromarray(arr)
+        return arr
 
 
 if __name__ == "__main__":
-    # Smoke test against the canonical COCO val image.
     detector = ObjectDetector(device="cuda" if torch.cuda.is_available() else "cpu")
-    image_path = "./output/current_scene/rgbs/rgb_14000.png"
+    image_path = "./output/current_scene/rgbs/rgb_18000.png"
     image = Image.open(image_path)
-    N = 5
+
+    # Warm up: first call pays for kernel compile + CLIP text embed.
+    detector.detect(image, "a photo of a bed")
+
+    N = 10
     t0 = time.time()
     for _ in range(N):
         score, box = detector.detect(image, "a photo of a bed")
-    print(f"per-call: {(time.time() - t0) / N * 1000:.1f} ms")
+    print(f"per-call (warmed): {(time.time() - t0) / N * 1000:.1f} ms")
+
     if box is None:
         print("No detection.")
     else:

@@ -197,14 +197,14 @@ class MPPIPlanner:
         # cov_scale (schedule-controlled) widens or tightens the sampling envelope.
         cov_matrix = float(cov_scale) * torch.tensor([[0.5, 0.0], [0.0, np.pi/4]], device=self.device)
 
-        # # DIAL-MPC action-level annealing: noise variance grows with horizon
-        # # index, so early steps (which we'll actually commit to) stay near the
-        # # warm-started controls while tail steps explore widely. Precomputed
-        # # once: shape [H], values in (0, 1], h=H-1 is full noise.
-        # beta_action = self.cfg.mppi_anneal_beta_action
-        # beta_traj   = self.cfg.mppi_anneal_beta_traj
-        # h_idx = torch.arange(horizon, device=self.device, dtype=torch.float32)
-        # action_scale = torch.exp(-(horizon - 1 - h_idx) / (beta_action * horizon))  # [H]
+        # DIAL-MPC action-level annealing: noise variance grows with horizon
+        # index, so early steps (which we'll actually commit to) stay near the
+        # warm-started controls while tail steps explore widely. Precomputed
+        # once: shape [H], values in (0, 1], h=H-1 is full noise.
+        beta_action = self.cfg.mppi_anneal_beta_action
+        beta_traj   = self.cfg.mppi_anneal_beta_traj
+        h_idx = torch.arange(horizon, device=self.device, dtype=torch.float32)
+        action_scale = torch.exp(-(horizon - 1 - h_idx) / (beta_action * horizon))  # [H]
 
         best_traj = [(int(start_z), int(start_x))]
         best_U = None
@@ -220,8 +220,8 @@ class MPPIPlanner:
             #  # action), iter 0 + h=H-1 is the widest (rough global coverage).
             #  traj_scale = float(np.exp(-it / (beta_traj * max(num_iters, 1))))
 
-            #  traj_scale = 1.0
-            #  noise = noise * (traj_scale * action_scale).view(1, horizon, 1)
+             traj_scale = 1.0
+             noise = noise * (traj_scale * action_scale).view(1, horizon, 1)
              # Pin sample 0 to zero noise so the unmutated warm-start is always
              # evaluated as-is — protects against the case where every noisy
              # variant happens to be worse than the carried-over plan.

@@ -109,27 +109,7 @@ class SimilarityGrid(VoxelGrid):
         points, grid_shape = self.generate_sample_points()
         total_points = points.shape[0]
 
-        # Use occupancy masking if available
-        mask = None
-        if occupancy_grid is not None and occupancy_grid.voxels is not None:
-            x_idx = ((points[:, 0] - self.min_x) / self.resolution).astype(np.int64)
-            y_idx = ((points[:, 1] - self.min_y) / self.resolution).astype(np.int64)
-            z_idx = ((points[:, 2] - self.min_z) / self.resolution).astype(np.int64)
-            
-            x_idx = np.clip(x_idx, 0, self.num_x - 1)
-            y_idx = np.clip(y_idx, 0, self.num_y - 1)
-            z_idx = np.clip(z_idx, 0, self.num_z - 1)
-            
-            # Map indices to torch
-            x_indices = torch.from_numpy(x_idx).to(self.device)
-            y_indices = torch.from_numpy(y_idx).to(self.device)
-            z_indices = torch.from_numpy(z_idx).to(self.device)
-
-            # Occupied points only
-            mask = (occupancy_grid.voxels[y_indices, z_indices, x_indices] == occupancy_grid.occupied_val)
-            query_points = points[mask.cpu().numpy()]
-        else:
-            query_points = points
+        query_points = points
 
         if query_points.shape[0] == 0:
             self.voxels = torch.zeros(grid_shape, device=self.device)
@@ -158,14 +138,7 @@ class SimilarityGrid(VoxelGrid):
                 all_sims.append(sim)
         
         all_sims = torch.cat(all_sims, dim=0)
-        
-        full_sims = torch.zeros(total_points, device=self.device)
-        if mask is not None:
-            full_sims[mask] = all_sims
-        else:
-            full_sims = all_sims
-            
-        self.voxels = full_sims.reshape(grid_shape)
+        self.voxels = all_sims.reshape(grid_shape)
 
     def get_2d_map(self, min_y=0.0, max_y=1.5):
         if self.voxels is None: return None
