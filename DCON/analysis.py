@@ -798,5 +798,5 @@ if __name__ == "__main__":
     # visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)
     
     # Generate a single step snapshot (e.g. at step 10000)
-    # visualizer.generate_step_png(step=12000, save_path='./figs/snapshot_step_10000.png')
-    visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)
+    visualizer.generate_step_png(step=27000, save_path='./output/current_scene/snapshot_step_12000.png')
+    # visualizer.viz_all_maps_history(save_path='./figs/full_simulation_history.mp4', fps=2)

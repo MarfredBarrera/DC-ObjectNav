@@ -65,6 +65,7 @@ def main():
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--output", default="./figs/nav_history.mp4")
     parser.add_argument("--fps", type=int, default=5)
+    parser.add_argument("--snapshot_step", type=int, default=-1, help="If positive, generate a single PNG for this step instead of a video")
     args = parser.parse_args()
 
     cfg = Config(args.config)
@@ -97,6 +98,13 @@ def main():
     
     # Filter to only those that actually exist (optional but keeps it robust)
     map_steps = [s for s in map_steps if os.path.exists(os.path.join(output_dir, "umaps", f"bev_epistemic_uncertainty_{s}.npy"))]
+
+    if getattr(args, "snapshot_step", -1) >= 0:
+        if args.snapshot_step not in map_steps:
+            # Fallback just in case they request a step not in viz_interval
+            map_steps = [args.snapshot_step]
+        else:
+            map_steps = [args.snapshot_step]
 
     if not map_steps:
         print(f"ERROR: No saved BEV maps found in {output_dir} following viz_interval {cfg.viz_interval}. "
@@ -177,6 +185,17 @@ def main():
 
     if not frames:
         print("No frames rendered — nothing to save.")
+        return
+
+    if getattr(args, "snapshot_step", -1) >= 0:
+        # If output still has a video extension, swap it for .png so imageio.imwrite doesn't fail
+        out_path = args.output
+        ext = os.path.splitext(out_path)[1].lower()
+        if ext in ['.mp4', '.gif', '.avi', '.mov']:
+            out_path = os.path.splitext(out_path)[0] + f"_step{args.snapshot_step}.png"
+            
+        imageio.imwrite(out_path, frames[0])
+        print(f"\nSnapshot saved to: {out_path}")
         return
 
     ext = os.path.splitext(args.output)[1].lower()

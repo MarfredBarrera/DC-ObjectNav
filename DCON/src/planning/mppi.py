@@ -137,7 +137,7 @@ class MPPIPlanner:
             "cov_scale":     lerp(self.cfg.mppi_cov_scale_start, self.cfg.mppi_cov_scale_end),
         }
 
-    def optimize_trajectory(self, start, goal, epi_map, occ_map, num_samples=100, num_iters=None, horizon=100, lambda_weight=None, w_goal=None, w_ig=None, w_occ=1e6, w_unseen=0, intrinsics=None, sensor_height=1.5, initial_heading=None, progress=0.0, cov_scale=None):
+    def optimize_trajectory(self, start, goal, ig_map, occ_map, num_samples=100, num_iters=None, horizon=100, lambda_weight=None, w_goal=None, w_ig=None, w_occ=1e6, w_unseen=0, intrinsics=None, sensor_height=1.5, initial_heading=None, progress=0.0, cov_scale=None):
         """
         Optimize a trajectory from `start` to `goal` using MPPI unicycle
         sampling. No A* reference; nominal controls start at zero and MPPI
@@ -162,10 +162,10 @@ class MPPIPlanner:
         if cov_scale is None:     cov_scale = sched["cov_scale"]
         if num_iters is None:     num_iters = getattr(self.cfg, "mppi_num_iters", 5)
 
-        epi_torch = torch.from_numpy(epi_map).to(self.device).float()
+        ig_torch = torch.from_numpy(ig_map).to(self.device).float()
         occ_torch = torch.from_numpy(occ_map).to(self.device).long()
 
-        Z_dim, X_dim = epi_torch.shape
+        Z_dim, X_dim = ig_torch.shape
 
         start_z, start_x = float(start[0]), float(start[1])
         goal_z,  goal_x  = float(goal[0]),  float(goal[1])
@@ -310,7 +310,7 @@ class MPPIPlanner:
                      Z_idx[safe_mask],
                      X_idx[safe_mask],
                      Theta_samples[safe_mask],
-                     epi_torch,
+                     ig_torch,
                      occ_torch,
                      self.cfg,
                      self.device,
@@ -335,7 +335,7 @@ class MPPIPlanner:
                      best_score = masked_scores[iter_best_idx].item()
                      best_traj = [(int(Z_idx[iter_best_idx, t]), int(X_idx[iter_best_idx, t])) for t in range(horizon)]
                      best_U = U_samples[iter_best_idx].detach().cpu().numpy()  # [H, 2] (v_cells_per_step, w_rad_per_step)
-                     _, best_mask = compute_fov_ig(best_traj, epi_torch, occ_torch, self.cfg, self.device, gamma_ig=0.95, intrinsics=intrinsics, sensor_height=sensor_height)
+                     _, best_mask = compute_fov_ig(best_traj, ig_torch, occ_torch, self.cfg, self.device, gamma_ig=0.95, intrinsics=intrinsics, sensor_height=sensor_height)
 
                  # Softmax: safe rollouts only. Unsafe entries are -inf, so
                  # exp(...) = 0 and they contribute nothing to U_nom update.

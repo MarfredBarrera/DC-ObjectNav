@@ -291,10 +291,16 @@ class UncertaintyGrid(VoxelGrid):
     def get_2d_map(self, min_y=0.1, max_y=1.5, type='epistemic'):
         voxels = self.voxels_epi if type == 'epistemic' else self.voxels_ale
         if voxels is None: return None
-        # Adjust slicing if voxels is only a subset from forward_pass
-        # For simplicity, assume forward_pass was run on the full grid or the requested range.
-        # If voxels shape doesn't match full num_y, we just mean over what we have.
-        return voxels.mean(dim=0)
+        # Bottom-5% pool along Y: a column with any trained surface voxel
+        # snaps to that voxel's (low) uncertainty, while pure-air columns
+        # stay uniformly high. Decouples "covered vs uncovered" from
+        # "uncertain about scene contents." Mirrors the top-k pattern in
+        # SimilarityGrid.get_2d_map, inverted because lower epistemic = more
+        # confident.
+        num_y = voxels.shape[0]
+        k = max(1, int(0.15 * num_y))
+        bottom_vals, _ = torch.topk(voxels, k, dim=0, largest=False)
+        return bottom_vals.mean(dim=0)
 
     def save(self, step):
         epi_2d = self.get_2d_map(type='epistemic')

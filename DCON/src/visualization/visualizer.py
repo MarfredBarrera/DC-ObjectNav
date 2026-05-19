@@ -166,10 +166,10 @@ class Visualizer:
 
         gs = fig.add_gridspec(2, 3)
         
-        # We will use 5 axes
+        # We will use 6 axes
         ax_rgb = fig.add_subplot(gs[0, 0])
         ax_sim2d = fig.add_subplot(gs[0, 1])
-        # Skip gs[0, 2] -> Empty or for Title
+        ax_overlay = fig.add_subplot(gs[0, 2])
         ax_epi = fig.add_subplot(gs[1, 0])
         ax_occ = fig.add_subplot(gs[1, 1])
         ax_sim = fig.add_subplot(gs[1, 2])
@@ -252,7 +252,15 @@ class Visualizer:
             plt.colorbar(im5, ax=ax_sim, fraction=0.046, pad=0.02, shrink=0.7)
             _overlays(ax_sim)
 
-        for ax in [ax_epi, ax_occ, ax_sim]:
+        # 5. Overlay Uncertainty over Occupancy
+        if epi is not None and occ is not None:
+            ax_overlay.imshow(occ, cmap=self.occ_cmap, origin='lower', extent=extent, vmin=0, vmax=2)
+            im_overlay = ax_overlay.imshow(epi, cmap=self.unc_cmap, origin='lower', extent=extent, vmin=0, vmax=self.cfg.vmax_epi, alpha=0.6)
+            ax_overlay.set_title("Uncertainty + Occupancy")
+            plt.colorbar(im_overlay, ax=ax_overlay, fraction=0.046, pad=0.02, shrink=0.7)
+            _overlays(ax_overlay)
+
+        for ax in [ax_epi, ax_occ, ax_sim, ax_overlay]:
             ax.set_xlabel('X (m)')
             ax.set_ylabel('Z (m)')
             ax.grid(True, alpha=0.3, linestyle='--')
