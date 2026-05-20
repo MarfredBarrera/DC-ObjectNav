@@ -117,9 +117,9 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
         # options. Rotating doesn't translate the agent, so it's always safe
         # in a free start cell, and the heading change usually reveals new
         # geometry that makes the next replan more likely to find a safe plan.
-        print("  plan: MPPI returned no safe control sequence; spinning in place")
+        print("  plan: MPPI returned no safe control sequence, replanning")
         action_queue.clear()
-        return [0.0, cfg.mppi_w_sign * cfg.mppi_max_w_rps], None, None, None
+        return [0.0, 0.0], None, None, None
 
     # Successful plan: replace queue with full MPPI control sequence.
     # MPPI U units: v in [grid cells / mppi_step], w in [rad / mppi_step].

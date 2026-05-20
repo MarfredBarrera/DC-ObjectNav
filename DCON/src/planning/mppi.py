@@ -11,6 +11,13 @@ class MPPIPlanner:
         # Previous safe control sequence, used to warm-start the next call.
         # None until the first successful optimize_trajectory.
         self.last_U = None
+        # Adaptive horizon: shrinks on consecutive "no safe rollout" failures
+        # so a stuck agent can find a shorter feasible plan, then snaps back
+        # to the default horizon on the first successful plan.
+        self.default_horizon = getattr(cfg, "mppi_horizon", 150)
+        self.horizon_shrink_step = getattr(cfg, "mppi_horizon_shrink_step", 20)
+        self.min_horizon = getattr(cfg, "mppi_min_horizon", 10)
+        self.current_horizon = self.default_horizon
 
     def get_highest_sim_goal(self, sim_map, obstacle_val=2, occ_map=None):
         """
@@ -137,7 +144,11 @@ class MPPIPlanner:
             "cov_scale":     lerp(self.cfg.mppi_cov_scale_start, self.cfg.mppi_cov_scale_end),
         }
 
-    def optimize_trajectory(self, start, goal, ig_map, occ_map, num_samples=100, num_iters=None, horizon=100, lambda_weight=None, w_goal=None, w_ig=None, w_occ=1e6, w_unseen=0, intrinsics=None, sensor_height=1.5, initial_heading=None, progress=0.0, cov_scale=None):
+    def optimize_trajectory(self, start, goal, ig_map, occ_map,
+    num_samples=300, num_iters=None, horizon=None,
+    lambda_weight=None, w_goal=None, w_ig=None, w_occ=1e6, w_unseen=0,
+    intrinsics=None, sensor_height=1.5, initial_heading=None,
+    progress=0.0, cov_scale=None, ig_source="epistemic"):
         """
         Optimize a trajectory from `start` to `goal` using MPPI unicycle
         sampling. No A* reference; nominal controls start at zero and MPPI
@@ -161,9 +172,21 @@ class MPPIPlanner:
         if w_goal is None:        w_goal = sched["w_goal"]
         if cov_scale is None:     cov_scale = sched["cov_scale"]
         if num_iters is None:     num_iters = getattr(self.cfg, "mppi_num_iters", 5)
+        # Caller-supplied horizon pins the value (and bypasses adaptive
+        # shrinking entirely); otherwise use the planner's current adaptive
+        # horizon, which shrinks after each consecutive failed replan.
+        horizon_pinned = horizon is not None
+        if horizon is None:       horizon = self.current_horizon
 
-        ig_torch = torch.from_numpy(ig_map).to(self.device).float()
         occ_torch = torch.from_numpy(occ_map).to(self.device).long()
+        # IG signal: either the supplied uncertainty map ("epistemic"), or a
+        # binary mask of unseen occupancy cells ("unseen"). The unseen branch
+        # ignores ig_map entirely — the caller can pass anything (e.g. None
+        # placeholder or the epi map for logging) without affecting the cost.
+        if ig_source == "unseen":
+            ig_torch = (occ_torch == 0).float()
+        else:
+            ig_torch = torch.from_numpy(ig_map).to(self.device).float()
 
         Z_dim, X_dim = ig_torch.shape
 
@@ -185,26 +208,36 @@ class MPPIPlanner:
         # Warm-start: shift the previously committed control sequence left by
         # one (drop the action already executed) and zero-pad the tail. On the
         # first call (or after a manual reset), last_U is None and U_nom = 0.
+        had_warmstart = self.last_U is not None
         U_nom = torch.zeros((horizon, 2), device=self.device, dtype=torch.float32)
-        if self.last_U is not None:
+        if had_warmstart:
             last_U_t = torch.as_tensor(self.last_U, device=self.device, dtype=torch.float32)
             shifted_len = min(last_U_t.shape[0] - 1, horizon)
             if shifted_len > 0:
                 U_nom[:shifted_len] = last_U_t[1:1 + shifted_len]
-        
+
         # Control noise covariance [v_noise, w_noise]
         # v noise scales with typical cell size (1.0), w noise allows sufficient turning.
         # cov_scale (schedule-controlled) widens or tightens the sampling envelope.
         cov_matrix = float(cov_scale) * torch.tensor([[0.5, 0.0], [0.0, np.pi/4]], device=self.device)
 
+        w_control = 0.1
+
         # DIAL-MPC action-level annealing: noise variance grows with horizon
         # index, so early steps (which we'll actually commit to) stay near the
         # warm-started controls while tail steps explore widely. Precomputed
         # once: shape [H], values in (0, 1], h=H-1 is full noise.
+        # On cold start (no warm-start to anchor to), annealing would squash
+        # h=0 noise to near-zero around U_nom=0, locking the agent into a
+        # stationary plan. Use uniform full noise across the horizon instead
+        # so every step explores freely.
         beta_action = self.cfg.mppi_anneal_beta_action
         beta_traj   = self.cfg.mppi_anneal_beta_traj
         h_idx = torch.arange(horizon, device=self.device, dtype=torch.float32)
-        action_scale = torch.exp(-(horizon - 1 - h_idx) / (beta_action * horizon))  # [H]
+        if had_warmstart:
+            action_scale = torch.exp(-(horizon - 1 - h_idx) / (beta_action * horizon))  # [H]
+        else:
+            action_scale = torch.ones(horizon, device=self.device, dtype=torch.float32)
 
         best_traj = [(int(start_z), int(start_x))]
         best_U = None
@@ -224,8 +257,11 @@ class MPPIPlanner:
              noise = noise * (traj_scale * action_scale).view(1, horizon, 1)
              # Pin sample 0 to zero noise so the unmutated warm-start is always
              # evaluated as-is — protects against the case where every noisy
-             # variant happens to be worse than the carried-over plan.
-             noise[0] = 0.0
+             # variant happens to be worse than the carried-over plan. Skip
+             # this on cold start, where "U_nom + 0 noise" is just the
+             # do-nothing plan and would bias the softmax toward stillness.
+             if had_warmstart:
+                 noise[0] = 0.0
              U_samples = U_nom.unsqueeze(0) + noise
 
              # Clamp linear / angular velocity bounds
@@ -258,6 +294,9 @@ class MPPIPlanner:
              # along-A*-path L2 cost — no reference trajectory is used.
              dist_cost = torch.mean(torch.sqrt((Z_samples - goal_z)**2 + (X_samples - goal_x)**2), dim=1)
              scores -= w_goal * dist_cost
+
+             control_cost = torch.mean(torch.sqrt(U_samples[:, :, 0]**2 + U_samples[:, :, 1]**2), dim=1)
+             scores -= w_control * control_cost
 
              # Cost 2: Collision Penalty (subsampled along each segment).
              # A single step can span many cells (max_v_cells), so checking only
@@ -356,40 +395,24 @@ class MPPIPlanner:
              # Update nominal controls
              U_nom = U_nom + torch.sum(weights.view(-1, 1, 1) * noise, dim=0)
 
-        # Final fallback: no safe rollout was ever found across all iters.
-        # Rather than returning None and forcing the caller to idle, reconstruct
-        # a trajectory from the shifted previous plan and return that so the
-        # agent keeps moving along its last-known-safe controls.
-        if best_U is None and self.last_U is not None:
-            print("MPPI: No safe rollout found, falling back to shifted previous plan")
-            last_U_t = torch.as_tensor(self.last_U, device=self.device, dtype=torch.float32)
-            U_fallback = torch.zeros((horizon, 2), device=self.device, dtype=torch.float32)
-            shifted_len = min(last_U_t.shape[0] - 1, horizon)
-            if shifted_len > 0:
-                U_fallback[:shifted_len] = last_U_t[1:1 + shifted_len]
-            U_fallback[:, 0] = torch.clamp(U_fallback[:, 0], min=min_v_cells, max=max_v_cells)
-            U_fallback[:, 1] = torch.clamp(U_fallback[:, 1], min=-max_w_rad, max=max_w_rad)
-
-            Theta_fb = torch.zeros(horizon, device=self.device)
-            Theta_fb[0] = theta_start
-            Theta_fb[1:] = theta_start + torch.cumsum(U_fallback[:-1, 1], dim=0)
-            Z_fb = torch.zeros(horizon, device=self.device)
-            X_fb = torch.zeros(horizon, device=self.device)
-            Z_fb[0] = start_z
-            X_fb[0] = start_x
-            Z_fb[1:] = start_z + torch.cumsum(U_fallback[:-1, 0] * torch.sin(Theta_fb[1:]), dim=0)
-            X_fb[1:] = start_x + torch.cumsum(U_fallback[:-1, 0] * torch.cos(Theta_fb[1:]), dim=0)
-            Z_fb_idx = torch.clamp(Z_fb.round().long(), 0, Z_dim - 1)
-            X_fb_idx = torch.clamp(X_fb.round().long(), 0, X_dim - 1)
-
-            best_U = U_fallback.detach().cpu().numpy()
-            best_traj = [(int(Z_fb_idx[t]), int(X_fb_idx[t])) for t in range(horizon)]
-            # Don't update self.last_U here — the fallback isn't certified safe.
-
-        # Save the committed plan for next call's warm-start, but only when MPPI
-        # actually found a safe rollout this call (not the fallback path).
-        if best_U is not None and best_score > -float('inf'):
+        # No safe rollout found this call: clear the warm-start so the next
+        # replan samples from zero instead of biasing back toward the plan
+        # that led us into the dead-end. The caller handles best_U=None by
+        # spinning in place to scan for new options.
+        if best_U is None:
+            self.last_U = None
+            # Shrink horizon for the next call until either a safe plan is
+            # found or we hit min_horizon. Skip when the caller pinned the
+            # horizon explicitly — they own the schedule in that case.
+            if not horizon_pinned:
+                self.current_horizon = max(
+                    self.min_horizon,
+                    self.current_horizon - self.horizon_shrink_step,
+                )
+        else:
             self.last_U = best_U.copy()
+            if not horizon_pinned:
+                self.current_horizon = self.default_horizon
 
         best_mask_np = best_mask.cpu().numpy() if best_mask is not None else None
         final_score = best_score if best_score > -float('inf') else None
