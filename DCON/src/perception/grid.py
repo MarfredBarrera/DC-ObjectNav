@@ -92,9 +92,9 @@ class VoxelGrid:
 
 class SimilarityGrid(VoxelGrid):
     """3D Similarity Voxel Grid with 2D BEV projection."""
-    def __init__(self, config, ensemble, semantics, scene_bounds):
+    def __init__(self, config, feature_field, semantics, scene_bounds):
         super().__init__(config, scene_bounds, device=config.device)
-        self.ensemble = ensemble
+        self.feature_field = feature_field
         self.semantics = semantics
         self.voxels = None # 3D Similarity Map (Y, Z, X)
 
@@ -107,7 +107,6 @@ class SimilarityGrid(VoxelGrid):
 
         # Full grid points
         points, grid_shape = self.generate_sample_points()
-        total_points = points.shape[0]
 
         query_points = points
 
@@ -118,25 +117,19 @@ class SimilarityGrid(VoxelGrid):
         points_tensor = torch.from_numpy(query_points).float().to(self.device)
         all_sims = []
         num_batches = int(np.ceil(query_points.shape[0] / batch_size))
-        
+
         with torch.no_grad():
             for i in range(num_batches):
                 start, end = i * batch_size, min((i + 1) * batch_size, query_points.shape[0])
                 batch_pts = points_tensor[start:end]
-                
-                # Ensemble mean
-                batch_means = []
-                for model in self.ensemble:
-                    mean, _ = model.forward(batch_pts, normalize=True)
-                    batch_means.append(mean)
-                
-                ensemble_mean = torch.stack(batch_means, dim=0).mean(dim=0)
-                ensemble_mean = ensemble_mean / (ensemble_mean.norm(dim=-1, keepdim=True) + 1e-8)
-                
-                sim = torch.matmul(ensemble_mean, text_embed.T).squeeze(-1)
+
+                gamma, _, _, _ = self.feature_field.forward(batch_pts, normalize=True)
+                gamma = gamma / (gamma.norm(dim=-1, keepdim=True) + 1e-8)
+
+                sim = torch.matmul(gamma, text_embed.T).squeeze(-1)
                 sim = (sim + 1.0) / 2.0
                 all_sims.append(sim)
-        
+
         all_sims = torch.cat(all_sims, dim=0)
         self.voxels = all_sims.reshape(grid_shape)
 
@@ -260,10 +253,14 @@ class OccupancyGrid(VoxelGrid):
         np.save(path, occ_2d.cpu().numpy())
 
 class UncertaintyGrid(VoxelGrid):
-    """3D Uncertainty Voxel Grid."""
-    def __init__(self, config, ensemble, scene_bounds):
+    """3D Uncertainty Voxel Grid backed by an evidential feature field.
+
+    Epistemic and aleatoric uncertainty both come from a single forward pass
+    via the Normal-Inverse-Gamma marginal — no ensemble needed.
+    """
+    def __init__(self, config, feature_field, scene_bounds):
         super().__init__(config, scene_bounds, device=config.device)
-        self.ensemble = ensemble
+        self.feature_field = feature_field
         self.voxels_epi = None
         self.voxels_ale = None
 
@@ -271,20 +268,18 @@ class UncertaintyGrid(VoxelGrid):
         if not self.initialized: return
         points, grid_shape = self.generate_sample_points(height_filter)
         pts_tensor = torch.from_numpy(points).float().to(self.device)
-        
-        preds, vars = [], []
-        for model in self.ensemble:
-            p_batch, v_batch = [], []
+
+        epi_chunks, ale_chunks = [], []
+        with torch.no_grad():
             for i in range(int(np.ceil(pts_tensor.shape[0] / batch_size))):
                 start, end = i * batch_size, min((i + 1) * batch_size, pts_tensor.shape[0])
-                m, v = model.forward(pts_tensor[start:end], normalize=True)
-                p_batch.append(m); v_batch.append(v)
-            preds.append(torch.cat(p_batch, dim=0)); vars.append(torch.cat(v_batch, dim=0))
-        
-        preds, vars = torch.stack(preds), torch.stack(vars)
-        epi = preds.var(dim=0).mean(dim=-1)
-        ale = vars.mean(dim=0).mean(dim=-1)
-        
+                _, ale, epi, _ = self.feature_field.forward(pts_tensor[start:end], normalize=True)
+                epi_chunks.append(epi.squeeze(-1))
+                ale_chunks.append(ale.squeeze(-1))
+
+        epi = torch.cat(epi_chunks, dim=0)
+        ale = torch.cat(ale_chunks, dim=0)
+
         self.voxels_epi = epi.reshape(grid_shape)
         self.voxels_ale = ale.reshape(grid_shape)
 

@@ -8,7 +8,7 @@ import torch
 
 from src.config import Config
 from src.perception.semantics import MaskCLIPSemantics
-from src.perception.featurefield import FeatureField
+from src.perception.featurefield import EvidentialFeatureField
 from src.perception.grid import UncertaintyGrid, OccupancyGrid, SimilarityGrid
 from src.perception.utils import unprojection
 
@@ -64,8 +64,8 @@ class PerceptionStack:
         update_replay_buffer()— insert observation points into the flat history buffer
         update_occupancy()    — update occupancy grid from depth + pose
         make_super_batch()    — stage a random sample from the buffer onto GPU
-        train_step()          — one gradient step over the ensemble  [HIGH FREQUENCY]
-        update_maps()         — compute & save all BEV maps          [LOW FREQUENCY]
+        train_step()          — one gradient step on the evidential field  [HIGH FREQUENCY]
+        update_maps()         — compute & save all BEV maps                [LOW FREQUENCY]
     """
 
     def __init__(self, cfg: Config, scene_bounds: list):
@@ -74,15 +74,17 @@ class PerceptionStack:
         self.scene_bounds = scene_bounds
 
         self.mask_clip = MaskCLIPSemantics(device=self.device)
-        self.ensemble = [
-            FeatureField(cfg, scene_bounds=scene_bounds, device=self.device)
-            for _ in range(cfg.ensemble_num_models)
-        ]
+        # Single evidential field: aleatoric + epistemic uncertainty in one
+        # forward pass via the Normal-Inverse-Gamma marginal (replaces the
+        # ensemble whose only role was empirical epistemic from prediction var).
+        self.feature_field = EvidentialFeatureField(
+            cfg, scene_bounds=scene_bounds, device=self.device,
+        )
 
-        self.ugrid = UncertaintyGrid(cfg, ensemble=self.ensemble, scene_bounds=scene_bounds)
+        self.ugrid = UncertaintyGrid(cfg, feature_field=self.feature_field, scene_bounds=scene_bounds)
         self.occupancy_grid = OccupancyGrid(cfg, scene_bounds=scene_bounds)
         self.similarity_grid = SimilarityGrid(
-            cfg, ensemble=self.ensemble, semantics=self.mask_clip, scene_bounds=scene_bounds,
+            cfg, feature_field=self.feature_field, semantics=self.mask_clip, scene_bounds=scene_bounds,
         )
 
         # Flat history buffer: bounded-memory ring over all observed points
@@ -197,7 +199,7 @@ class PerceptionStack:
         return torch.cat(gpu_pts_chunks, dim=0), torch.cat(gpu_feat_chunks, dim=0)
 
     def train_step(self, super_points: torch.Tensor, super_features: torch.Tensor) -> float:
-        """Sample a mini-batch from the super-batch and run one gradient step. Returns avg loss."""
+        """Sample a mini-batch from the super-batch and run one gradient step. Returns loss."""
         mini_batch_size = self.cfg.hash_train_batch_size
 
         if super_points is None or super_points.shape[0] < mini_batch_size:
@@ -207,13 +209,8 @@ class PerceptionStack:
         batch_pts = super_points[batch_idx]
         batch_feats = super_features[batch_idx]
 
-        total_loss = 0.0
-        for model in self.ensemble:
-            loss = model.train_step(batch_pts, batch_feats)
-            if loss is not None:
-                total_loss += loss
-
-        return total_loss / len(self.ensemble)
+        loss = self.feature_field.train_step(batch_pts, batch_feats)
+        return loss if loss is not None else 0.0
 
     def update_maps(
         self,
@@ -242,62 +239,38 @@ class PerceptionStack:
         print(f"Maps {verb} at step {step} ({time.time() - t0:.2f}s)")
 
     def save_models(self) -> None:
-        for i, model in enumerate(self.ensemble):
-            path = os.path.join(self.cfg.output_dir, f"ensemble/featurefield_ensemble_{i}.pt")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            model.save(path)
-            print(f"Saved ensemble model {i} -> {path}")
+        path = os.path.join(self.cfg.output_dir, "featurefield/featurefield.pt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.feature_field.save(path)
+        print(f"Saved feature field -> {path}")
 
     def save_pretrained(self) -> None:
-        """Save current models to ensemble/pretrained/ so a future run can load them."""
-        for i, model in enumerate(self.ensemble):
-            path = os.path.join(self.cfg.output_dir, f"ensemble/pretrained/pretrained_{i}.pt")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            model.save(path)
-            print(f"Saved pretrained model {i} -> {path}")
+        """Save current model to featurefield/pretrained/ so a future run can load it."""
+        path = os.path.join(self.cfg.output_dir, "featurefield/pretrained/pretrained.pt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.feature_field.save(path)
+        print(f"Saved pretrained feature field -> {path}")
 
     def load_models(self, pretrained: bool = False) -> bool:
-        """Load models from disk. Returns True if at least one model was loaded."""
-        ensemble_dir = os.path.join(self.cfg.output_dir, "ensemble")
+        """Load feature field from disk. Returns True if loaded."""
         if pretrained:
-            ensemble_dir = os.path.join(ensemble_dir, "pretrained")
+            path = os.path.join(self.cfg.output_dir, "featurefield/pretrained/pretrained.pt")
+        else:
+            path = os.path.join(self.cfg.output_dir, "featurefield/featurefield.pt")
 
-        if not os.path.exists(ensemble_dir):
-            print(f"Warning: ensemble directory not found at {ensemble_dir}")
+        if not os.path.exists(path):
+            print(f"Warning: feature field checkpoint not found at {path}")
             return False
 
-        loaded_any = False
-        for i, model in enumerate(self.ensemble):
-            # When loading pretrained, try pretrained_{i}.pt first then fall back
-            # to featurefield_ensemble_{i}.pt (handles the case where the user
-            # placed standard-save files in the pretrained directory).
-            if pretrained:
-                candidates = [f"pretrained_{i}.pt", f"featurefield_ensemble_{i}.pt"]
-            else:
-                candidates = [f"featurefield_ensemble_{i}.pt"]
-
-            path = None
-            for filename in candidates:
-                candidate = os.path.join(ensemble_dir, filename)
-                if os.path.exists(candidate):
-                    path = candidate
-                    break
-
-            if path is not None:
-                # Skip optimizer state for pretrained loads — fine-tuning on a new
-                # data distribution with the converged Adam stats produces oversized
-                # first steps that destroy the pretrained weights.
-                model.load(path, load_optimizer=not pretrained)
-                print(f"  -> Loaded {'pretrained ' if pretrained else ''}model {i} <- {path}")
-                loaded_any = True
-            else:
-                tried = [os.path.join(ensemble_dir, f) for f in candidates]
-                print(f"  -> Warning: model {i} not found (tried: {tried})")
-
-        return loaded_any
+        # Skip optimizer state for pretrained loads — fine-tuning on a new
+        # data distribution with the converged Adam stats produces oversized
+        # first steps that destroy the pretrained weights.
+        self.feature_field.load(path, load_optimizer=not pretrained)
+        print(f"  -> Loaded {'pretrained ' if pretrained else ''}feature field <- {path}")
+        return True
         
     def save_2d_similarity(self, step: int, depth: torch.Tensor, c2w: torch.Tensor, intrinsics: tuple) -> None:
-        """Query ensemble for 2D similarity from current camera view and save."""
+        """Query feature field for 2D similarity from current camera view and save."""
         if not self.target_query:
             return
 
@@ -313,28 +286,22 @@ class PerceptionStack:
         if world_points.shape[0] == 0:
             sim_2d = torch.zeros((H, W), device=self.device)
         else:
-            # 3. Query Ensemble
             batch_size = 100_000
             num_batches = int(np.ceil(world_points.shape[0] / batch_size))
             all_sims = []
-            
+
             with torch.no_grad():
                 for i in range(num_batches):
                     start, end = i * batch_size, min((i + 1) * batch_size, world_points.shape[0])
                     batch_pts = world_points[start:end]
-                    
-                    batch_means = []
-                    for model in self.ensemble:
-                        m, _ = model.forward(batch_pts, normalize=True)
-                        batch_means.append(m)
-                    
-                    ens_mean = torch.stack(batch_means, dim=0).mean(dim=0)
-                    ens_mean = ens_mean / (ens_mean.norm(dim=-1, keepdim=True) + 1e-8)
-                    
-                    sim = (ens_mean @ text_embed.T).squeeze(-1)
+
+                    gamma, _, _, _ = self.feature_field.forward(batch_pts, normalize=True)
+                    gamma = gamma / (gamma.norm(dim=-1, keepdim=True) + 1e-8)
+
+                    sim = (gamma @ text_embed.T).squeeze(-1)
                     sim = (sim + 1.0) / 2.0
                     all_sims.append(sim)
-            
+
             sim_2d = torch.zeros((H, W), device=self.device)
             sim_2d[mask] = torch.cat(all_sims, dim=0)
 

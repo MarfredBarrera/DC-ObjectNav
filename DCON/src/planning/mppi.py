@@ -120,35 +120,30 @@ class MPPIPlanner:
                 break
         return chosen
 
-    def scheduled_params(self, progress):
-        """
-        Linearly interpolate the exploration→exploitation schedule.
-        progress=0.0 → all *_start values; progress=1.0 → all *_end values.
+    # def scheduled_params(self, progress):
+    #     """Constant params — no per-parameter ramping.
 
-        w_goal uses a delayed schedule: it holds at *_start for the first half
-        of the run, then interpolates to *_end over the second half. This lets
-        the agent commit to pure IG-driven exploration early before the
-        goal-distance pull kicks in.
+    #     Exploration→exploitation is controlled instead by a single mixing
+    #     weight `lam = exp(-progress)` applied to the IG and goal-distance
+    #     cost terms in optimize_trajectory:
+    #         score += lam       * w_ig   * IG
+    #         score -= (1 - lam) * w_goal * dist_cost
 
-        Returns dict with lambda_weight, w_ig, w_goal, cov_scale.
-        """
-        p = float(np.clip(progress, 0.0, 1.0))
-        # Delayed half-run ramp for goal pull: 0 for p<0.5, then linear 0→1.
-        p_goal = max(0.0, (p - 0.5))
-        def lerp(a, b, t=p):
-            return a + t * (b - a)
-        return {
-            "lambda_weight": lerp(self.cfg.mppi_lambda_start, self.cfg.mppi_lambda_end),
-            "w_ig":          lerp(self.cfg.mppi_w_ig_start,   self.cfg.mppi_w_ig_end),
-            "w_goal":        lerp(self.cfg.mppi_w_goal_start, self.cfg.mppi_w_goal_end, p_goal),
-            "cov_scale":     lerp(self.cfg.mppi_cov_scale_start, self.cfg.mppi_cov_scale_end),
-        }
+    #     lam(0) = 1 (pure IG), lam(1) ≈ 0.368 (~36/64 IG/goal at endpoint).
+    #     Length-agnostic — depends only on fractional progress through the run.
+    #     """
+    #     return {
+    #         "lambda_weight": self.cfg.mppi_lambda_start,
+    #         "w_ig":          self.cfg.mppi_w_ig_start,
+    #         "w_goal":        1.0,
+    #         "cov_scale":     self.cfg.mppi_cov_scale_start,
+    #     }
 
     def optimize_trajectory(self, start, goal, ig_map, occ_map,
     num_samples=300, num_iters=None, horizon=None,
-    lambda_weight=None, w_goal=None, w_ig=None, w_occ=1e6, w_unseen=0,
+    lambda_weight=None, w_goal=1, w_ig=None, w_occ=1e6, w_unseen=0,
     intrinsics=None, sensor_height=1.5, initial_heading=None,
-    progress=0.0, cov_scale=None, ig_source="epistemic"):
+    progress=0.0, cov_scale=None, ig_source="unseen", goal_confidence=0.0):
         """
         Optimize a trajectory from `start` to `goal` using MPPI unicycle
         sampling. No A* reference; nominal controls start at zero and MPPI
@@ -166,11 +161,33 @@ class MPPIPlanner:
             return ([(int(start[0]), int(start[1]))] if start is not None else []), None, None, None
 
         # Resolve schedule. Caller-supplied scalars take precedence.
-        sched = self.scheduled_params(progress)
-        if lambda_weight is None: lambda_weight = sched["lambda_weight"]
-        if w_ig is None:          w_ig = sched["w_ig"]
-        if w_goal is None:        w_goal = sched["w_goal"]
-        if cov_scale is None:     cov_scale = sched["cov_scale"]
+        # sched = self.scheduled_params(progress)
+        # if w_ig is None:          w_ig = sched["w_ig"]
+        # if w_goal is None:        w_goal = sched["w_goal"]
+        # if cov_scale is None:     cov_scale = sched["cov_scale"]
+        mppi_lambda = self.cfg.mppi_lambda
+        w_ig = self.cfg.mppi_w_ig
+        w_goal = self.cfg.mppi_w_goal
+        cov_scale = self.cfg.mppi_cov_scale
+
+        # Exploration→exploitation mixing weight, length-agnostic.
+        # lam(progress=0) = 1.0 → pure IG; lam(progress=1) ≈ 0.368.
+        lam = float(np.exp(-float(np.clip(progress, 0.0, 1.0))/2.0))
+
+        # Detection-confidence weighting. Formula:
+        #   w_conf_norm = (a^confidence - 1) / (a - 1),  confidence in [0, 1]
+        # With a < 1 the curve is concave/saturating — moderate sim values
+        # (~0.3–0.6) already produce near-saturated weight. The boosted
+        # version `w_conf` scales the exploitation term; the IG term is
+        # damped symmetrically by `(1 - w_conf_norm)` so a confident
+        # detection both attracts and silences frontier chasing.
+        a_conf = float(getattr(self.cfg, "mppi_conf_weight_a", 0.1))
+        conf_scale = float(getattr(self.cfg, "mppi_conf_weight_scale", 100.0))
+        conf = float(np.clip(goal_confidence, 0.0, 1.0))
+        w_conf_norm = (a_conf ** conf - 1.0) / (a_conf - 1.0)
+        w_conf = conf_scale * w_conf_norm
+        w_ig_conf = 1.0 - w_conf_norm
+
         if num_iters is None:     num_iters = getattr(self.cfg, "mppi_num_iters", 5)
         # Caller-supplied horizon pins the value (and bypasses adaptive
         # shrinking entirely); otherwise use the planner's current adaptive
@@ -178,7 +195,30 @@ class MPPIPlanner:
         horizon_pinned = horizon is not None
         if horizon is None:       horizon = self.current_horizon
 
+        start_z, start_x = float(start[0]), float(start[1])
+        goal_z,  goal_x  = float(goal[0]),  float(goal[1])
+
         occ_torch = torch.from_numpy(occ_map).to(self.device).long()
+        # Collision-only view of occupancy: carve a small disk around the goal
+        # so the target cell (which is often an obstacle — e.g. the bed, the
+        # pillow) is reachable. The original occ_torch is unchanged for IG
+        # raycasts, which still see the target as a proper occluder.
+        r_carve = getattr(self.cfg, "mppi_goal_carve_radius", 1)
+        occ_collision = occ_torch.clone()
+        if r_carve > 0:
+            gz = int(round(goal_z))
+            gx = int(round(goal_x))
+            z0, z1 = max(0, gz - r_carve), min(occ_torch.shape[0], gz + r_carve + 1)
+            x0, x1 = max(0, gx - r_carve), min(occ_torch.shape[1], gx + r_carve + 1)
+            zz, xx = torch.meshgrid(
+                torch.arange(z0, z1, device=self.device),
+                torch.arange(x0, x1, device=self.device),
+                indexing='ij',
+            )
+            disk = ((zz - gz) ** 2 + (xx - gx) ** 2) <= r_carve ** 2
+            patch = occ_collision[z0:z1, x0:x1]
+            patch[disk] = 1  # treat as free for collision
+            occ_collision[z0:z1, x0:x1] = patch
         # IG signal: either the supplied uncertainty map ("epistemic"), or a
         # binary mask of unseen occupancy cells ("unseen"). The unseen branch
         # ignores ig_map entirely — the caller can pass anything (e.g. None
@@ -189,9 +229,6 @@ class MPPIPlanner:
             ig_torch = torch.from_numpy(ig_map).to(self.device).float()
 
         Z_dim, X_dim = ig_torch.shape
-
-        start_z, start_x = float(start[0]), float(start[1])
-        goal_z,  goal_x  = float(goal[0]),  float(goal[1])
 
         # Control bounds (cells/step and rad/step).
         max_v_cells = (getattr(self.cfg, "mppi_max_v_mps", 1.0) * self.cfg.mppi_dt) / self.cfg.voxel_resolution
@@ -289,14 +326,13 @@ class MPPIPlanner:
 
              scores = torch.zeros(num_samples, device=self.device)
 
-             # Cost 1: Goal-distance pull. Mean per-step Euclidean distance from
-             # rollout waypoints to the single goal cell. Replaces the old
-             # along-A*-path L2 cost — no reference trajectory is used.
+             # Cost 1: Goal-distance pull, mixed by (1 - lam) so it grows
+             # as exploration anneals into exploitation.
              dist_cost = torch.mean(torch.sqrt((Z_samples - goal_z)**2 + (X_samples - goal_x)**2), dim=1)
-             scores -= w_goal * dist_cost
+             scores -= (1.0 - lam) * w_goal * w_conf * dist_cost
 
-             control_cost = torch.mean(torch.sqrt(U_samples[:, :, 0]**2 + U_samples[:, :, 1]**2), dim=1)
-             scores -= w_control * control_cost
+            #  control_cost = torch.mean(torch.sqrt(U_samples[:, :, 0]**2 + U_samples[:, :, 1]**2), dim=1)
+            #  scores -= w_control * control_cost
 
              # Cost 2: Collision Penalty (subsampled along each segment).
              # A single step can span many cells (max_v_cells), so checking only
@@ -316,17 +352,29 @@ class MPPIPlanner:
              Z_chk_idx = torch.clamp(Z_chk.round().long(), 0, Z_dim - 1)
              X_chk_idx = torch.clamp(X_chk.round().long(), 0, X_dim - 1)
              
-             occ_vals = occ_torch[Z_chk_idx, X_chk_idx].clone()
-             
+             occ_vals = occ_collision[Z_chk_idx, X_chk_idx].clone()
+
              # Forgive the starting cell: if the agent is pressed against a wall and
              # technically starts inside an obstacle (especially with dilation), we
-             # don't want to penalize rollouts just for being in the start cell. 
+             # don't want to penalize rollouts just for being in the start cell.
              # We only punish transitions into *new* obstacle cells.
              start_z_idx = min(max(int(round(start_z)), 0), Z_dim - 1)
              start_x_idx = min(max(int(round(start_x)), 0), X_dim - 1)
              at_start = (Z_chk_idx == start_z_idx) & (X_chk_idx == start_x_idx)
              occ_vals[at_start] = 1 # Treated as free
-             
+
+             # Forgive obstacle contact after first arrival at the goal. Without
+             # this, rollouts that touch the target object (e.g. graze the bed
+             # after reaching a pillow) get the hard-eliminated, and the planner
+             # is left with only orbit-style trajectories. cummax over time gives
+             # "has the rollout reached the goal yet?" — sub-points along axis 1
+             # are monotonic in rollout time.
+             r_arrival = float(getattr(self.cfg, "mppi_goal_arrival_radius", 3))
+             d_to_goal = torch.sqrt((Z_chk - goal_z) ** 2 + (X_chk - goal_x) ** 2)
+             arrived = (d_to_goal <= r_arrival).long()
+             post_arrival = torch.cummax(arrived, dim=1).values.bool()
+             occ_vals[post_arrival] = 1
+
              collision_cost = torch.sum((occ_vals >= 2).float(), dim=1)
             #  # Unseen-traversal cost: cells with value 0 are not verified free.
             #  # Penalizing these prevents rollouts from slipping through unseen-cell
@@ -357,7 +405,7 @@ class MPPIPlanner:
                      intrinsics=intrinsics,
                      sensor_height=sensor_height
                  )
-                 scores[safe_mask] += w_ig * batch_ig
+                 scores[safe_mask] += lam * w_ig_conf * w_ig * batch_ig
 
              # Hard-exclude colliding rollouts from the final weighting.
              # Without this, when every sample collides (tight spot, thin wall,
@@ -374,12 +422,11 @@ class MPPIPlanner:
                      best_score = masked_scores[iter_best_idx].item()
                      best_traj = [(int(Z_idx[iter_best_idx, t]), int(X_idx[iter_best_idx, t])) for t in range(horizon)]
                      best_U = U_samples[iter_best_idx].detach().cpu().numpy()  # [H, 2] (v_cells_per_step, w_rad_per_step)
-                     _, best_mask = compute_fov_ig(best_traj, ig_torch, occ_torch, self.cfg, self.device, gamma_ig=0.95, intrinsics=intrinsics, sensor_height=sensor_height)
 
                  # Softmax: safe rollouts only. Unsafe entries are -inf, so
                  # exp(...) = 0 and they contribute nothing to U_nom update.
                  beta = masked_scores.max()
-                 weights = torch.exp((masked_scores - beta) / lambda_weight)
+                 weights = torch.exp((masked_scores - beta) / mppi_lambda)
              else:
                  # No safe rollouts this iter: don't update best_U / best_traj.
                  # Still nudge U_nom using the soft collision penalty so the
@@ -389,7 +436,7 @@ class MPPIPlanner:
 
                  print("NO SAFE ROLLOUTS")
                  beta = torch.max(scores)
-                 weights = torch.exp((scores - beta) / lambda_weight)
+                 weights = torch.exp((scores - beta) / mppi_lambda)
              weights = weights / (torch.sum(weights) + 1e-8)
              
              # Update nominal controls
@@ -414,6 +461,4 @@ class MPPIPlanner:
             if not horizon_pinned:
                 self.current_horizon = self.default_horizon
 
-        best_mask_np = best_mask.cpu().numpy() if best_mask is not None else None
-        final_score = best_score if best_score > -float('inf') else None
-        return best_traj, best_U, best_mask_np, final_score
+        return best_traj, best_U

@@ -129,9 +129,9 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=str, default="0", help="GPU device index")
     parser.add_argument("--cores", type=str, default="0-127", help="CPU cores for taskset")
     parser.add_argument("--pretrained", action="store_true", default=False,
-                        help="Load pretrained models from ensemble/pretrained/ before training")
+                        help="Load pretrained model from featurefield/pretrained/ before training")
     parser.add_argument("--save-pretrained", action="store_true", default=False,
-                        help="Save final models to ensemble/pretrained/ (use after a bootstrap run)")
+                        help="Save final model to featurefield/pretrained/ (use after a bootstrap run)")
     args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu

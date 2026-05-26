@@ -1,9 +1,12 @@
-"""YOLO-World open-vocabulary object detector.
+"""Open-vocabulary object detectors.
 
-Given an RGB frame and a free-form text query, returns the highest-confidence
-detection's score and bounding box. Used to gate exploration→approach behavior
-on visible-target confidence. Swapped from OWLv2 for ~20× lower inference time
-at the cost of some accuracy on unusual queries.
+Both classes share the same interface — `detect(image, query) -> (score, box)` —
+so the rest of the system can swap between them by config without further
+plumbing. Pick one via `make_detector(name, ...)`.
+
+- `ObjectDetector`: YOLO-Worldv2 (fast, ~15 ms/frame, class-name-style queries).
+- `GroundingDinoDetector`: Grounding DINO (slow, ~200 ms/frame, much better
+  on natural-language phrases like "the green plant by the window").
 """
 
 from typing import Optional, Tuple, Union
@@ -100,22 +103,117 @@ class ObjectDetector:
         return arr
 
 
+class GroundingDinoDetector:
+    """Open-vocabulary detector using Grounding DINO via HuggingFace transformers.
+
+    Slower than YOLO-World but considerably better at natural-language queries
+    ("the small red mug on the table"). Score scale differs from YOLO-World —
+    strong detections typically sit at 0.35–0.55 rather than 0.5–0.8, so any
+    downstream threshold tuned for YOLO-World likely needs to be retuned.
+    """
+
+    def __init__(
+        self,
+        device: str = "cuda",
+        model_name: str = "IDEA-Research/grounding-dino-tiny",
+        threshold: float = 0.25,
+        text_threshold: float = 0.25,
+    ):
+        # Imported here so the YOLO-only path doesn't pay the transformers
+        # import cost or require it to be installed.
+        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+
+        self.device = device
+        self.threshold = float(threshold)
+        self.text_threshold = float(text_threshold)
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_name).to(device)
+        self.model.eval()
+        # Cache the last query text — re-tokenizing is cheap but the
+        # post-processor expects the same string used at inference time.
+        self._current_query: Optional[str] = None
+        self._query_text: Optional[str] = None
+
+    @torch.no_grad()
+    def detect(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
+        # GD expects the prompt to end with a period (separator between phrases).
+        if query != self._current_query:
+            self._current_query = query
+            self._query_text = query.strip().rstrip(".") + "."
+
+        arr = ObjectDetector._to_uint8(image)
+        pil = Image.fromarray(arr)
+
+        inputs = self.processor(images=pil, text=self._query_text, return_tensors="pt").to(self.device)
+        outputs = self.model(**inputs)
+
+        # post_process expects (H, W) target sizes for box rescaling.
+        h, w = arr.shape[:2]
+        results = self.processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            # box_threshold=self.threshold,
+            text_threshold=self.text_threshold,
+            target_sizes=[(h, w)],
+        )[0]
+
+        scores = results.get("scores")
+        boxes = results.get("boxes")
+        if scores is None or len(scores) == 0:
+            return 0.0, None
+
+        best = int(torch.argmax(scores))
+        score = float(scores[best])
+        xyxy = boxes[best].tolist()
+        box = (float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]))
+        return score, box
+
+
+def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
+    """Factory: pick a detector backend by short name.
+
+    - "yolo": fast YOLO-Worldv2.
+    - "grounding_dino": Grounding DINO Tiny via HuggingFace.
+    """
+    key = name.lower().strip()
+    if key in ("yolo", "yolo_world", "yoloworld"):
+        return ObjectDetector(device=device, **kwargs)
+    if key in ("grounding_dino", "gdino", "groundingdino"):
+        return GroundingDinoDetector(device=device, **kwargs)
+    raise ValueError(f"Unknown detector backend: {name!r}")
+
+
 if __name__ == "__main__":
-    detector = ObjectDetector(device="cuda" if torch.cuda.is_available() else "cpu")
-    image_path = "./output/current_scene/rgbs/rgb_18000.png"
+    import sys
+    backend = sys.argv[1] if len(sys.argv) > 1 else "yolo"
+    detector = make_detector(backend, device="cuda" if torch.cuda.is_available() else "cpu")
+    image_path = "./output/current_scene/rgbs/rgb_13000.png"
     image = Image.open(image_path)
 
-    # Warm up: first call pays for kernel compile + CLIP text embed.
-    detector.detect(image, "a photo of a bed")
+    # Warm up: first call pays for kernel compile + text embed.
+    detector.detect(image, "a small green potted plant")
 
     N = 10
     t0 = time.time()
     for _ in range(N):
-        score, box = detector.detect(image, "a photo of a bed")
-    print(f"per-call (warmed): {(time.time() - t0) / N * 1000:.1f} ms")
+        score, box = detector.detect(image, "a small green potted plant")
+    print(f"[{backend}] per-call (warmed): {(time.time() - t0) / N * 1000:.1f} ms")
 
     if box is None:
         print("No detection.")
     else:
         rounded = tuple(round(v, 2) for v in box)
         print(f"Detected with confidence {score:.3f} at {rounded}")
+
+    # Display image with box
+    import cv2
+    image = cv2.imread(image_path)
+    cv2.rectangle(image, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 2)
+    cv2.imwrite("./figs/tv_gdino.png", image)
+    # cv2.imshow("Image", image)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()

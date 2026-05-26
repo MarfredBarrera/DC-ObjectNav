@@ -34,9 +34,11 @@ from src.habitat.habitat_utils import (
     spawn_agent_at_random_navpoint,
 )
 from src.habitat.sim_interface import SimInterface
+from src.perception.obj_detection import make_detector
 from src.perception.perception_stack import PerceptionStack
 from src.planning.mppi import MPPIPlanner
 from src.planning.utils import normalize_sim
+from visualize import render_navigation
 
 
 REPLAN_INTERVAL = 100
@@ -69,7 +71,7 @@ def _to_numpy(maybe_tensor):
     return maybe_tensor
 
 
-def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max: int = 5, progress: float = 0.0):
+def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max: int = 5, progress: float = 0.0, detected: bool = False):
     """Run MPPI from current pose and return (action, ref_traj, opt_traj).
 
     action is [v_mps, w_rad_per_s] or None if idling.
@@ -79,6 +81,10 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
     On a successful plan the full MPPI control sequence replaces the queue.
     If every A* goal is unreachable the queue is consumed so the agent keeps
     moving.
+
+    `detected=True` switches MPPI into exploit mode by pinning
+    `goal_confidence=1.0`, which saturates the goal pull and zeroes the IG
+    term via the existing `w_conf` curve.
     """
     bev_sim = _to_numpy(perception.similarity_grid.get_2d_map(min_y=0.1, max_y=1.5))
     bev_epi = _to_numpy(perception.ugrid.get_2d_map(type='epistemic'))
@@ -92,26 +98,30 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
     heading = get_agent_heading(sim_iface.agent)
     start_grid = world_to_grid(pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution)
 
-    # Approach points around the single highest-similarity peak, ordered by
-    # proximity. Target objects (e.g. a bed) are marked as obstacles in the
-    # occupancy grid, so the peak itself is usually unreachable — we A* to
-    # the closest free cell next to it.
-    # Closest free cell to the highest-similarity peak. Target objects (e.g.
-    # a bed) are marked as obstacles in the occupancy grid, so the sim peak
-    # itself is usually unreachable — we just need to get close.
-    approach_points = mppi.get_goals_near_highest_sim(bev_sim, bev_occ, max_candidates=1)
-    if not approach_points:
+    # Drive straight at the highest-similarity cell, even if it's on an
+    # obstacle (the target object itself). MPPI carves a small free disk
+    # around the goal and forgives collisions once the rollout has arrived,
+    # so the planner can commit instead of orbiting.
+    sim_for_goal = bev_sim.copy().astype(np.float32)
+    sim_for_goal[bev_occ == 0] = -np.inf  # exclude unseen
+    if not np.any(np.isfinite(sim_for_goal)):
         print("  plan: no observed cells, can't pick a goal")
         return (action_queue.popleft() if action_queue else None), None, None, None
-    goal = approach_points[0]
+    flat_idx = int(np.argmax(sim_for_goal))
+    H, W = sim_for_goal.shape
+    goal = (flat_idx // W, flat_idx % W)
+    goal_confidence = 1.0 if detected else float(bev_sim[goal[0], goal[1]])
 
-    opt_path, U_opt, _seen, mppi_score = mppi.optimize_trajectory(
+    opt_path, U_opt = mppi.optimize_trajectory(
         start_grid, goal, bev_epi, bev_occ,
         initial_heading=heading,
         intrinsics=sim_iface.intrinsics,
         sensor_height=cfg.sensor_height,
         progress=progress,
+        ig_source=cfg.ig_source,
+        goal_confidence=goal_confidence,
     )
+    mppi_score = None
     if U_opt is None or U_opt.shape[0] == 0:
         # No safe MPPI plan this replan — spin in place to scan for new
         # options. Rotating doesn't translate the agent, so it's always safe
@@ -119,7 +129,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
         # geometry that makes the next replan more likely to find a safe plan.
         print("  plan: MPPI returned no safe control sequence, replanning")
         action_queue.clear()
-        return [0.0, 0.0], None, None, None
+        return [0.0, -np.pi/4], None, None, None
 
     # Successful plan: replace queue with full MPPI control sequence.
     # MPPI U units: v in [grid cells / mppi_step], w in [rad / mppi_step].
@@ -132,7 +142,9 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
     return action_queue.popleft(), None, opt_path, mppi_score
 
 
-def run(cfg: Config, save_enabled: bool = True) -> None:
+def run(cfg: Config, save_enabled: bool = True,
+        visualize: bool = True, viz_output: str = "./figs/nav_history.mp4",
+        viz_fps: int = 5) -> None:
     # 1. Init simulator
     sim, agent = init_simulator(
         cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov, sensor_height=cfg.sensor_height,
@@ -141,10 +153,10 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)
-    perception = PerceptionStack(cfg, scene_bounds)
-    perception.target_query = cfg.target_query
+    perception = PerceptionStack(cfg, scene_bounds)  # owns target_query; initialised from cfg
 
     mppi = MPPIPlanner(cfg, device=cfg.device)
+    detector = make_detector(cfg.detector, device=cfg.device)
     action_queue: deque = deque()
 
     # 2. Bootstrap A: spin in a full circle, observe each frame
@@ -185,7 +197,7 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
         os.makedirs(rgb_dir, exist_ok=True)
         rgb_img = (rgb.numpy() * 255).astype(np.uint8)
         imageio.imwrite(os.path.join(rgb_dir, f"rgb_{step:03d}.png"), rgb_img)
-        
+
         # Save 2D Sim Map
         perception.save_2d_similarity(step, depth, c2w, sim_iface.intrinsics)
 
@@ -208,7 +220,21 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
           f"(replan every {REPLAN_INTERVAL}, refresh every {cfg.hash_buffer_refresh_interval})")
     start_time = time.time()
 
+    # Two-phase planner state. `detected` latches to True (and never releases)
+    # once `det_score >= cfg.detected_conf_threshold` for
+    # `cfg.detected_persistence` consecutive replans. While latched, MPPI
+    # silences IG and pulls hard toward the BEV similarity peak.
+    detected = False
+    detected_streak = 0
+
+    # Tracks the last step actually executed by the loop. Used to cap the
+    # post-run visualization so it doesn't pull in stale .npy snapshots left
+    # over from a previous, longer run (traj_log.jsonl is truncated each run,
+    # but the umaps/occ_maps/sim_maps directories are not).
+    last_step = 0
+
     for step in range(1, cfg.iterations + 1):
+        last_step = step
         # A. train every step
         loss = perception.train_step(super_pts, super_feats)
 
@@ -218,15 +244,59 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
             pos = sim_iface.agent_position.copy()
             heading = get_agent_heading(sim_iface.agent)
             progress = step / max(1, cfg.iterations)
+
+            rgb_cur, _, _ = perception.observe(sim_iface)
+            det_score, det_box = detector.detect(rgb_cur, perception.target_query)
+
+            # Latch into DETECTED once we get `detected_persistence` consecutive
+            # detections above threshold. Never unlatches — see comment above.
+            if not detected:
+                if det_score >= cfg.detected_conf_threshold:
+                    detected_streak += 1
+                else:
+                    detected_streak = 0
+                if detected_streak >= cfg.detected_persistence:
+                    detected = True
+                    print(f"step {step}: DETECTED — entering exploit mode "
+                          f"(det_score={det_score:.3f})")
+
             action, ref_traj, opt_traj, score = plan_one_action(
-                perception, sim_iface, mppi, cfg, action_queue, progress=progress
+                perception, sim_iface, mppi, cfg, action_queue,
+                progress=progress, detected=detected,
             )
             if action is not None:
                 sim_iface.step(action, dt=cfg.mppi_dt)
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | "
-                      f"action [v={action[0]:+.3f} m/s, w={action[1]:+.3f} rad/s] | position: {pos[0]:.2f}, {pos[2]:.2f}")
+                      f"action [v={action[0]:+.3f} m/s, w={action[1]:+.3f} rad/s] | "
+                      f"position: {pos[0]:.2f}, {pos[2]:.2f} | det_conf: {det_score:.3f} | "
+                      f"mode: {'EXPLOIT' if detected else 'SEARCH'}")
             else:
-                print(f"step {step}: plan {time.time()-t_plan:.2f}s | no action")
+                print(f"step {step}: plan {time.time()-t_plan:.2f}s | no action | "
+                      f"det_conf: {det_score:.3f} | "
+                      f"mode: {'EXPLOIT' if detected else 'SEARCH'}")
+
+            # Termination check: in DETECTED mode, compute distance from agent
+            # to BEV similarity peak. Stop after the traj_log write below so the
+            # final replan is captured for visualization.
+            stop_now = False
+            if detected:
+                bev_sim = _to_numpy(perception.similarity_grid.get_2d_map(min_y=0.1, max_y=1.5))
+                bev_occ = _to_numpy(perception.occupancy_grid.get_2d_map())
+                if bev_sim is not None and bev_occ is not None:
+                    sim_for_goal = bev_sim.astype(np.float32).copy()
+                    sim_for_goal[bev_occ == 0] = -np.inf
+                    if np.any(np.isfinite(sim_for_goal)):
+                        H_g, W_g = sim_for_goal.shape
+                        flat_idx = int(np.argmax(sim_for_goal))
+                        gz, gx = flat_idx // W_g, flat_idx % W_g
+                        sz, sx = world_to_grid(
+                            pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution
+                        )
+                        dist_m = float(np.hypot(gz - sz, gx - sx)) * cfg.voxel_resolution
+                        if dist_m <= cfg.stop_distance_m:
+                            print(f"step {step}: TARGET REACHED "
+                                  f"(dist={dist_m:.2f}m <= {cfg.stop_distance_m:.2f}m)")
+                            stop_now = True
 
             with open(traj_log_path, 'a') as _f:
                 # Convert score to cost: higher score is better, so cost is -score.
@@ -239,7 +309,13 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
                     'ref_traj': [[int(p[0]), int(p[1])] for p in ref_traj] if ref_traj else [],
                     'opt_traj': [[int(p[0]), int(p[1])] for p in opt_traj] if opt_traj else [],
                     'mppi_cost': cost,
+                    'det_conf': float(det_score),
+                    'det_box': [float(v) for v in det_box] if det_box is not None else None,
                 }) + '\n')
+
+            if stop_now:
+                sim_iface.step([0.0, 0.0], dt=cfg.mppi_dt)
+                break
 
         # C. refresh buffer + maps (slowest cadence — bottleneck)
         if step % cfg.hash_buffer_refresh_interval == 0:
@@ -254,7 +330,7 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
                 os.makedirs(rgb_dir, exist_ok=True)
                 rgb_img = (rgb.numpy() * 255).astype(np.uint8)
                 imageio.imwrite(os.path.join(rgb_dir, f"rgb_{step:03d}.png"), rgb_img)
-                
+
                 # Save 2D Sim Map
                 perception.save_2d_similarity(step, depth, c2w, sim_iface.intrinsics)
 
@@ -276,6 +352,13 @@ def run(cfg: Config, save_enabled: bool = True) -> None:
     sim.close()
     print("[main] done.")
 
+    if visualize:
+        print(f"[viz] rendering navigation video up to step {last_step}...")
+        try:
+            render_navigation(cfg, viz_output, fps=viz_fps, max_step=last_step)
+        except Exception as e:
+            print(f"[viz] visualization failed: {e}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -283,6 +366,16 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=str, default="0", help="GPU device index")
     parser.add_argument("--no-save", action="store_true", default=False,
                         help="Skip saving BEV maps to disk during the live loop")
+    parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic"], default="epistemic",
+                        help="Information gain source for MPPI (unseen or epistemic)")
+    parser.add_argument("--detector", type=str, choices=["yolo", "grounding_dino"], default="yolo",
+                        help="Detector backend (yolo or grounding_dino)")
+    parser.add_argument("--no-visualize", action="store_true", default=False,
+                        help="Skip rendering nav_history video after the run")
+    parser.add_argument("--viz-output", type=str, default="./figs/nav_history.mp4",
+                        help="Output path for the post-run navigation video")
+    parser.add_argument("--viz-fps", type=int, default=5,
+                        help="FPS for the post-run navigation video")
     args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -290,5 +383,10 @@ if __name__ == "__main__":
     cfg = Config("config/config.yaml")
     if args.query is not None:
         cfg.target_query = args.query
+    cfg.ig_source = args.ig_source
+    cfg.detector = args.detector
 
-    run(cfg, save_enabled=not args.no_save)
+    run(cfg, save_enabled=not args.no_save,
+        visualize=not args.no_visualize,
+        viz_output=args.viz_output,
+        viz_fps=args.viz_fps)

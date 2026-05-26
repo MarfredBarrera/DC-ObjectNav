@@ -13,7 +13,7 @@ class Config:
         """
         # Visualization
         self.viz_interval = 500
-        self.vmax_epi = 0.002
+        self.vmax_epi = 0.25
         # Set all default values first
         # Paths
         self.output_dir = "/workspace/DCON/output/current_scene"
@@ -89,10 +89,10 @@ class Config:
         self.hash_inference_batch_size = 16384
         self.hash_replay_buffer_size = 10  # legacy: still used by offline.py's own buffer
         self.hash_buffer_refresh_interval = 200
-        self.hash_per_frame_cache_size = 8192
+        self.hash_per_frame_cache_size = 8192*4
         # Flat history buffer: bounded ring of (pt, feat) rows. Memory cost is
         # capacity * (3 + hash_feature_dim) * 4 bytes (~412MB at 200k & 512-dim).
-        self.history_buffer_capacity = 200_000
+        self.history_buffer_capacity = 500_000
         self.hash_train_every_n_steps = 1
         self.hash_warmup_steps = 0
 
@@ -107,19 +107,15 @@ class Config:
         self.mppi_dt = 0.5
         self.mppi_w_sign = -1.0  # flip if Habitat ω rotates opposite of MPPI's heading convention
         self.mppi_max_w_rps = 2.0  # rad/s clamp — prevents huge spins from sharp A* turns
-        self.mppi_min_v_mps = 0.0
+        self.mppi_min_v_mps = 0.05
         self.mppi_max_v_mps = 1.0
 
         # MPPI exploration→exploitation schedule. progress=0 uses *_start,
         # progress=1 uses *_end, linearly interpolated.
-        self.mppi_lambda_start = 1.0     # softmax temperature: high = flatter weights, wider sampling
-        self.mppi_lambda_end = 1.0
-        self.mppi_w_ig_start = 30.0      # information-gain reward: high = chase uncertainty
-        self.mppi_w_ig_end = 30.0
-        self.mppi_w_goal_start = 0.0     # goal-distance pull: low early = pure IG exploration
-        self.mppi_w_goal_end = 0.0       # bump end value to pull rollouts toward goal late
-        self.mppi_cov_scale_start = 4.0  # scalar on noise covariance: high = explore wider controls
-        self.mppi_cov_scale_end = 4.0
+        self.mppi_lambda = 1.0     # softmax temperature: high = flatter weights, wider sampling
+        self.mppi_w_ig = 30.0      # information-gain reward: high = chase uncertainty
+        self.mppi_w_goal = 0.25     # goal-distance pull: low early = pure IG exploration
+        self.mppi_cov_scale = 4.0  # scalar on noise covariance: high = explore wider controls
 
         # DIAL-MPC dual annealing. Per-(iter, horizon-step) noise scaling
         #   factor(it, h) = exp(-it / (β_traj * N) - (H - h) / (β_action * H))
@@ -136,7 +132,18 @@ class Config:
 
         # Visualization
         self.viz_interval = 1000
-        
+
+        self.detector = "yolo"
+
+        # Detection-based termination. Once `det_score >= detected_conf_threshold`
+        # for `detected_persistence` consecutive replans, latch into DETECTED
+        # mode (IG off, goal pull saturated via goal_confidence=1.0). Terminate
+        # the run when the agent is within `stop_distance_m` of the BEV
+        # similarity peak.
+        self.detected_conf_threshold = 0.5
+        self.detected_persistence = 1
+        self.stop_distance_m = 1.5
+
         # Load from YAML if path provided
         if yaml_path is not None:
             self._load_from_yaml(yaml_path)
@@ -328,3 +335,10 @@ class Config:
             ):
                 if key in planning:
                     setattr(self, key, planning[key])
+
+        # Detection / termination
+        if 'detection' in yaml_data:
+            det = yaml_data['detection']
+            for key in ('detected_conf_threshold', 'detected_persistence', 'stop_distance_m'):
+                if key in det:
+                    setattr(self, key, det[key])

@@ -6,7 +6,7 @@ paths:
   output_name: "model.pt"
 
 habitat:
-  scene_path: "/workspace/DCON/gibson_scenes/Annawan.glb"
+  scene_path: "/workspace/DCON/gibson_scenes/Cantwell.glb"
   img_width: 512
   img_height: 512
   fov: 90
@@ -22,7 +22,7 @@ semantics:
 
 # Training Settings
 training:
-  iterations: 50000
+  iterations: 100000
   device: "cuda"
   gpu_indices: "6"
   near_plane: 0.01
@@ -92,3 +92,8 @@ grid:
 planning:
   mppi_dt: 0.1
   mppi_w_sign: -1.0
+
+detection:
+  detected_conf_threshold: 0.4  # det_score required to latch DETECTED
+  detected_persistence: 2       # consecutive replans above threshold to latch
+  stop_distance_m: 1.0          # terminate within this distance of sim peak

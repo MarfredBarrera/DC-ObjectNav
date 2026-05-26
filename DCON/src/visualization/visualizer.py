@@ -152,7 +152,8 @@ class Visualizer:
 
     def render_combined_grid(self, maps_dict, extent, agent_trail=None, ref_traj_world=None,
                              opt_traj_world=None, current_pos=None, current_heading=0.0,
-                             step=None, save_path=None, avg_cost=None, current_cost=None):
+                             step=None, save_path=None, avg_cost=None, current_cost=None,
+                             det_conf=None):
         """
         Renders a diagnostic grid of maps with trajectory overlays:
         [RGB, ViewSim]
@@ -214,6 +215,10 @@ class Visualizer:
             title = f"Agent View (Step {step})" if step is not None else "Agent View"
             ax_rgb.set_title(title)
             ax_rgb.axis('off')
+            if det_conf is not None:
+                ax_rgb.text(0.5, -0.04, f"Detection confidence: {det_conf:.3f}",
+                            transform=ax_rgb.transAxes, ha='center', va='top',
+                            fontsize=10)
         
         # 1. View Similarity (2D)
         sim2d = maps_dict.get('sim2d')
@@ -228,7 +233,7 @@ class Visualizer:
         # 2. Uncertainty
         epi = maps_dict.get('epi')
         if epi is not None:
-            im3 = ax_epi.imshow(epi, cmap=self.unc_cmap, origin='lower', extent=extent, vmin=0, vmax=self.cfg.vmax_epi)
+            im3 = ax_epi.imshow(epi, cmap=self.unc_cmap, origin='lower', extent=extent,vmin=0,vmax=self.cfg.vmax_epi)
             ax_epi.set_title("Epistemic Uncertainty")
             plt.colorbar(im3, ax=ax_epi, fraction=0.046, pad=0.02, shrink=0.7)
             _overlays(ax_epi)
