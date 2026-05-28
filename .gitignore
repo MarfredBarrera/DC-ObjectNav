@@ -1,6 +1,7 @@
 # Ignore embedded git repositories
 gsplat/
 habitat-lab/
+figs/
 .vscode/
 .ckpt
 .pth

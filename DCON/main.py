@@ -32,10 +32,12 @@ from src.habitat.habitat_utils import (
     get_scene_bounds_from_pathfinder,
     init_simulator,
     spawn_agent_at_random_navpoint,
+    spawn_agent_at_pos
 )
 from src.habitat.sim_interface import SimInterface
 from src.perception.obj_detection import make_detector
 from src.perception.perception_stack import PerceptionStack
+from src.perception.utils import unprojection
 from src.planning.mppi import MPPIPlanner
 from src.planning.utils import normalize_sim
 from visualize import render_navigation
@@ -71,7 +73,101 @@ def _to_numpy(maybe_tensor):
     return maybe_tensor
 
 
-def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max: int = 5, progress: float = 0.0, detected: bool = False):
+def bev_cells_from_sim_pixels(perception, cfg, intrinsics, rgb, depth, c2w,
+                              target_query, top_frac=0.05, min_pixels=50):
+    """BEV cells from the top-K% most target-similar pixels in the current frame.
+
+    Robust alternative to `bev_cells_from_det_box`. At distance the detector
+    tends to bracket a generous region of wall/floor around the target, and
+    unprojecting *every* in-box pixel smears those background cells into the
+    goal region. Per-pixel CLIP similarity is much sharper: pixels actually
+    on the object score higher than adjacent background. We unproject only
+    the top-K% (constrained to valid depth) and use those BEV cells as the
+    goal-search region.
+
+    `top_frac`: fraction of valid pixels to keep. 0.05 = top 5%.
+    `min_pixels`: floor on the count so very sparse views still produce a
+                  usable mask.
+    """
+    if depth is None or c2w is None or rgb is None or not target_query:
+        return None
+    rgb_gpu = rgb.to(perception.device)
+    depth_gpu = depth.to(perception.device)
+
+    # Per-pixel similarity to the target text. feats and text_embed are both
+    # L2-normalized inside MaskCLIPSemantics, so the dot product is cosine.
+    feats = perception.mask_clip.extract_dense_features(rgb_gpu)  # (H, W, 512)
+    text_embed = perception.mask_clip.encode_text(target_query)   # (1, 512)
+    sim_2d = (feats @ text_embed.T).squeeze(-1)                   # (H, W) in [-1, 1]
+
+    depth_mask = (depth_gpu > cfg.min_sensor_dist) & (depth_gpu < cfg.max_sensor_dist)
+    if not bool(depth_mask.any()):
+        return None
+    sim_in_valid = sim_2d[depth_mask]
+    n_valid = int(sim_in_valid.numel())
+    if n_valid == 0:
+        return None
+    k = max(min_pixels, int(top_frac * n_valid))
+    k = min(k, n_valid)
+    thresh = torch.topk(sim_in_valid, k).values.min()
+    mask = (sim_2d >= thresh) & depth_mask
+    if not bool(mask.any()):
+        return None
+
+    world_points = unprojection(
+        depth_gpu, intrinsics, c2w.to(perception.device), perception.device, mask=mask,
+    )
+    if world_points.shape[0] == 0:
+        return None
+
+    sg = perception.similarity_grid
+    z_idx = ((world_points[:, 2] - sg.min_z) / cfg.voxel_resolution).long().clamp(0, sg.num_z - 1)
+    x_idx = ((world_points[:, 0] - sg.min_x) / cfg.voxel_resolution).long().clamp(0, sg.num_x - 1)
+    cell_mask = torch.zeros((sg.num_z, sg.num_x), dtype=torch.bool, device=perception.device)
+    cell_mask[z_idx, x_idx] = True
+    return cell_mask.cpu().numpy()
+
+
+def bev_cells_from_det_box(perception, cfg, intrinsics, det_box, depth, c2w):
+    """BEV (z_idx, x_idx) cells that the pixels inside `det_box` project to.
+
+    Returns a boolean numpy array of shape (num_z, num_x), or None if the box
+    is missing / yields no valid depth pixels. Used to constrain goal
+    selection in EXPLOIT mode: instead of the global argmax of bev_sim, we
+    take the argmax only over cells that actually correspond to the detected
+    object in the current frame.
+    """
+    if det_box is None or depth is None or c2w is None:
+        return None
+    xmin, ymin, xmax, ymax = det_box
+    depth_gpu = depth.to(perception.device)
+    H_d, W_d = depth_gpu.shape[-2:]
+    yy, xx = torch.meshgrid(
+        torch.arange(H_d, device=perception.device),
+        torch.arange(W_d, device=perception.device),
+        indexing='ij',
+    )
+    box_mask = (xx >= int(xmin)) & (xx <= int(xmax)) & (yy >= int(ymin)) & (yy <= int(ymax))
+    depth_mask = (depth_gpu > cfg.min_sensor_dist) & (depth_gpu < cfg.max_sensor_dist)
+    mask = box_mask & depth_mask
+    if not bool(mask.any()):
+        return None
+    world_points = unprojection(depth_gpu, intrinsics, c2w.to(perception.device), perception.device, mask=mask)
+    if world_points.shape[0] == 0:
+        return None
+    sg = perception.similarity_grid
+    z_idx = ((world_points[:, 2] - sg.min_z) / cfg.voxel_resolution).long().clamp(0, sg.num_z - 1)
+    x_idx = ((world_points[:, 0] - sg.min_x) / cfg.voxel_resolution).long().clamp(0, sg.num_x - 1)
+    cell_mask = torch.zeros((sg.num_z, sg.num_x), dtype=torch.bool, device=perception.device)
+    cell_mask[z_idx, x_idx] = True
+    return cell_mask.cpu().numpy()
+
+
+def plan_one_action(perception, sim_iface, mppi, cfg,
+                    action_queue: deque, k_max: int = 5,
+                    progress: float = 0.0, det_score: float = 0.0,
+                    detected: bool = False, det_box=None, rgb=None, depth=None, c2w=None,
+                    last_box_goal=None):
     """Run MPPI from current pose and return (action, ref_traj, opt_traj).
 
     action is [v_mps, w_rad_per_s] or None if idling.
@@ -82,9 +178,10 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
     If every A* goal is unreachable the queue is consumed so the agent keeps
     moving.
 
-    `detected=True` switches MPPI into exploit mode by pinning
-    `goal_confidence=1.0`, which saturates the goal pull and zeroes the IG
-    term via the existing `w_conf` curve.
+    `det_score` is the raw detector confidence for the current frame, used as
+    `goal_confidence` in SEARCH mode (MPPI's threshold + hysteresis filter
+    noisy detections). `detected=True` overrides it with goal_confidence=1.0,
+    saturating the conf curve so `w_ig_conf = 0` and IG is hard-off.
     """
     bev_sim = _to_numpy(perception.similarity_grid.get_2d_map(min_y=0.1, max_y=1.5))
     bev_epi = _to_numpy(perception.ugrid.get_2d_map(type='epistemic'))
@@ -92,7 +189,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
 
     if bev_sim is None or bev_epi is None or bev_occ is None:
         print("  plan: missing map(s); idling")
-        return (action_queue.popleft() if action_queue else None), None, None, None
+        return (action_queue.popleft() if action_queue else None), None, None, None, None, None
 
     pos = sim_iface.agent_position
     heading = get_agent_heading(sim_iface.agent)
@@ -104,13 +201,41 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
     # so the planner can commit instead of orbiting.
     sim_for_goal = bev_sim.copy().astype(np.float32)
     sim_for_goal[bev_occ == 0] = -np.inf  # exclude unseen
-    if not np.any(np.isfinite(sim_for_goal)):
-        print("  plan: no observed cells, can't pick a goal")
-        return (action_queue.popleft() if action_queue else None), None, None, None
-    flat_idx = int(np.argmax(sim_for_goal))
+    # Goal selection priority:
+    #   1. Detection box this frame → argmax of bev_sim restricted to BEV cells
+    #      the box projects to.
+    #   2. No box this frame, but a previous box-derived goal is cached →
+    #      reuse that fixed world cell so the agent commits to the last
+    #      sighting instead of chasing a far-away similarity peak.
+    #   3. Otherwise → global argmax of observed bev_sim (exploration).
+    goal = None
+    box_goal = None  # None unless THIS frame's detection produced a fresh goal
     H, W = sim_for_goal.shape
-    goal = (flat_idx // W, flat_idx % W)
-    goal_confidence = 1.0 if detected else float(bev_sim[goal[0], goal[1]])
+    # Detector presence triggers the constrained search; the actual BEV
+    # region comes from the top-K% most-target-similar pixels in the frame
+    # (not the raw box, which can be loose at distance).
+    if det_box is not None:
+        det_cells = bev_cells_from_sim_pixels(
+            perception, cfg, sim_iface.intrinsics,
+            rgb, depth, c2w, perception.target_query,
+        )
+        if det_cells is not None and det_cells.any():
+            sim_for_goal[~det_cells] = -np.inf
+            if np.any(np.isfinite(sim_for_goal)):
+                flat_idx = int(np.argmax(sim_for_goal))
+                goal = (flat_idx // W, flat_idx % W)
+                box_goal = goal
+    if goal is None and last_box_goal is not None:
+        gz, gx = int(last_box_goal[0]), int(last_box_goal[1])
+        if 0 <= gz < H and 0 <= gx < W:
+            goal = (gz, gx)
+    if goal is None:
+        if not np.any(np.isfinite(sim_for_goal)):
+            print("  plan: no observed cells, can't pick a goal")
+            return (action_queue.popleft() if action_queue else None), None, None, None, None, None
+        flat_idx = int(np.argmax(sim_for_goal))
+        goal = (flat_idx // W, flat_idx % W)
+    goal_confidence = 1.0 if detected else float(det_score)
 
     opt_path, U_opt = mppi.optimize_trajectory(
         start_grid, goal, bev_epi, bev_occ,
@@ -129,7 +254,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
         # geometry that makes the next replan more likely to find a safe plan.
         print("  plan: MPPI returned no safe control sequence, replanning")
         action_queue.clear()
-        return [0.0, -np.pi/4], None, None, None
+        return [0.0, -np.pi/4], None, None, None, goal, box_goal
 
     # Successful plan: replace queue with full MPPI control sequence.
     # MPPI U units: v in [grid cells / mppi_step], w in [rad / mppi_step].
@@ -139,7 +264,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg, action_queue: deque, k_max
         v_mps = float(U_opt[i, 0]) * cfg.voxel_resolution / cfg.mppi_dt
         w_rps = cfg.mppi_w_sign * float(U_opt[i, 1]) / cfg.mppi_dt
         action_queue.append([v_mps, w_rps])
-    return action_queue.popleft(), None, opt_path, mppi_score
+    return action_queue.popleft(), None, opt_path, mppi_score, goal, box_goal
 
 
 def run(cfg: Config, save_enabled: bool = True,
@@ -150,6 +275,7 @@ def run(cfg: Config, save_enabled: bool = True,
         cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov, sensor_height=cfg.sensor_height,
     )
     spawn_agent_at_random_navpoint(sim, agent)
+    # spawn_agent_at_pos(sim, agent, [0.0, 0.0, 0.0])
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)
@@ -227,6 +353,14 @@ def run(cfg: Config, save_enabled: bool = True,
     detected = False
     detected_streak = 0
 
+    # Best goal cell derived from a detection bounding box so far, with its
+    # detector confidence. Persists across replans so a missing detection
+    # this frame doesn't drop the agent back to global-argmax exploration.
+    # Only overwritten when a NEW detection beats `last_box_conf` — a noisy
+    # low-conf detection can't displace an earlier strong sighting.
+    last_box_goal = None
+    last_box_conf = -1.0
+
     # Tracks the last step actually executed by the loop. Used to cap the
     # post-run visualization so it doesn't pull in stale .npy snapshots left
     # over from a previous, longer run (traj_log.jsonl is truncated each run,
@@ -245,7 +379,7 @@ def run(cfg: Config, save_enabled: bool = True,
             heading = get_agent_heading(sim_iface.agent)
             progress = step / max(1, cfg.iterations)
 
-            rgb_cur, _, _ = perception.observe(sim_iface)
+            rgb_cur, depth_cur, c2w_cur = perception.observe(sim_iface)
             det_score, det_box = detector.detect(rgb_cur, perception.target_query)
 
             # Latch into DETECTED once we get `detected_persistence` consecutive
@@ -260,20 +394,37 @@ def run(cfg: Config, save_enabled: bool = True,
                     print(f"step {step}: DETECTED — entering exploit mode "
                           f"(det_score={det_score:.3f})")
 
-            action, ref_traj, opt_traj, score = plan_one_action(
+            action, ref_traj, opt_traj, score, goal_cell, box_goal = plan_one_action(
                 perception, sim_iface, mppi, cfg, action_queue,
-                progress=progress, detected=detected,
+                progress=progress, det_score=det_score, detected=detected,
+                det_box=det_box, rgb=rgb_cur, depth=depth_cur, c2w=c2w_cur,
+                last_box_goal=last_box_goal,
             )
+            # Cache only when THIS frame's box yielded a valid goal AND its
+            # confidence beats the best we've seen. Fallback paths (cached /
+            # global argmax) return goal_cell but leave box_goal=None, so they
+            # never touch the cache.
+            if box_goal is not None and det_score > last_box_conf:
+                last_box_goal = box_goal
+                last_box_conf = float(det_score)
+                print(f"  cached new goal {box_goal} (conf {det_score:.3f})")
+            det_backend = detector.backend_for(perception.target_query)
+            mode = 'EXPLOIT' if detected else 'SEARCH'
+            w_conf = float(getattr(mppi, 'last_w_conf', 0.0))
+            goal_str = f"({goal_cell[0]},{goal_cell[1]})" if goal_cell is not None else "—"
             if action is not None:
                 sim_iface.step(action, dt=cfg.mppi_dt)
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | "
                       f"action [v={action[0]:+.3f} m/s, w={action[1]:+.3f} rad/s] | "
-                      f"position: {pos[0]:.2f}, {pos[2]:.2f} | det_conf: {det_score:.3f} | "
-                      f"mode: {'EXPLOIT' if detected else 'SEARCH'}")
+                      f"position: {pos[0]:.2f}, {pos[2]:.2f} | "
+                      f"det[{det_backend}]: {det_score:.3f} | "
+                      f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
+                      f"mode: {mode}")
             else:
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | no action | "
-                      f"det_conf: {det_score:.3f} | "
-                      f"mode: {'EXPLOIT' if detected else 'SEARCH'}")
+                      f"det[{det_backend}]: {det_score:.3f} | "
+                      f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
+                      f"mode: {mode}")
 
             # Termination check: in DETECTED mode, compute distance from agent
             # to BEV similarity peak. Stop after the traj_log write below so the
@@ -285,6 +436,13 @@ def run(cfg: Config, save_enabled: bool = True,
                 if bev_sim is not None and bev_occ is not None:
                     sim_for_goal = bev_sim.astype(np.float32).copy()
                     sim_for_goal[bev_occ == 0] = -np.inf
+                    if det_box is not None:
+                        det_cells = bev_cells_from_sim_pixels(
+                            perception, cfg, sim_iface.intrinsics,
+                            rgb_cur, depth_cur, c2w_cur, perception.target_query,
+                        )
+                        if det_cells is not None and det_cells.any():
+                            sim_for_goal[~det_cells] = -np.inf
                     if np.any(np.isfinite(sim_for_goal)):
                         H_g, W_g = sim_for_goal.shape
                         flat_idx = int(np.argmax(sim_for_goal))
@@ -311,6 +469,9 @@ def run(cfg: Config, save_enabled: bool = True,
                     'mppi_cost': cost,
                     'det_conf': float(det_score),
                     'det_box': [float(v) for v in det_box] if det_box is not None else None,
+                    'goal': [int(goal_cell[0]), int(goal_cell[1])] if goal_cell is not None else None,
+                    'mode': mode,
+                    'w_conf': w_conf,
                 }) + '\n')
 
             if stop_now:
@@ -368,8 +529,12 @@ if __name__ == "__main__":
                         help="Skip saving BEV maps to disk during the live loop")
     parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic"], default="epistemic",
                         help="Information gain source for MPPI (unseen or epistemic)")
-    parser.add_argument("--detector", type=str, choices=["yolo", "grounding_dino"], default="yolo",
-                        help="Detector backend (yolo or grounding_dino)")
+    parser.add_argument("--detector", type=str,
+                        choices=["yolo", "coco_yolo", "hybrid", "grounding_dino"],
+                        default="hybrid",
+                        help="Detector backend: yolo (YOLO-Worldv2), coco_yolo "
+                             "(closed-set YOLOv8), hybrid (COCO→YOLOv8 else "
+                             "YOLO-Worldv2), or grounding_dino")
     parser.add_argument("--no-visualize", action="store_true", default=False,
                         help="Skip rendering nav_history video after the run")
     parser.add_argument("--viz-output", type=str, default="./figs/nav_history.mp4",

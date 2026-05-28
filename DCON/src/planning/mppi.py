@@ -18,6 +18,10 @@ class MPPIPlanner:
         self.horizon_shrink_step = getattr(cfg, "mppi_horizon_shrink_step", 20)
         self.min_horizon = getattr(cfg, "mppi_min_horizon", 10)
         self.current_horizon = self.default_horizon
+        # Latched exploit confidence — hysteresis so a brief detection keeps
+        # the goal-pull engaged after the target falls out of view. Updated
+        # each call as max(incoming, prev * decay).
+        self.exploit_conf = 0.0
 
     def get_highest_sim_goal(self, sim_map, obstacle_val=2, occ_map=None):
         """
@@ -170,23 +174,34 @@ class MPPIPlanner:
         w_goal = self.cfg.mppi_w_goal
         cov_scale = self.cfg.mppi_cov_scale
 
-        # Exploration→exploitation mixing weight, length-agnostic.
-        # lam(progress=0) = 1.0 → pure IG; lam(progress=1) ≈ 0.368.
-        lam = float(np.exp(-float(np.clip(progress, 0.0, 1.0))/2.0))
+        # # Exploration→exploitation mixing weight, length-agnostic.
+        # # lam(progress=0) = 1.0 → pure IG; lam(progress=1) ≈ 0.368.
+        # lam = float(np.exp(-float(np.clip(progress, 0.0, 1.0))/2.0))
 
-        # Detection-confidence weighting. Formula:
-        #   w_conf_norm = (a^confidence - 1) / (a - 1),  confidence in [0, 1]
-        # With a < 1 the curve is concave/saturating — moderate sim values
-        # (~0.3–0.6) already produce near-saturated weight. The boosted
-        # version `w_conf` scales the exploitation term; the IG term is
-        # damped symmetrically by `(1 - w_conf_norm)` so a confident
-        # detection both attracts and silences frontier chasing.
+        # Detection-confidence weighting with hysteresis.
+        #   latch = max(incoming, prev * decay)  → sticks high after a brief detection
+        #   below `threshold`: w_conf = 0 (exploitation hard-off, IG full)
+        #   above:            w_conf = conf_scale * (a^latch - 1)/(a - 1)
+        # With a < 1 the curve is concave/saturating — small post-threshold
+        # values already produce near-full goal pull. IG is damped
+        # symmetrically by `(1 - w_conf_norm)`.
         a_conf = float(getattr(self.cfg, "mppi_conf_weight_a", 0.1))
         conf_scale = float(getattr(self.cfg, "mppi_conf_weight_scale", 100.0))
-        conf = float(np.clip(goal_confidence, 0.0, 1.0))
-        w_conf_norm = (a_conf ** conf - 1.0) / (a_conf - 1.0)
-        w_conf = conf_scale * w_conf_norm
-        w_ig_conf = 1.0 - w_conf_norm
+        conf_decay = float(getattr(self.cfg, "mppi_conf_decay", 0.75))
+        conf_threshold = float(getattr(self.cfg, "mppi_conf_threshold", 0.1))
+        incoming_conf = float(np.clip(goal_confidence, 0.0, 1.0))
+        self.exploit_conf = max(incoming_conf, self.exploit_conf * conf_decay)
+        if self.exploit_conf <= conf_threshold:
+            w_conf = 0.0
+            w_ig_conf = 1.0
+        else:
+            w_conf_norm = (a_conf ** self.exploit_conf - 1.0) / (a_conf - 1.0)
+            w_conf = conf_scale * w_conf_norm
+            w_ig_conf = 1.0 - w_conf_norm
+        # Expose for logging / visualization. Latched exploit confidence (post
+        # decay+ratchet) and the resulting goal-distance weight.
+        self.last_exploit_conf = float(self.exploit_conf)
+        self.last_w_conf = float(w_conf)
 
         if num_iters is None:     num_iters = getattr(self.cfg, "mppi_num_iters", 5)
         # Caller-supplied horizon pins the value (and bypasses adaptive
@@ -329,7 +344,9 @@ class MPPIPlanner:
              # Cost 1: Goal-distance pull, mixed by (1 - lam) so it grows
              # as exploration anneals into exploitation.
              dist_cost = torch.mean(torch.sqrt((Z_samples - goal_z)**2 + (X_samples - goal_x)**2), dim=1)
-             scores -= (1.0 - lam) * w_goal * w_conf * dist_cost
+            #  scores -= (1.0 - lam) * w_goal * w_conf * dist_cost
+             scores -= w_goal * w_conf * dist_cost
+
 
             #  control_cost = torch.mean(torch.sqrt(U_samples[:, :, 0]**2 + U_samples[:, :, 1]**2), dim=1)
             #  scores -= w_control * control_cost
@@ -405,7 +422,9 @@ class MPPIPlanner:
                      intrinsics=intrinsics,
                      sensor_height=sensor_height
                  )
-                 scores[safe_mask] += lam * w_ig_conf * w_ig * batch_ig
+                #  scores[safe_mask] += lam * w_ig_conf * w_ig * batch_ig
+                 scores[safe_mask] += w_ig_conf * w_ig * batch_ig
+
 
              # Hard-exclude colliding rollouts from the final weighting.
              # Without this, when every sample collides (tight spot, thin wall,

@@ -107,14 +107,14 @@ class Config:
         self.mppi_dt = 0.5
         self.mppi_w_sign = -1.0  # flip if Habitat ω rotates opposite of MPPI's heading convention
         self.mppi_max_w_rps = 2.0  # rad/s clamp — prevents huge spins from sharp A* turns
-        self.mppi_min_v_mps = 0.05
+        self.mppi_min_v_mps = 0.0
         self.mppi_max_v_mps = 1.0
 
         # MPPI exploration→exploitation schedule. progress=0 uses *_start,
         # progress=1 uses *_end, linearly interpolated.
         self.mppi_lambda = 1.0     # softmax temperature: high = flatter weights, wider sampling
         self.mppi_w_ig = 30.0      # information-gain reward: high = chase uncertainty
-        self.mppi_w_goal = 0.25     # goal-distance pull: low early = pure IG exploration
+        self.mppi_w_goal = 1.0     # goal-distance pull: low early = pure IG exploration
         self.mppi_cov_scale = 4.0  # scalar on noise covariance: high = explore wider controls
 
         # DIAL-MPC dual annealing. Per-(iter, horizon-step) noise scaling

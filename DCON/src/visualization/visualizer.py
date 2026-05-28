@@ -153,17 +153,29 @@ class Visualizer:
     def render_combined_grid(self, maps_dict, extent, agent_trail=None, ref_traj_world=None,
                              opt_traj_world=None, current_pos=None, current_heading=0.0,
                              step=None, save_path=None, avg_cost=None, current_cost=None,
-                             det_conf=None):
+                             det_conf=None, goal_world=None, goal_cell=None,
+                             mode=None, w_conf=None):
         """
         Renders a diagnostic grid of maps with trajectory overlays:
         [RGB, ViewSim]
         [Uncertainty, Occupancy, BEVSim]
         """
         fig = plt.figure(figsize=(16, 10))
+        title_bits = []
+        if step is not None:
+            title_bits.append(f"Step {step}")
+        if mode is not None:
+            mode_color = {'EXPLOIT': '#c01818', 'SEARCH': '#1860c0'}.get(mode, '#444')
+            title_bits.append(f"Mode: {mode}")
+        if w_conf is not None:
+            title_bits.append(f"w_conf: {w_conf:.2f}")
+        if goal_cell is not None:
+            title_bits.append(f"goal: ({goal_cell[0]},{goal_cell[1]})")
         if avg_cost is not None and current_cost is not None:
-            fig.suptitle(f"Step {step} | Current Cost: {current_cost:.2f} | Avg Cost: {avg_cost:.2f}", fontsize=16)
-        elif step is not None:
-            fig.suptitle(f"Step {step}", fontsize=16)
+            title_bits.append(f"Cost: {current_cost:.2f} (avg {avg_cost:.2f})")
+        if title_bits:
+            fig.suptitle(" | ".join(title_bits), fontsize=14,
+                         color=(mode_color if mode is not None else 'black'))
 
         gs = fig.add_gridspec(2, 3)
         
@@ -198,6 +210,13 @@ class Visualizer:
                 oz = [p[1] for p in opt_traj_world]
                 ax.plot(ox, oz, color='cyan', linewidth=2, alpha=0.9, zorder=5)
                 ax.scatter(ox[-1], oz[-1], marker='*', color='cyan', s=100, zorder=6)
+
+            # Planner-selected goal cell (argmax of constrained similarity).
+            # Distinct from the MPPI rollout endpoint (cyan star).
+            if goal_world is not None:
+                gx, gz = goal_world
+                ax.scatter(gx, gz, marker='X', color='magenta',
+                           edgecolors='black', linewidths=1.2, s=160, zorder=8)
 
             # Current pose arrow
             if current_pos is not None:

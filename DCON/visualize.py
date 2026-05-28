@@ -181,6 +181,14 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         if rgb is not None:
             rgb = annotate_detection(rgb, det_box)
 
+        # Goal cell (z, x) chosen by the planner this step. Convert to world.
+        goal_cell = current_entry.get('goal') if current_entry else None
+        goal_world = g2w(goal_cell[0], goal_cell[1]) if goal_cell else None
+
+        # Planner mode (SEARCH/EXPLOIT) and current exploit weight.
+        mode = (current_entry.get('mode') if current_entry else None) or 'SEARCH'
+        w_conf = float(current_entry.get('w_conf', 0.0) or 0.0) if current_entry else 0.0
+
         maps_dict = {'occ': occ, 'sim': sim, 'epi': epi, 'rgb': rgb, 'sim2d': sim2d}
         
         # Optional: compute CombinedZ if we want to match analysis.py perfectly
@@ -197,6 +205,8 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
             step=map_step,
             avg_cost=avg_cost, current_cost=current_cost,
             det_conf=det_conf,
+            goal_world=goal_world, goal_cell=goal_cell,
+            mode=mode, w_conf=w_conf,
         )
         frames.append(viz.fig_to_numpy(fig))
         plt.close(fig)
