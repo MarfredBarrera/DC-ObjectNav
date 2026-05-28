@@ -111,6 +111,11 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
     cap = cfg.iterations if max_step is None else int(max_step)
     map_steps = [s for s in range(0, cap + 1, cfg.viz_interval)]
 
+    # Always include the run's final step (main.py snapshots aligned maps at
+    # last_step before exiting), even if it isn't a viz_interval tick.
+    if cap not in map_steps:
+        map_steps.append(cap)
+
     # Filter to only those that actually exist on disk
     map_steps = [s for s in map_steps if os.path.exists(os.path.join(output_dir, "umaps", f"bev_epistemic_uncertainty_{s}.npy"))]
 

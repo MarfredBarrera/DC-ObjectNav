@@ -74,16 +74,19 @@ def _to_numpy(maybe_tensor):
 
 
 def bev_cells_from_sim_pixels(perception, cfg, intrinsics, rgb, depth, c2w,
-                              target_query, top_frac=0.05, min_pixels=50):
-    """BEV cells from the top-K% most target-similar pixels in the current frame.
+                              target_query, det_box=None, expand_factor=2.0,
+                              top_frac=0.05, min_pixels=50):
+    """BEV cells from the top-K% most target-similar pixels around the detection.
 
-    Robust alternative to `bev_cells_from_det_box`. At distance the detector
-    tends to bracket a generous region of wall/floor around the target, and
-    unprojecting *every* in-box pixel smears those background cells into the
-    goal region. Per-pixel CLIP similarity is much sharper: pixels actually
-    on the object score higher than adjacent background. We unproject only
-    the top-K% (constrained to valid depth) and use those BEV cells as the
-    goal-search region.
+    The detector's box at distance is often *almost right* — frequently offset
+    by ~one box-length from the actual object — so trusting its exact pixels
+    smears wall/floor into the goal region. We instead build an expanded
+    search window (`expand_factor` × box dims, centered on the box) and pick
+    the top-K% of CLIP-similar pixels within it. That forgives offset error
+    while still anchoring to where the detector thinks the object is.
+
+    If `det_box` is None or `expand_factor <= 0`, the search runs over the
+    full frame (no spatial constraint).
 
     `top_frac`: fraction of valid pixels to keep. 0.05 = top 5%.
     `min_pixels`: floor on the count so very sparse views still produce a
@@ -93,6 +96,7 @@ def bev_cells_from_sim_pixels(perception, cfg, intrinsics, rgb, depth, c2w,
         return None
     rgb_gpu = rgb.to(perception.device)
     depth_gpu = depth.to(perception.device)
+    H_d, W_d = depth_gpu.shape[-2:]
 
     # Per-pixel similarity to the target text. feats and text_embed are both
     # L2-normalized inside MaskCLIPSemantics, so the dot product is cosine.
@@ -100,17 +104,34 @@ def bev_cells_from_sim_pixels(perception, cfg, intrinsics, rgb, depth, c2w,
     text_embed = perception.mask_clip.encode_text(target_query)   # (1, 512)
     sim_2d = (feats @ text_embed.T).squeeze(-1)                   # (H, W) in [-1, 1]
 
+    # Spatial window: expanded box around the detection, clipped to image.
+    region_mask = torch.ones((H_d, W_d), dtype=torch.bool, device=perception.device)
+    if det_box is not None and expand_factor > 0:
+        xmin, ymin, xmax, ymax = det_box
+        cx, cy = 0.5 * (xmin + xmax), 0.5 * (ymin + ymax)
+        bw, bh = (xmax - xmin), (ymax - ymin)
+        ew, eh = bw * expand_factor, bh * expand_factor
+        ex0 = int(max(0, np.floor(cx - ew / 2.0)))
+        ex1 = int(min(W_d, np.ceil(cx + ew / 2.0)))
+        ey0 = int(max(0, np.floor(cy - eh / 2.0)))
+        ey1 = int(min(H_d, np.ceil(cy + eh / 2.0)))
+        if ex1 <= ex0 or ey1 <= ey0:
+            return None
+        region_mask = torch.zeros((H_d, W_d), dtype=torch.bool, device=perception.device)
+        region_mask[ey0:ey1, ex0:ex1] = True
+
     depth_mask = (depth_gpu > cfg.min_sensor_dist) & (depth_gpu < cfg.max_sensor_dist)
-    if not bool(depth_mask.any()):
+    valid = depth_mask & region_mask
+    if not bool(valid.any()):
         return None
-    sim_in_valid = sim_2d[depth_mask]
+    sim_in_valid = sim_2d[valid]
     n_valid = int(sim_in_valid.numel())
     if n_valid == 0:
         return None
     k = max(min_pixels, int(top_frac * n_valid))
     k = min(k, n_valid)
     thresh = torch.topk(sim_in_valid, k).values.min()
-    mask = (sim_2d >= thresh) & depth_mask
+    mask = (sim_2d >= thresh) & valid
     if not bool(mask.any()):
         return None
 
@@ -218,6 +239,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
         det_cells = bev_cells_from_sim_pixels(
             perception, cfg, sim_iface.intrinsics,
             rgb, depth, c2w, perception.target_query,
+            det_box=det_box,
         )
         if det_cells is not None and det_cells.any():
             sim_for_goal[~det_cells] = -np.inf
@@ -411,7 +433,13 @@ def run(cfg: Config, save_enabled: bool = True,
             det_backend = detector.backend_for(perception.target_query)
             mode = 'EXPLOIT' if detected else 'SEARCH'
             w_conf = float(getattr(mppi, 'last_w_conf', 0.0))
-            goal_str = f"({goal_cell[0]},{goal_cell[1]})" if goal_cell is not None else "—"
+            if goal_cell is not None:
+                sg = perception.similarity_grid
+                goal_x_m = sg.min_x + goal_cell[1] * cfg.voxel_resolution
+                goal_z_m = sg.min_z + goal_cell[0] * cfg.voxel_resolution
+                goal_str = f"({goal_x_m:+.2f}, {goal_z_m:+.2f})m"
+            else:
+                goal_str = "—"
             if action is not None:
                 sim_iface.step(action, dt=cfg.mppi_dt)
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | "
@@ -440,6 +468,7 @@ def run(cfg: Config, save_enabled: bool = True,
                         det_cells = bev_cells_from_sim_pixels(
                             perception, cfg, sim_iface.intrinsics,
                             rgb_cur, depth_cur, c2w_cur, perception.target_query,
+                            det_box=det_box,
                         )
                         if det_cells is not None and det_cells.any():
                             sim_for_goal[~det_cells] = -np.inf
@@ -508,6 +537,23 @@ def run(cfg: Config, save_enabled: bool = True,
 
         # if step % 100 == 0:
         #     print(f"  step {step:05d} | loss {loss:.5f} | t {time.time()-start_time:.1f}s")
+
+    # Snapshot maps + RGB + 2D-sim aligned to last_step so the visualizer's
+    # final frame is up-to-date. The C cadence only fires every refresh
+    # interval, and early termination via `stop_now` can leave it 100+ steps
+    # behind the actual last action. Skipped when last_step already matches
+    # the most recent refresh tick — same files would just be overwritten.
+    if save_enabled and last_step % cfg.hash_buffer_refresh_interval != 0:
+        print(f"[main] saving final maps at step {last_step}...")
+        rgb_f, depth_f, c2w_f = perception.observe(sim_iface)
+        perception.update_replay_buffer(rgb_f, depth_f, c2w_f, sim_iface.intrinsics)
+        perception.update_occupancy(depth_f, c2w_f, sim_iface.intrinsics)
+        rgb_dir = os.path.join(cfg.output_dir, "rgbs")
+        os.makedirs(rgb_dir, exist_ok=True)
+        rgb_img = (rgb_f.numpy() * 255).astype(np.uint8)
+        imageio.imwrite(os.path.join(rgb_dir, f"rgb_{last_step:03d}.png"), rgb_img)
+        perception.save_2d_similarity(last_step, depth_f, c2w_f, sim_iface.intrinsics)
+        perception.update_maps(step=last_step, save_enabled=True)
 
     perception.save_models()
     sim.close()

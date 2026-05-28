@@ -169,8 +169,8 @@ class Visualizer:
             title_bits.append(f"Mode: {mode}")
         if w_conf is not None:
             title_bits.append(f"w_conf: {w_conf:.2f}")
-        if goal_cell is not None:
-            title_bits.append(f"goal: ({goal_cell[0]},{goal_cell[1]})")
+        if goal_world is not None:
+            title_bits.append(f"goal: ({goal_world[0]:+.2f}, {goal_world[1]:+.2f})m")
         if avg_cost is not None and current_cost is not None:
             title_bits.append(f"Cost: {current_cost:.2f} (avg {avg_cost:.2f})")
         if title_bits:
@@ -284,9 +284,15 @@ class Visualizer:
             plt.colorbar(im_overlay, ax=ax_overlay, fraction=0.046, pad=0.02, shrink=0.7)
             _overlays(ax_overlay)
 
+        # 1-metre gridlines so distances are readable at a glance.
+        x_ticks = np.arange(np.ceil(min_x), np.floor(max_x) + 1, 1.0)
+        z_ticks = np.arange(np.ceil(min_z), np.floor(max_z) + 1, 1.0)
         for ax in [ax_epi, ax_occ, ax_sim, ax_overlay]:
             ax.set_xlabel('X (m)')
             ax.set_ylabel('Z (m)')
+            ax.set_xticks(x_ticks)
+            ax.set_yticks(z_ticks)
+            ax.tick_params(axis='both', labelsize=8)
             ax.grid(True, alpha=0.3, linestyle='--')
 
         plt.subplots_adjust(hspace=0.3, wspace=0.3)

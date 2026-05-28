@@ -345,16 +345,16 @@ if __name__ == "__main__":
     import sys
     backend = sys.argv[1] if len(sys.argv) > 1 else "yolo"
     detector = make_detector(backend, device="cuda" if torch.cuda.is_available() else "cpu")
-    image_path = "./output/current_scene/rgbs/rgb_13000.png"
+    image_path = "./output/current_scene/rgbs/rgb_60000.png"
     image = Image.open(image_path)
 
     # Warm up: first call pays for kernel compile + text embed.
-    detector.detect(image, "a small green potted plant")
+    detector.detect(image, "shower")
 
     N = 10
     t0 = time.time()
     for _ in range(N):
-        score, box = detector.detect(image, "a small green potted plant")
+        score, box = detector.detect(image, "shower")
     print(f"[{backend}] per-call (warmed): {(time.time() - t0) / N * 1000:.1f} ms")
 
     if box is None:
