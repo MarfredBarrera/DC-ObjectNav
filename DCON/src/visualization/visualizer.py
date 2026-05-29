@@ -157,8 +157,8 @@ class Visualizer:
                              mode=None, w_conf=None):
         """
         Renders a diagnostic grid of maps with trajectory overlays:
-        [RGB, ViewSim]
-        [Uncertainty, Occupancy, BEVSim]
+        [RGB, _, BEVSim]
+        [Uncertainty, Occupancy, Uncertainty+Occupancy]
         """
         fig = plt.figure(figsize=(16, 10))
         title_bits = []
@@ -178,14 +178,17 @@ class Visualizer:
                          color=(mode_color if mode is not None else 'black'))
 
         gs = fig.add_gridspec(2, 3)
-        
-        # We will use 6 axes
+
+        # Top row: RGB on the left, BEV similarity on the right (promoted
+        # from the bottom-right). The top-middle cell is intentionally empty
+        # (used to hold View Similarity; removed). Bottom row keeps the
+        # three BEV maps, with the Uncertainty+Occupancy overlay swapped in
+        # at the bottom-right where BEV similarity used to live.
         ax_rgb = fig.add_subplot(gs[0, 0])
-        ax_sim2d = fig.add_subplot(gs[0, 1])
-        ax_overlay = fig.add_subplot(gs[0, 2])
+        ax_sim = fig.add_subplot(gs[0, 2])
         ax_epi = fig.add_subplot(gs[1, 0])
         ax_occ = fig.add_subplot(gs[1, 1])
-        ax_sim = fig.add_subplot(gs[1, 2])
+        ax_overlay = fig.add_subplot(gs[1, 2])
         
         min_x, max_x, min_z, max_z = extent
         arrow_len = (max_x - min_x) * 0.05
@@ -239,17 +242,7 @@ class Visualizer:
                             transform=ax_rgb.transAxes, ha='center', va='top',
                             fontsize=10)
         
-        # 1. View Similarity (2D)
-        sim2d = maps_dict.get('sim2d')
-        if sim2d is not None:
-            s2d = self.normalize_sim(sim2d)
-            s2d = self.apply_temperature(s2d, 0.5)
-            im1 = ax_sim2d.imshow(s2d, cmap=self.sim_cmap, vmin=0, vmax=1)
-            ax_sim2d.set_title("View Similarity")
-            plt.colorbar(im1, ax=ax_sim2d, fraction=0.046, pad=0.02, shrink=0.7)
-            ax_sim2d.axis('off')
-
-        # 2. Uncertainty
+        # 1. Uncertainty
         epi = maps_dict.get('epi')
         if epi is not None:
             im3 = ax_epi.imshow(epi, cmap=self.unc_cmap, origin='lower', extent=extent,vmin=0,vmax=self.cfg.vmax_epi)

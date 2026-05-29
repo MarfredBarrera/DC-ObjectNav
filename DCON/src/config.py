@@ -115,7 +115,10 @@ class Config:
         self.mppi_lambda = 1.0     # softmax temperature: high = flatter weights, wider sampling
         self.mppi_w_ig = 30.0      # information-gain reward: high = chase uncertainty
         self.mppi_w_goal = 1.0     # goal-distance pull: low early = pure IG exploration
-        self.mppi_cov_scale = 4.0  # scalar on noise covariance: high = explore wider controls
+        # Control-noise stddev is anchored to half the actuator limits inside
+        # optimize_trajectory; no scalar knob. Trajectory- and action-level
+        # annealing (mppi_anneal_beta_traj / mppi_anneal_beta_action) shape
+        # the envelope across iters and horizon index.
 
         # DIAL-MPC dual annealing. Per-(iter, horizon-step) noise scaling
         #   factor(it, h) = exp(-it / (β_traj * N) - (H - h) / (β_action * H))
@@ -127,8 +130,8 @@ class Config:
         # from a known-safe plan and get small perturbation; tail steps are
         # zero-padded and explore widely.
         self.mppi_num_iters = 5
-        self.mppi_anneal_beta_traj = 1.0
-        self.mppi_anneal_beta_action = 5.0
+        self.mppi_anneal_beta_traj = 3.0
+        self.mppi_anneal_beta_action = 1.5
 
         # Visualization
         self.viz_interval = 1000
@@ -143,6 +146,29 @@ class Config:
         self.detected_conf_threshold = 0.5
         self.detected_persistence = 1
         self.stop_distance_m = 1.5
+
+        # MobileSAM goal refinement. When the detector fires AND the new
+        # det_score beats the cached one, we re-localize the target by:
+        #   1) running MobileSAM auto-mask-gen on the whole image,
+        #   2) picking the mask with highest mean CLIP-similarity to the
+        #      target query,
+        #   3) projecting that mask's pixels to BEV cells.
+        # Set use_mobile_sam=False to fall back to the old box-based path.
+        # min_clip_sim is a floor on the best mask's CLIP score; below this
+        # we discard the segmentation as not actually the target.
+        self.use_mobile_sam = True
+        self.sam_checkpoint = "SAM_models/mobile_sam.pt"
+        self.sam_points_per_side = 16
+        self.sam_pred_iou_thresh = 0.86
+        self.sam_stability_score_thresh = 0.90
+        self.sam_min_mask_region_area = 200
+        self.sam_min_mask_pixels = 200
+        self.sam_min_clip_sim = 0.18
+        # Visualization-only: when rendering nav_history.mp4, overlay the
+        # most recent saved SAM mask whose step is within this many ticks
+        # of the current viz frame. Larger = more frames get an overlay
+        # but the mask may be stale (from an older viewpoint).
+        self.sam_lookback_steps = 200
 
         # Load from YAML if path provided
         if yaml_path is not None:
@@ -329,7 +355,6 @@ class Config:
                 'mppi_lambda_start', 'mppi_lambda_end',
                 'mppi_w_ig_start', 'mppi_w_ig_end',
                 'mppi_w_goal_start', 'mppi_w_goal_end',
-                'mppi_cov_scale_start', 'mppi_cov_scale_end',
                 'mppi_num_iters',
                 'mppi_anneal_beta_traj', 'mppi_anneal_beta_action',
             ):
@@ -342,3 +367,16 @@ class Config:
             for key in ('detected_conf_threshold', 'detected_persistence', 'stop_distance_m'):
                 if key in det:
                     setattr(self, key, det[key])
+
+        # MobileSAM goal refinement
+        if 'sam' in yaml_data:
+            sam = yaml_data['sam']
+            for key in (
+                'use_mobile_sam', 'sam_checkpoint',
+                'sam_points_per_side', 'sam_pred_iou_thresh',
+                'sam_stability_score_thresh', 'sam_min_mask_region_area',
+                'sam_min_mask_pixels', 'sam_min_clip_sim',
+                'sam_lookback_steps',
+            ):
+                if key in sam:
+                    setattr(self, key, sam[key])

@@ -96,4 +96,4 @@ planning:
 detection:
   detected_conf_threshold: 0.4  # det_score required to latch DETECTED
   detected_persistence: 2       # consecutive replans above threshold to latch
-  stop_distance_m: 0.9          # terminate within this distance of sim peak
+  stop_distance_m: 0.8          # terminate within this distance of sim peak

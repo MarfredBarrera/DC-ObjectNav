@@ -321,6 +321,110 @@ class GroundingDinoDetector:
         return score, box
 
 
+class SamRefinedDetector:
+    """Detector → MobileSAM (whole-image) → CLIP-scored best mask.
+
+    Pipeline (mirrors what `bev_cells_from_sam` does in main.py, minus the
+    BEV projection so it can be tested standalone on a single RGB):
+
+      1. Run a base detector to decide whether the query target is present.
+         If no box clears its threshold, return (0.0, None).
+      2. Run MobileSAM's automatic mask generator on the WHOLE image
+         (no box prompt — at distance the box is often a full box-width
+         off, so anchoring SAM on it propagates the error).
+      3. Score every mask by mean MaskCLIP cosine similarity to ``query``.
+      4. Pick the highest-scoring mask. If it clears ``min_clip_sim``,
+         return that mask's bbox + the CLIP score. Otherwise (0.0, None).
+
+    `detect(image, query)` matches the base interface and returns
+    (score, box) from the refined mask. `detect_with_mask(image, query)`
+    additionally returns the (H, W) bool mask itself — used by the
+    __main__ visualization to overlay the contour.
+    """
+
+    name = "sam_refined"
+
+    def backend_for(self, query: str) -> str:
+        return self.name
+
+    def __init__(
+        self,
+        base_detector,
+        segmenter,
+        mask_clip,
+        device: str = "cuda",
+        min_clip_sim: float = 0.18,
+        min_mask_pixels: int = 200,
+    ):
+        self.base = base_detector
+        self.segmenter = segmenter
+        self.mask_clip = mask_clip
+        self.device = device
+        self.min_clip_sim = float(min_clip_sim)
+        self.min_mask_pixels = int(min_mask_pixels)
+
+    @torch.no_grad()
+    def detect_with_mask(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> Tuple[float, Optional[Tuple[float, float, float, float]], Optional[np.ndarray]]:
+        det_score, det_box = self.base.detect(image, query)
+        if det_box is None or det_score <= 0.0:
+            return 0.0, None, None
+
+        masks = self.segmenter.segment_all(image)
+        if not masks:
+            return 0.0, None, None
+
+        rgb_gpu = _to_float_rgb_tensor(image, self.device)
+        feats = self.mask_clip.extract_dense_features(rgb_gpu)  # (H, W, 512)
+        text_embed = self.mask_clip.encode_text(query)          # (1, 512)
+        sim_2d = (feats @ text_embed.T).squeeze(-1)             # (H, W) in [-1, 1]
+        H, W = sim_2d.shape
+
+        best_score = -float("inf")
+        best_seg = None
+        for m in masks:
+            seg = m["segmentation"]
+            if seg.sum() < self.min_mask_pixels:
+                continue
+            seg_t = torch.from_numpy(seg).to(self.device)
+            if seg_t.shape != (H, W):
+                seg_t = torch.nn.functional.interpolate(
+                    seg_t[None, None].float(), size=(H, W), mode="nearest",
+                )[0, 0].bool()
+            if not bool(seg_t.any()):
+                continue
+            score = float(sim_2d[seg_t].mean())
+            if score > best_score:
+                best_score = score
+                best_seg = seg
+
+        if best_seg is None or best_score < self.min_clip_sim:
+            return 0.0, None, None
+
+        ys, xs = np.where(best_seg)
+        box = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+        return best_score, box, best_seg
+
+    @torch.no_grad()
+    def detect(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
+        score, box, _ = self.detect_with_mask(image, query)
+        return score, box
+
+
+def _to_float_rgb_tensor(image: Union[torch.Tensor, np.ndarray, Image.Image], device: str) -> torch.Tensor:
+    """(H, W, 3) float in [0, 1] on `device` — MaskCLIPSemantics input format."""
+    arr = ObjectDetector._to_uint8(image)
+    t = torch.from_numpy(arr).to(device).float() / 255.0
+    return t
+
+
 def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
     """Factory: pick a detector backend by short name.
 
@@ -338,36 +442,92 @@ def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
         return HybridDetector(device=device, **kwargs)
     if key in ("grounding_dino", "gdino", "groundingdino"):
         return GroundingDinoDetector(device=device, **kwargs)
+    if key in ("sam_refined", "sam"):
+        # Composite: base detector triggers, MobileSAM proposes whole-image
+        # masks, MaskCLIP scores them, best mask wins. Heavy deps imported
+        # lazily so the other branches don't pay the cost.
+        from src.perception.segmentation import MobileSAMSegmenter
+        from src.perception.semantics import MaskCLIPSemantics
+        base_name = kwargs.pop("base", "yolo")
+        sam_checkpoint = kwargs.pop("sam_checkpoint", "SAM_models/mobile_sam.pt")
+        min_clip_sim = float(kwargs.pop("min_clip_sim", 0.18))
+        min_mask_pixels = int(kwargs.pop("min_mask_pixels", 200))
+        maskclip_input_size = int(kwargs.pop("maskclip_input_size", 448))
+        maskclip_model_name = kwargs.pop("maskclip_model_name", "ViT-B/16")
+        base = make_detector(base_name, device=device, **kwargs)
+        segmenter = MobileSAMSegmenter(checkpoint=sam_checkpoint, device=device)
+        mask_clip = MaskCLIPSemantics(
+            device=device, model_name=maskclip_model_name, input_size=maskclip_input_size,
+        )
+        return SamRefinedDetector(
+            base, segmenter, mask_clip, device=device,
+            min_clip_sim=min_clip_sim, min_mask_pixels=min_mask_pixels,
+        )
     raise ValueError(f"Unknown detector backend: {name!r}")
 
 
 if __name__ == "__main__":
+    # Usage:
+    #   python -m src.perception.obj_detection [backend] [query] [image_path]
+    # Examples:
+    #   python -m src.perception.obj_detection yolo "shower"
+    #   python -m src.perception.obj_detection sam_refined "a pillow" output/current_scene/rgbs/rgb_60000.png
+    import os
     import sys
+
     backend = sys.argv[1] if len(sys.argv) > 1 else "yolo"
-    detector = make_detector(backend, device="cuda" if torch.cuda.is_available() else "cpu")
-    image_path = "./output/current_scene/rgbs/rgb_60000.png"
-    image = Image.open(image_path)
+    query = sys.argv[2] if len(sys.argv) > 2 else "shower"
+    image_path = sys.argv[3] if len(sys.argv) > 3 else "./output/current_scene/rgbs/rgb_15900.png"
 
-    # Warm up: first call pays for kernel compile + text embed.
-    detector.detect(image, "shower")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    detector = make_detector(backend, device=device)
+    image = Image.open(image_path).convert("RGB")
 
-    N = 10
+    # Warm up: first call pays for kernel compile + text embed (+ SAM, if used).
+    detector.detect(image, query)
+
+    # SAM auto-gen is ~1s/call so timing 10 is overkill; do 3 for sam_refined.
+    N = 3 if isinstance(detector, SamRefinedDetector) else 10
     t0 = time.time()
     for _ in range(N):
-        score, box = detector.detect(image, "shower")
-    print(f"[{backend}] per-call (warmed): {(time.time() - t0) / N * 1000:.1f} ms")
+        score, box = detector.detect(image, query)
+    print(f"[{backend}] per-call (warmed): {(time.time() - t0) / N * 1000:.1f} ms  (N={N})")
 
     if box is None:
         print("No detection.")
-    else:
-        rounded = tuple(round(v, 2) for v in box)
-        print(f"Detected with confidence {score:.3f} at {rounded}")
+        sys.exit(0)
 
-    # Display image with box
+    rounded = tuple(round(v, 2) for v in box)
+    print(f"Detected with confidence {score:.3f} at {rounded}")
+
     import cv2
-    image = cv2.imread(image_path)
-    cv2.rectangle(image, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 2)
-    cv2.imwrite("./figs/tv_gdino.png", image)
-    # cv2.imshow("Image", image)
-    # cv2.waitKey(0)
-    # cv2.destroyAllWindows()
+    bgr = cv2.imread(image_path)
+
+    if isinstance(detector, SamRefinedDetector):
+        # Compare base-detector box vs. SAM-refined mask side-by-side.
+        base_score, base_box = detector.base.detect(image, query)
+        _, sam_box, mask = detector.detect_with_mask(image, query)
+        if base_box is not None:
+            x0, y0, x1, y1 = (int(v) for v in base_box)
+            cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 0, 255), 2)  # red: base detector
+            cv2.putText(bgr, f"base {base_score:.2f}", (x0, max(0, y0 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+        if sam_box is not None:
+            x0, y0, x1, y1 = (int(v) for v in sam_box)
+            cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 255, 0), 2)  # green: SAM mask bbox
+            cv2.putText(bgr, f"sam {score:.2f}", (x0, min(bgr.shape[0] - 4, y1 + 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        if mask is not None:
+            # Tint the mask region green at 40% so the contour is visible.
+            overlay = bgr.copy()
+            overlay[mask] = (0, 255, 0)
+            bgr = cv2.addWeighted(overlay, 0.4, bgr, 0.6, 0)
+        out_path = f"./figs/det_{backend}_{query.replace(' ', '_')}.png"
+    else:
+        x0, y0, x1, y1 = (int(v) for v in box)
+        cv2.rectangle(bgr, (x0, y0), (x1, y1), (0, 255, 0), 2)
+        out_path = f"./figs/det_{backend}_{query.replace(' ', '_')}.png"
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cv2.imwrite(out_path, bgr)
+    print(f"Wrote {out_path}")

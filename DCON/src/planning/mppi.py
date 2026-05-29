@@ -22,6 +22,11 @@ class MPPIPlanner:
         # the goal-pull engaged after the target falls out of view. Updated
         # each call as max(incoming, prev * decay).
         self.exploit_conf = 0.0
+        # Wedge counter: consecutive replans where MPPI's optimal first
+        # action is essentially (0, 0). Read/incremented by the caller; used
+        # to trigger a recovery rotation when the agent is stuck against a
+        # wall and every motion sample collides.
+        self.stuck_counter = 0
 
     def get_highest_sim_goal(self, sim_map, obstacle_val=2, occ_map=None):
         """
@@ -144,10 +149,10 @@ class MPPIPlanner:
     #     }
 
     def optimize_trajectory(self, start, goal, ig_map, occ_map,
-    num_samples=300, num_iters=None, horizon=None,
+    num_samples=500, num_iters=None, horizon=None,
     lambda_weight=None, w_goal=1, w_ig=None, w_occ=1e6, w_unseen=0,
     intrinsics=None, sensor_height=1.5, initial_heading=None,
-    progress=0.0, cov_scale=None, ig_source="unseen", goal_confidence=0.0):
+    progress=0.0, ig_source="unseen", goal_confidence=0.0):
         """
         Optimize a trajectory from `start` to `goal` using MPPI unicycle
         sampling. No A* reference; nominal controls start at zero and MPPI
@@ -156,23 +161,17 @@ class MPPIPlanner:
         `start` and `goal` are (z, x) grid-cell tuples. Exploitation cost is
         mean per-step Euclidean distance from rollout waypoints to `goal`.
 
-        Exploration→exploitation schedule: when lambda_weight/w_ig/w_goal/cov_scale
-        are left None, they are filled in from cfg.mppi_*_start/end interpolated
-        by `progress` (0.0 = pure exploration, 1.0 = pure exploitation). Pass a
-        scalar to pin any single parameter and bypass the schedule for it.
+        Cost weights (`mppi_lambda`, `mppi_w_ig`, `mppi_w_goal`) come from
+        cfg. Control-noise stddev is anchored to half the actuator limits and
+        modulated by DIAL annealing across MPPI iterations (`beta_traj`) and
+        horizon steps (`beta_action`).
         """
         if start is None or goal is None:
             return ([(int(start[0]), int(start[1]))] if start is not None else []), None, None, None
 
-        # Resolve schedule. Caller-supplied scalars take precedence.
-        # sched = self.scheduled_params(progress)
-        # if w_ig is None:          w_ig = sched["w_ig"]
-        # if w_goal is None:        w_goal = sched["w_goal"]
-        # if cov_scale is None:     cov_scale = sched["cov_scale"]
         mppi_lambda = self.cfg.mppi_lambda
         w_ig = self.cfg.mppi_w_ig
         w_goal = self.cfg.mppi_w_goal
-        cov_scale = self.cfg.mppi_cov_scale
 
         # # Exploration→exploitation mixing weight, length-agnostic.
         # # lam(progress=0) = 1.0 → pure IG; lam(progress=1) ≈ 0.368.
@@ -187,7 +186,7 @@ class MPPIPlanner:
         # symmetrically by `(1 - w_conf_norm)`.
         a_conf = float(getattr(self.cfg, "mppi_conf_weight_a", 0.1))
         conf_scale = float(getattr(self.cfg, "mppi_conf_weight_scale", 100.0))
-        conf_decay = float(getattr(self.cfg, "mppi_conf_decay", 0.75))
+        conf_decay = float(getattr(self.cfg, "mppi_conf_decay", 0.9))
         conf_threshold = float(getattr(self.cfg, "mppi_conf_threshold", 0.1))
         incoming_conf = float(np.clip(goal_confidence, 0.0, 1.0))
         self.exploit_conf = max(incoming_conf, self.exploit_conf * conf_decay)
@@ -268,10 +267,14 @@ class MPPIPlanner:
             if shifted_len > 0:
                 U_nom[:shifted_len] = last_U_t[1:1 + shifted_len]
 
-        # Control noise covariance [v_noise, w_noise]
-        # v noise scales with typical cell size (1.0), w noise allows sufficient turning.
-        # cov_scale (schedule-controlled) widens or tightens the sampling envelope.
-        cov_matrix = float(cov_scale) * torch.tensor([[0.5, 0.0], [0.0, np.pi/4]], device=self.device)
+        # Control-noise stddev per channel, anchored to half the actuator
+        # limit so the sampling envelope auto-scales when mppi_max_v_mps /
+        # mppi_max_w_rps change. No separate cov_scale knob — annealing
+        # (below) handles iteration- and horizon-time modulation.
+        cov_diag = torch.tensor(
+            [0.5 * max_v_cells, 0.5 * max_w_rad],
+            device=self.device, dtype=torch.float32,
+        )
 
         w_control = 0.1
 
@@ -296,16 +299,14 @@ class MPPIPlanner:
         best_mask = None
         best_score = -float('inf')
         for it in range(num_iters):
-             # Sample control noise
-             noise = torch.randn((num_samples, horizon, 2), device=self.device) @ cov_matrix # [K, H, 2]
-            #  # DIAL-MPC trajectory-level annealing: iter 0 = full noise (wide
-            #  # exploration), iter N-1 = shrunken noise (local refinement).
-            #  # Combined with action-level scaling so iter N-1 + h=0 is the
-            #  # most concentrated sample (refining the immediately-committed
-            #  # action), iter 0 + h=H-1 is the widest (rough global coverage).
-            #  traj_scale = float(np.exp(-it / (beta_traj * max(num_iters, 1))))
-
-             traj_scale = 1.0
+             # Sample control noise at the per-channel stddev, then anneal.
+             noise = torch.randn((num_samples, horizon, 2), device=self.device) * cov_diag  # [K, H, 2]
+             # DIAL-MPC trajectory-level annealing: iter 0 = full noise (wide
+             # exploration), iter N-1 = shrunken noise (local refinement).
+             # Combined with action-level scaling so iter N-1 + h=0 is the
+             # most concentrated sample (refining the immediately-committed
+             # action), iter 0 + h=H-1 is the widest (rough global coverage).
+             traj_scale = float(np.exp(-it / (beta_traj * max(num_iters, 1))))
              noise = noise * (traj_scale * action_scale).view(1, horizon, 1)
              # Pin sample 0 to zero noise so the unmutated warm-start is always
              # evaluated as-is — protects against the case where every noisy
@@ -341,11 +342,49 @@ class MPPIPlanner:
 
              scores = torch.zeros(num_samples, device=self.device)
 
-             # Cost 1: Goal-distance pull, mixed by (1 - lam) so it grows
-             # as exploration anneals into exploitation.
-             dist_cost = torch.mean(torch.sqrt((Z_samples - goal_z)**2 + (X_samples - goal_x)**2), dim=1)
-            #  scores -= (1.0 - lam) * w_goal * w_conf * dist_cost
+             # EXPLOIT-mode terminal condition: any rollout whose waypoint
+             # enters the `stop_distance_m` radius is considered terminated at
+             # that point — post-arrival waypoints don't contribute to
+             # dist_cost, post-arrival sub-points get collision forgiveness
+             # (further below), arrival earns a large reward, and arriving
+             # rollouts bypass the safe_mask filter so a clutter-rich approach
+             # is still preferred over orbiting outside the radius.
+             # Triggered by the EXPLOIT pin in main.py (goal_confidence=1.0).
+             in_exploit = incoming_conf >= 0.99
+             stop_dist_cells = float(getattr(self.cfg, "stop_distance_m", 1.5)) / self.cfg.voxel_resolution
+
+             # Cost 1: Goal-distance pull (squared, to weight far points harder).
+             sq_dist = (Z_samples - goal_z) ** 2 + (X_samples - goal_x) ** 2
+             if in_exploit:
+                 d_wp = torch.sqrt(sq_dist)                                      # [K, H]
+                 arrived_wp = (d_wp <= stop_dist_cells)                          # [K, H]
+                 post_arr_wp = torch.cummax(arrived_wp.long(), dim=1).values.bool()
+                 pre_arr_wp = ~post_arr_wp
+                 n_pre = pre_arr_wp.float().sum(dim=1).clamp(min=1.0)
+                 dist_cost = (sq_dist * pre_arr_wp.float()).sum(dim=1) / n_pre
+                 arrived_anywhere = arrived_wp.any(dim=1)                        # [K]
+             else:
+                 dist_cost = sq_dist.mean(dim=1)
+                 arrived_anywhere = torch.zeros(num_samples, dtype=torch.bool, device=self.device)
              scores -= w_goal * w_conf * dist_cost
+
+             # Terminal-arrival bonus (only nonzero in EXPLOIT).
+             arrival_bonus = float(getattr(self.cfg, "mppi_arrival_bonus", 1000.0))
+             scores += arrival_bonus * arrived_anywhere.float()
+
+             # Stationarity penalty: linear ramp that zeroes out once a
+             # rollout's max displacement from start reaches `r_stat`. Breaks
+             # ties toward rollouts that actually leave the start neighborhood
+             # when IG≈0 (cleared room) and goal pull is weak/decayed. Uses
+             # max — not final — displacement, so "leave and return" rollouts
+             # aren't punished as harshly as "spin in place" ones.
+             r_stat_m = float(getattr(self.cfg, "mppi_stationarity_radius_m", 0.5))
+             w_stat = float(getattr(self.cfg, "mppi_w_stationarity", 1.0))
+             r_stat = r_stat_m / self.cfg.voxel_resolution
+             disp = torch.sqrt((Z_samples - start_z) ** 2 + (X_samples - start_x) ** 2)
+             max_disp = disp.max(dim=1).values
+             stat_cost = torch.clamp(r_stat - max_disp, min=0.0)
+             scores -= w_stat * stat_cost
 
 
             #  control_cost = torch.mean(torch.sqrt(U_samples[:, :, 0]**2 + U_samples[:, :, 1]**2), dim=1)
@@ -424,7 +463,6 @@ class MPPIPlanner:
                  )
                 #  scores[safe_mask] += lam * w_ig_conf * w_ig * batch_ig
                  scores[safe_mask] += w_ig_conf * w_ig * batch_ig
-
 
              # Hard-exclude colliding rollouts from the final weighting.
              # Without this, when every sample collides (tight spot, thin wall,

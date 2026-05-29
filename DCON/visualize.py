@@ -37,6 +37,72 @@ def annotate_detection(rgb_uint8: np.ndarray, box) -> np.ndarray:
     return np.asarray(img)
 
 
+def annotate_sam(rgb_uint8: np.ndarray, mask: Optional[np.ndarray],
+                 box, score: Optional[float] = None) -> np.ndarray:
+    """Tint the SAM mask region green and draw its bbox on a uint8 RGB image.
+
+    The mask shape is the segmenter's native resolution (typically the
+    saved RGB size); we resize via PIL nearest if it doesn't match.
+    Box is xyxy in the mask's pixel coordinates. Both can be None.
+    """
+    if mask is None and box is None:
+        return rgb_uint8
+    img = Image.fromarray(rgb_uint8).convert("RGB")
+    H, W = rgb_uint8.shape[:2]
+
+    if mask is not None:
+        if mask.shape != (H, W):
+            mask_img = Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
+            mask_img = mask_img.resize((W, H), Image.NEAREST)
+            mask = np.asarray(mask_img) > 0
+        # 40% green tint over the mask region.
+        arr = np.asarray(img).astype(np.float32)
+        green = np.array([64, 220, 64], dtype=np.float32)
+        arr[mask] = 0.6 * arr[mask] + 0.4 * green
+        img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+    if box is not None:
+        draw = ImageDraw.Draw(img)
+        xmin, ymin, xmax, ymax = box
+        draw.rectangle([xmin, ymin, xmax, ymax], outline=(64, 220, 64), width=3)
+        if score is not None:
+            label_y = max(0, int(ymin) - 14)
+            draw.text((int(xmin) + 2, label_y), f"sam {score:.2f}", fill=(64, 220, 64))
+    return np.asarray(img)
+
+
+def load_sam_mask(sam_dir: str, step: int) -> Optional[np.ndarray]:
+    """Load the packed SAM mask for `step` (or None if missing)."""
+    path = os.path.join(sam_dir, f"sam_mask_{step:06d}.npz")
+    if not os.path.exists(path):
+        return None
+    with np.load(path) as data:
+        packed = data["packed"]
+        shape = tuple(int(v) for v in data["shape"])
+    flat = np.unpackbits(packed)[: int(np.prod(shape))]
+    return flat.reshape(shape).astype(bool)
+
+
+def find_recent_sam_step(traj_log, current_step: int, lookback: int) -> Optional[int]:
+    """Most recent traj_log step <= current_step whose entry has a sam_box.
+
+    `lookback` caps how far back we accept a SAM result — older masks
+    were computed from a different viewpoint and would mis-align with
+    the current RGB. Returns None if no entry within the window.
+    """
+    best = None
+    for e in traj_log:
+        s = int(e["step"])
+        if s > current_step:
+            break
+        if e.get("sam_box") is None:
+            continue
+        if current_step - s > lookback:
+            continue
+        best = s
+    return best
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def load_traj_log(path):
@@ -129,7 +195,7 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
               f"viz_interval={cfg.viz_interval}). Run main.py with save_enabled=True.")
         return
     print(f"Using {len(map_steps)} map snapshots (step 0 to {map_steps[-1]} every {cfg.viz_interval}) and {len(traj_log)} trajectory log entries.")
-    
+
     # Calculate average MPPI cost
     costs = [e['mppi_cost'] for e in traj_log if 'mppi_cost' in e and e['mppi_cost'] is not None]
     costs = [c for c in costs if np.isfinite(c)]
@@ -148,14 +214,10 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         sim = load_map(os.path.join(output_dir, "sim_maps"),
                        f"bev_similarity_{map_step}.npy")
         
-        # Load extra diagnostic maps
-        sim2d = load_map(os.path.join(output_dir, "2d_sim_maps"),
-                         f"sim2d_{map_step:03d}.npy")
-        
         rgb_path = os.path.join(output_dir, "rgbs", f"rgb_{map_step:03d}.png")
         # if not os.path.exists(rgb_path):
         #     rgb_path = os.path.join(output_dir, "rgbs", f"bootstrap_{map_step:03d}.png") # fallback
-            
+
         rgb = imageio.imread(rgb_path) if os.path.exists(rgb_path) else None
 
         if epi is None or occ is None or sim is None:
@@ -186,6 +248,22 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         if rgb is not None:
             rgb = annotate_detection(rgb, det_box)
 
+        # SAM overlay: most recent saved mask at or before this frame,
+        # capped at `sam_lookback_steps` so we don't paint a stale mask
+        # from a totally different viewpoint onto the current RGB.
+        if rgb is not None:
+            sam_dir = os.path.join(output_dir, "sam_masks")
+            sam_step = find_recent_sam_step(
+                traj_log, map_step,
+                lookback=int(getattr(cfg, 'sam_lookback_steps', cfg.viz_interval)),
+            )
+            if sam_step is not None:
+                sam_mask = load_sam_mask(sam_dir, sam_step)
+                sam_entry = next((e for e in traj_log if int(e['step']) == sam_step), None)
+                sam_box = sam_entry.get('sam_box') if sam_entry else None
+                sam_score = sam_entry.get('sam_score') if sam_entry else None
+                rgb = annotate_sam(rgb, sam_mask, sam_box, sam_score)
+
         # Goal cell (z, x) chosen by the planner this step. Convert to world.
         goal_cell = current_entry.get('goal') if current_entry else None
         goal_world = g2w(goal_cell[0], goal_cell[1]) if goal_cell else None
@@ -194,7 +272,7 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         mode = (current_entry.get('mode') if current_entry else None) or 'SEARCH'
         w_conf = float(current_entry.get('w_conf', 0.0) or 0.0) if current_entry else 0.0
 
-        maps_dict = {'occ': occ, 'sim': sim, 'epi': epi, 'rgb': rgb, 'sim2d': sim2d}
+        maps_dict = {'occ': occ, 'sim': sim, 'epi': epi, 'rgb': rgb}
         
         # Optional: compute CombinedZ if we want to match analysis.py perfectly
         # For now, let's just pass the dict. Visualizer handles it.

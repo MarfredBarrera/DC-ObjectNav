@@ -37,6 +37,7 @@ from src.habitat.habitat_utils import (
 from src.habitat.sim_interface import SimInterface
 from src.perception.obj_detection import make_detector
 from src.perception.perception_stack import PerceptionStack
+from src.perception.segmentation import MobileSAMSegmenter
 from src.perception.utils import unprojection
 from src.planning.mppi import MPPIPlanner
 from src.planning.utils import normalize_sim
@@ -184,11 +185,108 @@ def bev_cells_from_det_box(perception, cfg, intrinsics, det_box, depth, c2w):
     return cell_mask.cpu().numpy()
 
 
+def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
+                       target_query, segmenter,
+                       min_mask_pixels: int = 200,
+                       min_clip_sim: float = 0.18):
+    """Whole-image SAM → CLIP-scored best mask → BEV cells.
+
+    Run MobileSAM's automatic mask generator over the full RGB frame, score
+    every proposal by mean CLIP cosine similarity to ``target_query``, pick
+    the highest-scoring mask, and project its pixels (gated by valid depth)
+    into BEV. The detector box is only used as a *trigger* upstream — it
+    does NOT constrain SAM. Rationale: at distance the box is often a full
+    box-width off, so box-prompted SAM inherits that error; auto-gen lets
+    SAM find object boundaries from scratch and CLIP picks the right one.
+
+    Returns a (num_z, num_x) bool numpy array, or None if no mask cleared
+    ``min_clip_sim`` or no valid depth pixels remained.
+    """
+    if rgb is None or depth is None or c2w is None or not target_query or segmenter is None:
+        return None
+    # Reset the segmenter's side-channel state — the main loop reads these
+    # after the call to persist the chosen mask for offline visualization.
+    segmenter.last_mask = None
+    segmenter.last_box = None
+    segmenter.last_score = 0.0
+
+    rgb_gpu = rgb.to(perception.device)
+    depth_gpu = depth.to(perception.device)
+    H_d, W_d = depth_gpu.shape[-2:]
+
+    masks = segmenter.segment_all(rgb)
+    if not masks:
+        return None
+
+    feats = perception.mask_clip.extract_dense_features(rgb_gpu)  # (H, W, 512)
+    text_embed = perception.mask_clip.encode_text(target_query)   # (1, 512)
+    sim_2d = (feats @ text_embed.T).squeeze(-1)                   # (H, W) in [-1, 1]
+    if sim_2d.shape != (H_d, W_d):
+        sim_2d = torch.nn.functional.interpolate(
+            sim_2d[None, None].float(), size=(H_d, W_d),
+            mode='bilinear', align_corners=False,
+        )[0, 0]
+
+    depth_mask = (depth_gpu > cfg.min_sensor_dist) & (depth_gpu < cfg.max_sensor_dist)
+
+    best_score = -float('inf')
+    best_seg = None
+    for m in masks:
+        seg = m['segmentation']  # numpy bool (H_rgb, W_rgb)
+        if seg.sum() < min_mask_pixels:
+            continue
+        seg_t = torch.from_numpy(seg).to(perception.device)
+        if seg_t.shape != (H_d, W_d):
+            seg_t = torch.nn.functional.interpolate(
+                seg_t[None, None].float(), size=(H_d, W_d),
+                mode='nearest',
+            )[0, 0].bool()
+        valid = seg_t & depth_mask
+        if not bool(valid.any()):
+            continue
+        score = float(sim_2d[valid].mean())
+        if score > best_score:
+            best_score = score
+            best_seg = seg_t
+
+    if best_seg is None or best_score < min_clip_sim:
+        return None
+
+    final_mask = best_seg & depth_mask
+    if not bool(final_mask.any()):
+        return None
+
+    # Stash the chosen 2D mask + its bbox + score on the segmenter as a
+    # side channel for the main loop / visualizer. We use the raw best_seg
+    # (not depth-gated) for the visualization overlay since it shows the
+    # full SAM contour the user expects to see.
+    seg_np = best_seg.detach().cpu().numpy().astype(bool)
+    ys, xs = np.where(seg_np)
+    if xs.size > 0 and ys.size > 0:
+        segmenter.last_mask = seg_np
+        segmenter.last_box = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+        segmenter.last_score = float(best_score)
+
+    world_points = unprojection(
+        depth_gpu, intrinsics, c2w.to(perception.device), perception.device, mask=final_mask,
+    )
+    if world_points.shape[0] == 0:
+        return None
+
+    sg = perception.similarity_grid
+    z_idx = ((world_points[:, 2] - sg.min_z) / cfg.voxel_resolution).long().clamp(0, sg.num_z - 1)
+    x_idx = ((world_points[:, 0] - sg.min_x) / cfg.voxel_resolution).long().clamp(0, sg.num_x - 1)
+    cell_mask = torch.zeros((sg.num_z, sg.num_x), dtype=torch.bool, device=perception.device)
+    cell_mask[z_idx, x_idx] = True
+    return cell_mask.cpu().numpy()
+
+
 def plan_one_action(perception, sim_iface, mppi, cfg,
                     action_queue: deque, k_max: int = 5,
                     progress: float = 0.0, det_score: float = 0.0,
                     detected: bool = False, det_box=None, rgb=None, depth=None, c2w=None,
-                    last_box_goal=None):
+                    last_box_goal=None, last_box_conf: float = -1.0,
+                    segmenter=None):
     """Run MPPI from current pose and return (action, ref_traj, opt_traj).
 
     action is [v_mps, w_rad_per_s] or None if idling.
@@ -232,14 +330,20 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     goal = None
     box_goal = None  # None unless THIS frame's detection produced a fresh goal
     H, W = sim_for_goal.shape
-    # Detector presence triggers the constrained search; the actual BEV
-    # region comes from the top-K% most-target-similar pixels in the frame
-    # (not the raw box, which can be loose at distance).
-    if det_box is not None:
-        det_cells = bev_cells_from_sim_pixels(
+    # Layer 1: only spend a fresh SAM + MaskCLIP pass when this frame's
+    # detection actually beats the cached max. Otherwise the cached goal
+    # already represents the strongest sighting and we should aim at it
+    # (see Layer 2). This makes the agent pursue the max-confidence goal
+    # at all times — weak transient detections can't displace a strong one.
+    # SAM runs on the *whole image* (not box-prompted) because the box is
+    # often offset by ~one box-width at distance; CLIP picks the right mask.
+    if det_box is not None and det_score > last_box_conf and segmenter is not None:
+        det_cells = bev_cells_from_sam(
             perception, cfg, sim_iface.intrinsics,
             rgb, depth, c2w, perception.target_query,
-            det_box=det_box,
+            segmenter,
+            min_mask_pixels=int(getattr(cfg, 'sam_min_mask_pixels', 200)),
+            min_clip_sim=float(getattr(cfg, 'sam_min_clip_sim', 0.18)),
         )
         if det_cells is not None and det_cells.any():
             sim_for_goal[~det_cells] = -np.inf
@@ -257,6 +361,15 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
             return (action_queue.popleft() if action_queue else None), None, None, None, None, None
         flat_idx = int(np.argmax(sim_for_goal))
         goal = (flat_idx // W, flat_idx % W)
+    # Goal weight (`w_conf` inside MPPI):
+    #   EXPLOIT (detected latched True) → pin at 1.0 so the agent commits
+    #     hard to the cached max-conf goal and never decays back to IG.
+    #   SEARCH → raw per-frame det_score. MPPI's hysteresis
+    #     (exploit_conf = max(incoming, prev * conf_decay)) ratchets up on
+    #     strong sightings and decays after a stretch of misses, eventually
+    #     falling below threshold and re-enabling IG-driven exploration.
+    # The cached *goal cell* is independent of this — see Layer 1/2 above —
+    # so the planner still aims at the strongest sighting in either mode.
     goal_confidence = 1.0 if detected else float(det_score)
 
     opt_path, U_opt = mppi.optimize_trajectory(
@@ -286,6 +399,31 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
         v_mps = float(U_opt[i, 0]) * cfg.voxel_resolution / cfg.mppi_dt
         w_rps = cfg.mppi_w_sign * float(U_opt[i, 1]) / cfg.mppi_dt
         action_queue.append([v_mps, w_rps])
+
+    # Wedge detection: MPPI returned a "valid" plan but its first action is
+    # essentially (0, 0). Happens against walls/corners where every nonzero
+    # sample collides and the do-nothing rollout is the lone survivor. After
+    # a few consecutive stuck replans, override with a recovery rotation —
+    # changing heading exposes a different occupancy projection and usually
+    # unblocks the next replan.
+    first_v, first_w = action_queue[0]
+    v_thresh = float(getattr(cfg, "mppi_stuck_v_thresh_mps", 0.02))
+    w_thresh = float(getattr(cfg, "mppi_stuck_w_thresh_rps", 0.05))
+    if abs(first_v) < v_thresh and abs(first_w) < w_thresh:
+        mppi.stuck_counter += 1
+    else:
+        mppi.stuck_counter = 0
+    stuck_n = int(getattr(cfg, "mppi_stuck_replan_threshold", 2))
+    if mppi.stuck_counter >= stuck_n:
+        recovery_w = float(getattr(cfg, "mppi_stuck_recovery_w_rps", np.pi / 4))
+        # Alternate direction every other wedge to avoid pacing the same arc
+        # back and forth — the bit on stuck_counter parity flips the sign.
+        sign = -1.0 if (mppi.stuck_counter // stuck_n) % 2 == 0 else 1.0
+        print(f"  plan: WEDGED ({mppi.stuck_counter} stationary replans) — "
+              f"recovery rotate {sign * recovery_w:+.2f} rad/s")
+        action_queue.clear()
+        return [0.0, sign * recovery_w], None, opt_path, mppi_score, goal, box_goal
+
     return action_queue.popleft(), None, opt_path, mppi_score, goal, box_goal
 
 
@@ -305,6 +443,23 @@ def run(cfg: Config, save_enabled: bool = True,
 
     mppi = MPPIPlanner(cfg, device=cfg.device)
     detector = make_detector(cfg.detector, device=cfg.device)
+    # MobileSAM is only consulted when the detector fires (Layer-1 goal
+    # update), so a load failure shouldn't kill the run — fall back to the
+    # box-based path with a warning. The path is None-guarded downstream.
+    segmenter = None
+    if bool(getattr(cfg, 'use_mobile_sam', True)):
+        try:
+            segmenter = MobileSAMSegmenter(
+                checkpoint=getattr(cfg, 'sam_checkpoint', 'SAM_models/mobile_sam.pt'),
+                device=cfg.device,
+                points_per_side=int(getattr(cfg, 'sam_points_per_side', 16)),
+                pred_iou_thresh=float(getattr(cfg, 'sam_pred_iou_thresh', 0.86)),
+                stability_score_thresh=float(getattr(cfg, 'sam_stability_score_thresh', 0.90)),
+                min_mask_region_area=int(getattr(cfg, 'sam_min_mask_region_area', 200)),
+            )
+            print(f"[init] MobileSAM loaded from {getattr(cfg, 'sam_checkpoint', 'SAM_models/mobile_sam.pt')}")
+        except Exception as e:
+            print(f"[init] MobileSAM unavailable ({e}); EXPLOIT goals will skip SAM refinement")
     action_queue: deque = deque()
 
     # 2. Bootstrap A: spin in a full circle, observe each frame
@@ -420,7 +575,8 @@ def run(cfg: Config, save_enabled: bool = True,
                 perception, sim_iface, mppi, cfg, action_queue,
                 progress=progress, det_score=det_score, detected=detected,
                 det_box=det_box, rgb=rgb_cur, depth=depth_cur, c2w=c2w_cur,
-                last_box_goal=last_box_goal,
+                last_box_goal=last_box_goal, last_box_conf=last_box_conf,
+                segmenter=segmenter,
             )
             # Cache only when THIS frame's box yielded a valid goal AND its
             # confidence beats the best we've seen. Fallback paths (cached /
@@ -430,6 +586,23 @@ def run(cfg: Config, save_enabled: bool = True,
                 last_box_goal = box_goal
                 last_box_conf = float(det_score)
                 print(f"  cached new goal {box_goal} (conf {det_score:.3f})")
+            # If SAM produced a fresh mask this replan, persist it for the
+            # offline visualizer. The mask file is named by step so
+            # visualize.py can look up the most recent SAM result at or
+            # before each viz frame and overlay it on the saved RGB.
+            sam_box_log = None
+            sam_score_log = None
+            if save_enabled and segmenter is not None and getattr(segmenter, 'last_mask', None) is not None:
+                sam_dir = os.path.join(cfg.output_dir, "sam_masks")
+                os.makedirs(sam_dir, exist_ok=True)
+                # packbits cuts the on-disk size ~8x; unpacked at load time.
+                packed = np.packbits(segmenter.last_mask.astype(np.uint8))
+                np.savez_compressed(
+                    os.path.join(sam_dir, f"sam_mask_{step:06d}.npz"),
+                    packed=packed, shape=np.array(segmenter.last_mask.shape, dtype=np.int32),
+                )
+                sam_box_log = [float(v) for v in segmenter.last_box]
+                sam_score_log = float(segmenter.last_score)
             det_backend = detector.backend_for(perception.target_query)
             mode = 'EXPLOIT' if detected else 'SEARCH'
             w_conf = float(getattr(mppi, 'last_w_conf', 0.0))
@@ -454,36 +627,21 @@ def run(cfg: Config, save_enabled: bool = True,
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
                       f"mode: {mode}")
 
-            # Termination check: in DETECTED mode, compute distance from agent
-            # to BEV similarity peak. Stop after the traj_log write below so the
-            # final replan is captured for visualization.
+            # Termination check: measure distance to whatever goal the planner
+            # just aimed at (the max-conf goal — current frame if it beat the
+            # cache, else the cached cell). Stop after the traj_log write
+            # below so the final replan is captured for visualization.
             stop_now = False
-            if detected:
-                bev_sim = _to_numpy(perception.similarity_grid.get_2d_map(min_y=0.1, max_y=1.5))
-                bev_occ = _to_numpy(perception.occupancy_grid.get_2d_map())
-                if bev_sim is not None and bev_occ is not None:
-                    sim_for_goal = bev_sim.astype(np.float32).copy()
-                    sim_for_goal[bev_occ == 0] = -np.inf
-                    if det_box is not None:
-                        det_cells = bev_cells_from_sim_pixels(
-                            perception, cfg, sim_iface.intrinsics,
-                            rgb_cur, depth_cur, c2w_cur, perception.target_query,
-                            det_box=det_box,
-                        )
-                        if det_cells is not None and det_cells.any():
-                            sim_for_goal[~det_cells] = -np.inf
-                    if np.any(np.isfinite(sim_for_goal)):
-                        H_g, W_g = sim_for_goal.shape
-                        flat_idx = int(np.argmax(sim_for_goal))
-                        gz, gx = flat_idx // W_g, flat_idx % W_g
-                        sz, sx = world_to_grid(
-                            pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution
-                        )
-                        dist_m = float(np.hypot(gz - sz, gx - sx)) * cfg.voxel_resolution
-                        if dist_m <= cfg.stop_distance_m:
-                            print(f"step {step}: TARGET REACHED "
-                                  f"(dist={dist_m:.2f}m <= {cfg.stop_distance_m:.2f}m)")
-                            stop_now = True
+            if detected and goal_cell is not None:
+                gz, gx = int(goal_cell[0]), int(goal_cell[1])
+                sz, sx = world_to_grid(
+                    pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution,
+                )
+                dist_m = float(np.hypot(gz - sz, gx - sx)) * cfg.voxel_resolution
+                if dist_m <= cfg.stop_distance_m:
+                    print(f"step {step}: TARGET REACHED "
+                          f"(dist={dist_m:.2f}m <= {cfg.stop_distance_m:.2f}m)")
+                    stop_now = True
 
             with open(traj_log_path, 'a') as _f:
                 # Convert score to cost: higher score is better, so cost is -score.
@@ -498,6 +656,8 @@ def run(cfg: Config, save_enabled: bool = True,
                     'mppi_cost': cost,
                     'det_conf': float(det_score),
                     'det_box': [float(v) for v in det_box] if det_box is not None else None,
+                    'sam_box': sam_box_log,
+                    'sam_score': sam_score_log,
                     'goal': [int(goal_cell[0]), int(goal_cell[1])] if goal_cell is not None else None,
                     'mode': mode,
                     'w_conf': w_conf,
