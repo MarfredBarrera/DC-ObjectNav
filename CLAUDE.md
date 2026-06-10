@@ -24,7 +24,8 @@ DCON/
 │   │   ├── featurefield.py    # Learned 3D feature field model (hash-grid + MLP)
 │   │   ├── grid.py            # Uncertainty, Occupancy, and Similarity grids
 │   │   ├── semantics.py       # MaskCLIP semantic feature extraction wrapper
-│   │   ├── obj_detection.py   # OWLv2 object detection (used for goal grounding experiments)
+│   │   ├── obj_detection.py   # YOLO-World / COCO-YOLO / Grounding DINO + SamRefinedDetector
+│   │   ├── segmentation.py    # MobileSAM auto-mask-gen wrapper (whole-image segmentation)
 │   │   └── utils.py           # Unprojection and coordinate utilities
 │   ├── planning/              # Motion planning
 │   │   ├── astar.py           # A* graph-based pathfinder
@@ -56,7 +57,8 @@ DCON/
 ├── figs/                      # Generated figures and videos
 ├── gibson_scenes/             # Scene assets (.glb)
 ├── gsplat_viewers/            # Splatting viewer scripts
-└── SAM_models/                # Pretrained model weights
+├── SAM_models/                # MobileSAM weights (mobile_sam.pt, ~40 MB)
+└── test_object_detection.py   # Standalone detector + SAM smoke-test viz
 ```
 
 ## Core Architecture & Data Flow
@@ -76,7 +78,7 @@ The primary entry point. Three cadences in one process:
 2. **Cold-train**: `BOOTSTRAP_TRAIN_STEPS=2000` gradient steps so the first BEV maps have signal.
 3. **First maps**: compute & save uncertainty / occupancy / similarity grids at step 0.
 
-After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, `action`, `ref_traj`, `opt_traj`, and `mppi_cost` (= `-final_score`). `visualize.py` consumes this log + saved BEV maps to render `nav_history.mp4`.
+After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, `action`, `ref_traj`, `opt_traj`, `mppi_cost` (= `-final_score`), `det_conf`, `det_box`, `sam_box`, `sam_score`, `goal`, `mode`, and `w_conf`. When MobileSAM produces a fresh mask, a bit-packed `.npz` is also written to `output/<scene>/sam_masks/sam_mask_<step:06d>.npz`. `visualize.py` consumes the log, saved BEV maps, and saved SAM masks to render `nav_history.mp4`.
 
 ### Perception Pipeline (`src/perception/perception_stack.py`)
 
@@ -114,7 +116,15 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
 
 **A\* (`src/planning/astar.py`)**: graph search over occupancy grid with Euclidean heuristic. Used for sanity-check / fallback paths; the primary planner is MPPI.
 
-**Goal selection** ([main.py:103](DCON/main.py#L103)): `mppi.get_goals_near_highest_sim` finds the highest-similarity peak and picks the closest *free* cell next to it (target objects are themselves marked occupied, so the peak is usually unreachable).
+**Goal selection** ([main.py:plan_one_action](DCON/main.py)): three-layer priority for picking the cell MPPI aims at.
+
+1. **Fresh SAM-refined detection** — if the detector fires this replan AND its score beats the cached max, run [`bev_cells_from_sam`](DCON/main.py): MobileSAM auto-mask-gen on the WHOLE image (no box prompt), score every mask by mean MaskCLIP similarity to `cfg.target_query`, pick the best mask (if it clears `sam_min_clip_sim`), unproject its pixels to BEV cells, then `argmax(bev_sim)` restricted to those cells. The mask is cached on `segmenter.last_mask` and the goal cell is cached as `last_box_goal`/`last_box_conf`.
+2. **Cached box-goal** — no fresh detection this frame but a previous box-derived goal exists → reuse that fixed world cell so the agent commits to the strongest historical sighting instead of chasing a transient peak.
+3. **Global similarity argmax** — neither: pick the global argmax of observed BEV similarity (exploration default).
+
+Rationale for layer 1: at distance the detector's box is often offset by ~one box-width, so anchoring SAM on the box propagates that error. Whole-image auto-gen lets SAM find object boundaries from scratch and CLIP picks the right one. The detector is only a trigger.
+
+**Goal weight (MPPI `w_conf`)** is independent of which layer fired: `EXPLOIT` (latched once `det_score >= detected_conf_threshold` for `detected_persistence` consecutive replans) pins `w_conf=1.0` so the agent commits hard; `SEARCH` passes raw `det_score` and MPPI's hysteresis (`exploit_conf = max(incoming, prev * conf_decay)`) ratchets up on sightings and decays after misses.
 
 ### Semantics (`src/mask_clip/`)
 
@@ -124,6 +134,19 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
 - **Image path**: image → dense per-patch CLIP features (spatial 512-D map).
 - Per-pixel similarity: `patch_features @ text_features.T`, normalized to [0, 1].
 - **Frozen**: weights never update. The feature fields learn *where* in 3D to render these embeddings.
+
+### Object Detection + Goal Refinement (`src/perception/obj_detection.py`, `segmentation.py`)
+
+**Detectors** (all share `detect(image, query) → (score, box)`; pick via `cfg.detector`):
+- `yolo` — YOLO-Worldv2 open-vocabulary (~15 ms/frame, default).
+- `coco_yolo` — closed-set YOLOv8 over the 80 COCO classes (fastest, returns 0 for non-COCO queries).
+- `hybrid` — COCO-matching queries → `coco_yolo`, everything else → `yolo` (mirrors the VLFM paper's hybrid scheme but swaps Grounding DINO for YOLO-World on the open-vocab branch).
+- `grounding_dino` — open-vocab Grounding DINO Tiny (~200 ms/frame, better on natural-language phrases).
+- `sam_refined` — composite: base detector triggers + MobileSAM whole-image auto-gen + MaskCLIP best-mask scoring. Returns the SAM mask's bbox + CLIP score. Mainly for the standalone smoke test; the live loop reaches for the same pipeline directly via `bev_cells_from_sam`.
+
+**MobileSAM** ([segmentation.py](DCON/src/perception/segmentation.py)): thin wrapper around MobileSAM's `SamAutomaticMaskGenerator`. Returns one mask dict per discovered object — class-agnostic. Semantic identity comes from MaskCLIP scoring downstream. Loaded once at startup from `cfg.sam_checkpoint` (default `SAM_models/mobile_sam.pt`). Failed load is non-fatal: EXPLOIT falls back to the older box-based path with a warning.
+
+**State side channel**: when `bev_cells_from_sam` picks a winning mask, it stashes the 2D bool mask, bbox, and CLIP score on `segmenter.last_mask / last_box / last_score`. The main loop reads these immediately after the plan call to persist the mask to `output/<scene>/sam_masks/sam_mask_<step:06d>.npz` (bit-packed via `np.packbits` for ~8× compression) and writes `sam_box` / `sam_score` into the traj log. `visualize.py` looks these up and overlays a green-tinted mask + bbox on the RGB panel.
 
 ### Grids (`src/perception/grid.py`)
 
@@ -181,6 +204,8 @@ Key settings:
 - **MaskCLIP**: `maskclip_model_name` ("ViT-B/16"), `maskclip_input_size` (448).
 - **Hash-grid training**: `hash_train_batch_size`, `hash_buffer_refresh_interval`, `hash_per_frame_cache_size`, `history_buffer_capacity`, `hash_feature_dim`.
 - **MPPI**: `mppi_dt`, `mppi_max_v_mps`, `mppi_max_w_rps`, `mppi_num_iters`, `mppi_anneal_beta_action`, `mppi_anneal_beta_traj`, `mppi_*_start`/`mppi_*_end` for the schedule.
+- **Detection**: `detector` (`yolo` / `coco_yolo` / `hybrid` / `grounding_dino` / `sam_refined`), `detected_conf_threshold`, `detected_persistence`, `stop_distance_m`.
+- **MobileSAM**: `use_mobile_sam` (toggle the SAM goal-refinement path), `sam_checkpoint` (default `SAM_models/mobile_sam.pt`), `sam_points_per_side` (auto-gen density; 16 → ~0.5 s/call, 32 → ~2 s/call), `sam_pred_iou_thresh`, `sam_stability_score_thresh`, `sam_min_mask_region_area`, `sam_min_mask_pixels` (post-gen mask size floor), `sam_min_clip_sim` (CLIP-score floor for accepting a mask), `sam_lookback_steps` (viz-only: how far back to grab the most recent saved SAM mask when overlaying on a viz frame).
 
 ## Testing
 
@@ -191,6 +216,16 @@ python test_masking.py     # Dense feature extraction
 python test_mask_class.py  # MaskCLIP class API
 ```
 Both require sample images in `images/`; they generate heatmap + overlay visualizations.
+
+Detector + SAM standalone smoke test:
+```bash
+cd DCON
+# Bare detector: red bbox on the input image
+python -m src.perception.obj_detection yolo "a pillow" output/current_scene/rgbs/rgb_000.png
+# Full SAM-refined pipeline: red box = base detector, green mask + box = SAM-refined.
+python -m src.perception.obj_detection sam_refined "a pillow" output/current_scene/rgbs/rgb_000.png
+```
+Writes to `figs/det_<backend>_<query>.png`. The `sam_refined` overlay shows whether SAM correctly picked the right mask vs. the detector's (often offset) box.
 
 ## Common Development Tasks
 
@@ -220,6 +255,14 @@ Both require sample images in `images/`; they generate heatmap + overlay visuali
 - Extend `analysis.py` for new plot types.
 - Saved maps are `.npy`; load with `np.load()` + `plt.imshow()`.
 
+`render_combined_grid` layout (2×3) used by `nav_history.mp4`:
+| | col 0 | col 1 | col 2 |
+|---|---|---|---|
+| **row 0** | Agent View (RGB w/ detector + SAM overlays) | _(empty)_ | BEV Similarity |
+| **row 1** | Epistemic Uncertainty | Occupancy | Uncertainty + Occupancy overlay |
+
+The RGB panel composites in order: detector bbox (red) → SAM mask tint + bbox (green) → score label. SAM overlays come from the most recent saved `sam_masks/sam_mask_<step>.npz` within `cfg.sam_lookback_steps` of the current viz frame.
+
 ## Key Invariants & Patterns
 
 1. **Coordinate Systems**: World space (Habitat / simulator) vs. BEV voxel indices (in grids); unprojection maps camera→world via depth + camera pose.
@@ -234,7 +277,9 @@ Both require sample images in `images/`; they generate heatmap + overlay visuali
 - **PyTorch** (CUDA 11.8+)
 - **Habitat-sim**: physics simulator, scene loading, agent control
 - **CLIP** (OpenAI): frozen vision-language model
-- **NumPy, Matplotlib, PIL, imageio**: data processing and visualization
+- **MobileSAM**: `pip install git+https://github.com/ChaoningZhang/MobileSAM.git`, weights at `SAM_models/mobile_sam.pt` (~40 MB)
+- **Ultralytics** (`pip install ultralytics`): YOLO-World / YOLOv8 detectors
+- **NumPy, Matplotlib, PIL, imageio, OpenCV**: data processing and visualization
 - See `requirements.txt` for pinned versions
 
 GPU memory: ~12 GB recommended for training (multi-model ensemble + super-batch staging).
@@ -248,3 +293,7 @@ CPU memory: ~500 MB for the `_HistoryBuffer` at default capacity (200k × 512-di
 - **Planner picks bad goals**: inspect `bev_sim` peak via `analysis.py`; tweak `cfg.target_query` phrasing.
 - **MPPI "NO SAFE ROLLOUTS"**: the agent is wedged. Check occupancy dilation, reduce `w_unseen`, or widen `mppi_cov_scale_*`.
 - **Trajectory video looks wrong**: check `grid_extent.json` matches the scene bounds and that `traj_log.jsonl` was written cleanly (one JSON per line).
+- **`[init] MobileSAM unavailable`** at startup: weights missing or `mobile_sam` package not installed. Install via `pip install git+https://github.com/ChaoningZhang/MobileSAM.git` and place weights at `cfg.sam_checkpoint`. The run continues without SAM (EXPLOIT falls back to the box-based path).
+- **SAM never produces a goal** (no `sam_mask_*.npz` ever written): lower `sam_min_clip_sim` (default 0.18) — the CLIP scores on the chosen mask aren't clearing the floor. Use the `sam_refined` standalone test to inspect actual scores per frame.
+- **SAM picks the wrong mask** (e.g. couch when target is pillow): raise `sam_min_clip_sim`, or bump `sam_points_per_side` from 16 → 24/32 so SAM proposes finer-grained candidates.
+- **SAM is too slow**: `sam_points_per_side=16` is ~0.5 s/call; drop to 12 for a small cost in mask coverage. SAM only runs when the detector fires AND beats the cached score, so total per-run overhead is bounded.

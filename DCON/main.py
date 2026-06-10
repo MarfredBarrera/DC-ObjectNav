@@ -281,6 +281,41 @@ def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
     return cell_mask.cpu().numpy()
 
 
+def closest_cell_in_mask(cell_mask, start_grid):
+    """Nearest True cell in a (num_z, num_x) bool grid to `start_grid` (z, x).
+
+    Returns (z_idx, x_idx) of the mask cell closest to the agent — i.e. the
+    near face of the projected object footprint — or None if the mask is empty.
+    """
+    zs, xs = np.where(cell_mask)
+    if zs.size == 0:
+        return None
+    sz, sx = start_grid
+    d2 = (zs - sz) ** 2 + (xs - sx) ** 2
+    i = int(np.argmin(d2))
+    return (int(zs[i]), int(xs[i]))
+
+
+def snap_to_free(cell, bev_occ, free_val=1):
+    """Return `cell` if it is observed-free, else the nearest observed-free cell.
+
+    The near face of the object footprint is usually marked occupied (the
+    object is a solid surface in the occupancy grid), so we snap the goal to
+    the closest navigable cell — typically the free space directly in front of
+    the object on the agent's side. Falls back to `cell` if no free cell exists.
+    """
+    z, x = int(cell[0]), int(cell[1])
+    H, W = bev_occ.shape
+    if 0 <= z < H and 0 <= x < W and bev_occ[z, x] == free_val:
+        return (z, x)
+    fz, fx = np.where(bev_occ == free_val)
+    if fz.size == 0:
+        return (z, x)
+    d2 = (fz - z) ** 2 + (fx - x) ** 2
+    i = int(np.argmin(d2))
+    return (int(fz[i]), int(fx[i]))
+
+
 def plan_one_action(perception, sim_iface, mppi, cfg,
                     action_queue: deque, k_max: int = 5,
                     progress: float = 0.0, det_score: float = 0.0,
@@ -346,10 +381,14 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
             min_clip_sim=float(getattr(cfg, 'sam_min_clip_sim', 0.18)),
         )
         if det_cells is not None and det_cells.any():
-            sim_for_goal[~det_cells] = -np.inf
-            if np.any(np.isfinite(sim_for_goal)):
-                flat_idx = int(np.argmax(sim_for_goal))
-                goal = (flat_idx // W, flat_idx % W)
+            # Goal = the mask cell closest to the agent (near face of the
+            # object's projected footprint), not the argmax of the smeared
+            # similarity field. If that cell sits on the object (occupied),
+            # snap to the nearest navigable free cell so the agent stops in
+            # front of the target rather than inside it.
+            cand = closest_cell_in_mask(det_cells, start_grid)
+            if cand is not None:
+                goal = snap_to_free(cand, bev_occ)
                 box_goal = goal
     if goal is None and last_box_goal is not None:
         gz, gx = int(last_box_goal[0]), int(last_box_goal[1])
@@ -416,13 +455,12 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     stuck_n = int(getattr(cfg, "mppi_stuck_replan_threshold", 2))
     if mppi.stuck_counter >= stuck_n:
         recovery_w = float(getattr(cfg, "mppi_stuck_recovery_w_rps", np.pi / 4))
-        # Alternate direction every other wedge to avoid pacing the same arc
-        # back and forth — the bit on stuck_counter parity flips the sign.
-        sign = -1.0 if (mppi.stuck_counter // stuck_n) % 2 == 0 else 1.0
+        # Spin in place in a fixed direction to scan for a way out, rather than
+        # alternating left/right (which can pace the same arc back and forth).
         print(f"  plan: WEDGED ({mppi.stuck_counter} stationary replans) — "
-              f"recovery rotate {sign * recovery_w:+.2f} rad/s")
+              f"recovery rotate {recovery_w:+.2f} rad/s")
         action_queue.clear()
-        return [0.0, sign * recovery_w], None, opt_path, mppi_score, goal, box_goal
+        return [0.0, recovery_w], None, opt_path, mppi_score, goal, box_goal
 
     return action_queue.popleft(), None, opt_path, mppi_score, goal, box_goal
 
@@ -558,6 +596,16 @@ def run(cfg: Config, save_enabled: bool = True,
 
             rgb_cur, depth_cur, c2w_cur = perception.observe(sim_iface)
             det_score, det_box = detector.detect(rgb_cur, perception.target_query)
+
+            # Clear last replan's SAM side-channel so a mask is only persisted
+            # on the frame SAM actually ran. `bev_cells_from_sam` resets these
+            # too, but it only runs on a fresh qualifying detection — without
+            # this reset the previous mask lingers and gets re-saved/re-logged
+            # every replan, leaving a stale overlay on frames with no detection.
+            if segmenter is not None:
+                segmenter.last_mask = None
+                segmenter.last_box = None
+                segmenter.last_score = 0.0
 
             # Latch into DETECTED once we get `detected_persistence` consecutive
             # detections above threshold. Never unlatches — see comment above.

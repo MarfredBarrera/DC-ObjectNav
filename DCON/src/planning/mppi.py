@@ -336,59 +336,81 @@ class MPPIPlanner:
              Z_samples[:, 1:] = start_z + torch.cumsum(U_samples[:, :-1, 0] * torch.sin(Theta_samples[:, 1:]), dim=1)
              X_samples[:, 1:] = start_x + torch.cumsum(U_samples[:, :-1, 0] * torch.cos(Theta_samples[:, 1:]), dim=1)
 
-             # Discretize for grid evaluation (round, don't truncate)
-             Z_idx = torch.clamp(Z_samples.round().long(), 0, Z_dim - 1)
-             X_idx = torch.clamp(X_samples.round().long(), 0, X_dim - 1)
-
-             scores = torch.zeros(num_samples, device=self.device)
-
-             # EXPLOIT-mode terminal condition: any rollout whose waypoint
-             # enters the `stop_distance_m` radius is considered terminated at
-             # that point — post-arrival waypoints don't contribute to
-             # dist_cost, post-arrival sub-points get collision forgiveness
-             # (further below), arrival earns a large reward, and arriving
-             # rollouts bypass the safe_mask filter so a clutter-rich approach
-             # is still preferred over orbiting outside the radius.
-             # Triggered by the EXPLOIT pin in main.py (goal_confidence=1.0).
+             # EXPLOIT absorbing terminal state: once a rollout first enters the
+             # `stop_distance_m` radius of the goal it is "arrived" and frozen for
+             # the rest of the horizon — position pinned to the arrival point,
+             # controls zeroed. This makes "reach the target fast, then sit" the
+             # highest-scoring behavior: post-arrival motion costs nothing, the
+             # rollout can't be scored higher by wandering past or around the
+             # target, and earlier arrival earns more reward (more dwell steps).
+             # Arrival is detected in free space in front of the object, so this
+             # needs NO collision relaxation — walls stay hard obstacles.
+             # `stop_dist_cells` MUST match the episode termination radius in
+             # main.py (`stop_distance_m`).
              in_exploit = incoming_conf >= 0.99
              stop_dist_cells = float(getattr(self.cfg, "stop_distance_m", 1.5)) / self.cfg.voxel_resolution
 
-             # Cost 1: Goal-distance pull (squared, to weight far points harder).
+             # Goal distances on the raw (pre-freeze) approach.
              sq_dist = (Z_samples - goal_z) ** 2 + (X_samples - goal_x) ** 2
              if in_exploit:
                  d_wp = torch.sqrt(sq_dist)                                      # [K, H]
                  arrived_wp = (d_wp <= stop_dist_cells)                          # [K, H]
-                 post_arr_wp = torch.cummax(arrived_wp.long(), dim=1).values.bool()
+                 post_arr_wp = torch.cummax(arrived_wp.long(), dim=1).values.bool()  # arrival step onward
+                 arrived_anywhere = arrived_wp.any(dim=1)                        # [K]
+                 # First-arrival waypoint per rollout (argmax → first True; 0 for
+                 # rollouts that never arrive, masked out by `freeze` below).
+                 first_arr_idx = torch.argmax(arrived_wp.long(), dim=1)          # [K]
+                 row = torch.arange(num_samples, device=self.device)
+                 ar_z = Z_samples[row, first_arr_idx]                            # [K]
+                 ar_x = X_samples[row, first_arr_idx]                            # [K]
+                 # Freeze: pin position to the arrival point and zero the controls
+                 # from the arrival step onward (only for rollouts that arrived).
+                 freeze = post_arr_wp & arrived_anywhere.unsqueeze(1)            # [K, H]
+                 Z_samples = torch.where(freeze, ar_z.unsqueeze(1), Z_samples)
+                 X_samples = torch.where(freeze, ar_x.unsqueeze(1), X_samples)
+                 U_samples = U_samples * (~freeze).unsqueeze(-1).float()
+                 # Distance pull over the pre-arrival approach only.
                  pre_arr_wp = ~post_arr_wp
                  n_pre = pre_arr_wp.float().sum(dim=1).clamp(min=1.0)
                  dist_cost = (sq_dist * pre_arr_wp.float()).sum(dim=1) / n_pre
-                 arrived_anywhere = arrived_wp.any(dim=1)                        # [K]
              else:
                  dist_cost = sq_dist.mean(dim=1)
-                 arrived_anywhere = torch.zeros(num_samples, dtype=torch.bool, device=self.device)
+                 post_arr_wp = torch.zeros((num_samples, horizon), dtype=torch.bool, device=self.device)
+
+             # Discretize for grid evaluation (round, don't truncate). Uses the
+             # frozen positions so collision/IG see a rollout that stops at the
+             # target rather than continuing through it.
+             Z_idx = torch.clamp(Z_samples.round().long(), 0, Z_dim - 1)
+             X_idx = torch.clamp(X_samples.round().long(), 0, X_dim - 1)
+
+             scores = torch.zeros(num_samples, device=self.device)
+             # Cost 1: Goal-distance pull (squared, to weight far points harder).
              scores -= w_goal * w_conf * dist_cost
 
-             # Terminal-arrival bonus (only nonzero in EXPLOIT).
-             arrival_bonus = float(getattr(self.cfg, "mppi_arrival_bonus", 1000.0))
-             scores += arrival_bonus * arrived_anywhere.float()
+             # Graded terminal-arrival reward (EXPLOIT only): proportional to the
+             # fraction of the horizon spent absorbed at the target, so a rollout
+             # that arrives early (drives straight in) outscores one that arrives
+             # late or merely grazes the radius and drifts off.
+             arrival_bonus = float(1000.0)
+             scores += arrival_bonus * post_arr_wp.float().mean(dim=1)
 
-             # Stationarity penalty: linear ramp that zeroes out once a
-             # rollout's max displacement from start reaches `r_stat`. Breaks
-             # ties toward rollouts that actually leave the start neighborhood
-             # when IG≈0 (cleared room) and goal pull is weak/decayed. Uses
-             # max — not final — displacement, so "leave and return" rollouts
-             # aren't punished as harshly as "spin in place" ones.
-             r_stat_m = float(getattr(self.cfg, "mppi_stationarity_radius_m", 0.5))
-             w_stat = float(getattr(self.cfg, "mppi_w_stationarity", 1.0))
-             r_stat = r_stat_m / self.cfg.voxel_resolution
-             disp = torch.sqrt((Z_samples - start_z) ** 2 + (X_samples - start_x) ** 2)
-             max_disp = disp.max(dim=1).values
-             stat_cost = torch.clamp(r_stat - max_disp, min=0.0)
-             scores -= w_stat * stat_cost
+            #  # Stationarity penalty: linear ramp that zeroes out once a
+            #  # rollout's max displacement from start reaches `r_stat`. Breaks
+            #  # ties toward rollouts that actually leave the start neighborhood
+            #  # when IG≈0 (cleared room) and goal pull is weak/decayed. Uses
+            #  # max — not final — displacement, so "leave and return" rollouts
+            #  # aren't punished as harshly as "spin in place" ones.
+            #  r_stat_m = float(getattr(self.cfg, "mppi_stationarity_radius_m", 0.5))
+            #  w_stat = float(getattr(self.cfg, "mppi_w_stationarity", 1.0))
+            #  r_stat = r_stat_m / self.cfg.voxel_resolution
+            #  disp = torch.sqrt((Z_samples - start_z) ** 2 + (X_samples - start_x) ** 2)
+            #  max_disp = disp.max(dim=1).values
+            #  stat_cost = torch.clamp(r_stat - max_disp, min=0.0)
+            #  scores -= w_stat * stat_cost
 
 
-            #  control_cost = torch.mean(torch.sqrt(U_samples[:, :, 0]**2 + U_samples[:, :, 1]**2), dim=1)
-            #  scores -= w_control * control_cost
+             control_cost = torch.mean(torch.sqrt(U_samples[:, :, 0]**2 + U_samples[:, :, 1]**2), dim=1)
+             scores -= w_control * control_cost
 
              # Cost 2: Collision Penalty (subsampled along each segment).
              # A single step can span many cells (max_v_cells), so checking only
