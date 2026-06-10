@@ -105,9 +105,9 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
 - Unicycle dynamics (turn-first integration), control vector `[v_cells_per_step, w_rad_per_step]`.
 - Cost terms (combined as a score; lower cost = higher score):
   - **Goal-distance**: mean Euclidean from rollout waypoints to the single goal cell.
-  - **Collision**: subsampled along-segment occupancy check (sub-sample rate scales with max velocity to prevent diagonal tunneling).
-  - **Unseen-traversal**: penalty for stepping through cells that haven't been verified free.
-  - **Information gain**: FOV raycast against epistemic-uncertainty map (only for collision-free rollouts).
+  - **Collision (truncate-and-score)**: waypoint occupancy check; a rollout is frozen at its first collision (position, heading, controls zeroed) and scored on its surviving prefix plus a death penalty (`mppi_w_dead`) proportional to the lost horizon — so dying later scores better and a usable gradient survives even when every sample eventually collides (corners, clutter). No hard `-inf` masking: all rollouts keep softmax weight, so `U_nom` drifts toward the longer-surviving directions instead of stalling. The start cell and cells inside the goal-arrival radius are forgiven. Only rollouts that survive their *first* transition are eligible to be committed; if none do, `best_U=None` and the caller recovers (spin + horizon shrink).
+  - **Clearance**: smooth ESDF wall-proximity penalty `exp(-d/d0)` per step (`mppi_w_clearance`, `mppi_clearance_d0_m`), from a per-replan `cv2.distanceTransform` of the occupancy grid. Pulls samples away from walls before they're trapped; forgiven inside the goal-arrival radius.
+  - **Information gain**: FOV raycast against epistemic-uncertainty map, computed for all rollouts (frozen tails are deduped per-rollout); skipped when the IG weight is ~0 (EXPLOIT).
 - **DIAL action-level annealing** ([mppi.py:200-207](DCON/src/planning/mppi.py#L200-L207)): noise variance is *smaller* for early horizon indices (which will actually be committed) and grows toward the tail.
 - **DIAL trajectory-level annealing** ([mppi.py:216-222](DCON/src/planning/mppi.py#L216-L222)): noise variance shrinks across MPPI iterations — iter 0 is wide exploration, iter N-1 is local refinement.
 - **Exploration→exploitation schedule**: `scheduled_params(progress)` lerps `lambda_weight`, `w_ig`, `w_goal`, `cov_scale` from `*_start` to `*_end` based on `progress = step / iterations`.
@@ -241,7 +241,7 @@ Writes to `figs/det_<backend>_<query>.png`. The `sam_refined` overlay shows whet
 - **Uncertainty computation**: `src/perception/grid.py` (`UncertaintyGrid` methods).
 
 ### Tweaking the planner
-- **Cost weights**: `mppi_w_goal_*`, `mppi_w_ig_*` (schedule endpoints) and `w_occ`, `w_unseen` (constants).
+- **Cost weights**: `mppi_w_goal`, `mppi_w_ig`, `mppi_w_dead` (collision-truncation penalty), `mppi_w_clearance` / `mppi_clearance_d0_m` (wall-proximity penalty).
 - **Annealing aggressiveness**: `mppi_anneal_beta_action`, `mppi_anneal_beta_traj` — smaller β = sharper annealing.
 - **Sampling envelope**: `mppi_cov_scale_start` / `_end`.
 
@@ -291,7 +291,7 @@ CPU memory: ~500 MB for the `_HistoryBuffer` at default capacity (200k × 512-di
 - **Out-of-memory (CPU)**: reduce `history_buffer_capacity` (linear in feature-dim × capacity).
 - **NaN losses**: check input normalization (esp. CLIP embeddings); verify depth values are in `[min_sensor_dist, max_sensor_dist]`.
 - **Planner picks bad goals**: inspect `bev_sim` peak via `analysis.py`; tweak `cfg.target_query` phrasing.
-- **MPPI "NO SAFE ROLLOUTS"**: the agent is wedged. Check occupancy dilation, reduce `w_unseen`, or widen `mppi_cov_scale_*`.
+- **Agent wedged / dwelling in corners**: every sampled rollout dies early so `best_U=None` and the caller falls back to a recovery spin. Raise `mppi_w_clearance` / `mppi_clearance_d0_m` so the agent keeps more wall distance and doesn't get pinned, raise `mppi_w_dead` so the planner discriminates harder between early- and late-dying rollouts (approaches hard elimination), or check occupancy dilation (too aggressive seals narrow gaps).
 - **Trajectory video looks wrong**: check `grid_extent.json` matches the scene bounds and that `traj_log.jsonl` was written cleanly (one JSON per line).
 - **`[init] MobileSAM unavailable`** at startup: weights missing or `mobile_sam` package not installed. Install via `pip install git+https://github.com/ChaoningZhang/MobileSAM.git` and place weights at `cfg.sam_checkpoint`. The run continues without SAM (EXPLOIT falls back to the box-based path).
 - **SAM never produces a goal** (no `sam_mask_*.npz` ever written): lower `sam_min_clip_sim` (default 0.18) — the CLIP scores on the chosen mask aren't clearing the floor. Use the `sam_refined` standalone test to inspect actual scores per frame.

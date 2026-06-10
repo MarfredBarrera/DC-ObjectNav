@@ -115,6 +115,14 @@ class Config:
         self.mppi_lambda = 1.0     # softmax temperature: high = flatter weights, wider sampling
         self.mppi_w_ig = 30.0      # information-gain reward: high = chase uncertainty
         self.mppi_w_goal = 1.0     # goal-distance pull: low early = pure IG exploration
+        # Truncate-and-score collision penalty: per fraction of the horizon a
+        # rollout loses to its first collision (dying later scores better).
+        self.mppi_w_dead = 1e4
+        # ESDF clearance cost: per-step penalty exp(-d/d0) where d is the
+        # distance (m) to the nearest obstacle. Keeps surviving rollouts off
+        # walls before they're trapped.
+        self.mppi_w_clearance = 50.0
+        self.mppi_clearance_d0_m = 0.3
         # Control-noise stddev is anchored to half the actuator limits inside
         # optimize_trajectory; no scalar knob. Trajectory- and action-level
         # annealing (mppi_anneal_beta_traj / mppi_anneal_beta_action) shape
@@ -357,6 +365,7 @@ class Config:
                 'mppi_w_goal_start', 'mppi_w_goal_end',
                 'mppi_num_iters',
                 'mppi_anneal_beta_traj', 'mppi_anneal_beta_action',
+                'mppi_w_dead', 'mppi_w_clearance', 'mppi_clearance_d0_m',
             ):
                 if key in planning:
                     setattr(self, key, planning[key])
