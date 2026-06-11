@@ -25,8 +25,69 @@ from PIL import Image
 from ultralytics import YOLO
 
 
+# Canonical distractor vocabulary (mirrors the default of
+# cfg.det_negative_classes — kept here too so the standalone smoke test and
+# direct construction get the same behavior without importing config).
+DEFAULT_NEGATIVE_CLASSES = [
+    "wall", "door", "window", "floor", "ceiling",
+    "curtain", "cabinet", "shelf", "picture",
+]
+
+
+def _normalize_query(query: str) -> str:
+    """Lower-case, strip leading article and trailing period."""
+    q = query.strip().lower().rstrip(".")
+    for art in ("a ", "an ", "the "):
+        if q.startswith(art):
+            q = q[len(art):]
+            break
+    return q
+
+
+def _dedupe_negatives(query: str, negatives) -> list:
+    """Drop negatives that normalize to the same noun as the query itself."""
+    qn = _normalize_query(query)
+    return [n for n in (negatives or []) if _normalize_query(n) != qn]
+
+
+# (id(mask_clip), query, negatives) -> (K, 512) stacked text embeddings.
+_TEXT_BANK_CACHE: dict = {}
+
+
+def encode_query_with_negatives(mask_clip, query: str, negatives) -> torch.Tensor:
+    """(K, 512) L2-normalized text bank: row 0 = `query`, rows 1.. = the
+    deduped negatives as "a <noun>" prompts (repo's CLIP phrasing convention).
+    Cached per (mask_clip, query, negatives) — text encoding is deterministic
+    and the query rarely changes within a run."""
+    negs = tuple(_dedupe_negatives(query, negatives))
+    key = (id(mask_clip), query, negs)
+    bank = _TEXT_BANK_CACHE.get(key)
+    if bank is None:
+        prompts = [query] + [f"a {n}" for n in negs]
+        bank = torch.cat([mask_clip.encode_text(p) for p in prompts], dim=0)
+        _TEXT_BANK_CACHE[key] = bank
+    return bank
+
+
+def target_prob_from_sims(sims: torch.Tensor, temp: float) -> Tuple[float, float]:
+    """(target_prob, raw_target_cos) from a (K,) per-text cosine vector
+    whose row 0 is the target query. `temp` is the CLIP-style logit scale.
+    With K == 1 (no negatives) the softmax degenerates to prob 1.0 and the
+    raw-cosine floor is the only gate, matching the pre-softmax behavior."""
+    probs = torch.softmax(temp * sims, dim=0)
+    return float(probs[0]), float(sims[0])
+
+
 class ObjectDetector:
-    """Open-vocabulary detector using YOLO-World (via Ultralytics)."""
+    """Open-vocabulary detector using YOLO-World (via Ultralytics).
+
+    `negative_classes` are registered as competing classes alongside the
+    query (the query is always class id 0); only boxes whose winning class
+    is the query are accepted. Without competitors, YOLO-World's contrastive
+    head matches salient non-target regions (walls, doors) to the only class
+    available — registering distractors lets those regions be claimed by
+    their own class instead.
+    """
 
     name = "yolo_world"
 
@@ -41,12 +102,17 @@ class ObjectDetector:
         threshold: float = 0.1,
         imgsz: int = 640,
         half: bool = True,
+        negative_classes: Optional[list] = None,
     ):
         self.device = device
         self.threshold = float(threshold)
         self.imgsz = int(imgsz)
         # fp16 only on CUDA; Ultralytics silently no-ops it on CPU.
         self.half = bool(half) and "cuda" in str(device)
+        self.negative_classes = (
+            list(negative_classes) if negative_classes is not None
+            else list(DEFAULT_NEGATIVE_CLASSES)
+        )
         self.model = YOLO(model_name)
         self.model.to(device)
         # set_classes() re-embeds the query through CLIP, which is non-trivial.
@@ -73,7 +139,8 @@ class ObjectDetector:
             If no detection clears `self.threshold`, returns (0.0, None).
         """
         if query != self._current_query:
-            self.model.set_classes([query])
+            # Query is always class id 0; negatives compete for the boxes.
+            self.model.set_classes([query] + _dedupe_negatives(query, self.negative_classes))
             self._current_query = query
 
         arr = self._to_uint8(image)
@@ -90,9 +157,14 @@ class ObjectDetector:
         if r.boxes is None or len(r.boxes) == 0:
             return 0.0, None
 
-        confs = r.boxes.conf
-        best = int(torch.argmax(confs))
-        score = float(confs[best])
+        # Keep only boxes claimed by the target class — a box that matches
+        # "wall" better than the query is a suppressed false positive.
+        target_idx = (r.boxes.cls == 0).nonzero(as_tuple=True)[0]
+        if target_idx.numel() == 0:
+            return 0.0, None
+        confs = r.boxes.conf[target_idx]
+        best = target_idx[int(torch.argmax(confs))]
+        score = float(r.boxes.conf[best])
         xyxy = r.boxes.xyxy[best].tolist()
         box = (float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]))
         return score, box
@@ -228,9 +300,15 @@ class HybridDetector:
         device: str = "cuda",
         coco_kwargs: Optional[dict] = None,
         world_kwargs: Optional[dict] = None,
+        negative_classes: Optional[list] = None,
     ):
+        # Negatives only apply to the open-vocab branch — the closed-set
+        # COCO branch already has 80-class competition.
+        world_kwargs = dict(world_kwargs or {})
+        if negative_classes is not None:
+            world_kwargs.setdefault("negative_classes", negative_classes)
         self.coco = CocoYoloDetector(device=device, **(coco_kwargs or {}))
-        self.world = ObjectDetector(device=device, **(world_kwargs or {}))
+        self.world = ObjectDetector(device=device, **world_kwargs)
         self._route_cache: dict = {}
 
     def detect(
@@ -332,9 +410,14 @@ class SamRefinedDetector:
       2. Run MobileSAM's automatic mask generator on the WHOLE image
          (no box prompt — at distance the box is often a full box-width
          off, so anchoring SAM on it propagates the error).
-      3. Score every mask by mean MaskCLIP cosine similarity to ``query``.
-      4. Pick the highest-scoring mask. If it clears ``min_clip_sim``,
-         return that mask's bbox + the CLIP score. Otherwise (0.0, None).
+      3. Score every mask by softmax over its mean MaskCLIP cosine to
+         [``query``] + ``negative_texts`` (raw cosines cluster in a narrow
+         ~0.2–0.3 band where distractors score nearly as high as targets;
+         the relative "more pillow than wall" probability separates them).
+      4. Pick the mask with the highest target probability. If it clears
+         ``min_target_prob`` AND its raw target cosine clears
+         ``min_clip_sim``, return that mask's bbox + the target probability.
+         Otherwise (0.0, None).
 
     `detect(image, query)` matches the base interface and returns
     (score, box) from the refined mask. `detect_with_mask(image, query)`
@@ -355,6 +438,9 @@ class SamRefinedDetector:
         device: str = "cuda",
         min_clip_sim: float = 0.18,
         min_mask_pixels: int = 200,
+        negative_texts: Optional[list] = None,
+        softmax_temp: float = 100.0,
+        min_target_prob: float = 0.5,
     ):
         self.base = base_detector
         self.segmenter = segmenter
@@ -362,6 +448,12 @@ class SamRefinedDetector:
         self.device = device
         self.min_clip_sim = float(min_clip_sim)
         self.min_mask_pixels = int(min_mask_pixels)
+        self.negative_texts = (
+            list(negative_texts) if negative_texts is not None
+            else list(DEFAULT_NEGATIVE_CLASSES)
+        )
+        self.softmax_temp = float(softmax_temp)
+        self.min_target_prob = float(min_target_prob)
 
     @torch.no_grad()
     def detect_with_mask(
@@ -378,12 +470,14 @@ class SamRefinedDetector:
             return 0.0, None, None
 
         rgb_gpu = _to_float_rgb_tensor(image, self.device)
-        feats = self.mask_clip.extract_dense_features(rgb_gpu)  # (H, W, 512)
-        text_embed = self.mask_clip.encode_text(query)          # (1, 512)
-        sim_2d = (feats @ text_embed.T).squeeze(-1)             # (H, W) in [-1, 1]
-        H, W = sim_2d.shape
+        feats = self.mask_clip.extract_dense_features(rgb_gpu)              # (H, W, 512)
+        text_bank = encode_query_with_negatives(
+            self.mask_clip, query, self.negative_texts)                     # (K, 512)
+        sim_maps = (feats @ text_bank.T).permute(2, 0, 1)                   # (K, H, W) in [-1, 1]
+        H, W = sim_maps.shape[1:]
 
-        best_score = -float("inf")
+        best_prob = -float("inf")
+        best_raw = -float("inf")
         best_seg = None
         for m in masks:
             seg = m["segmentation"]
@@ -396,13 +490,16 @@ class SamRefinedDetector:
                 )[0, 0].bool()
             if not bool(seg_t.any()):
                 continue
-            score = float(sim_2d[seg_t].mean())
-            if score > best_score:
-                best_score = score
+            sims = sim_maps[:, seg_t].mean(dim=1)                           # (K,)
+            prob, raw = target_prob_from_sims(sims, self.softmax_temp)
+            if prob > best_prob:
+                best_prob = prob
+                best_raw = raw
                 best_seg = seg
 
-        if best_seg is None or best_score < self.min_clip_sim:
+        if best_seg is None or best_prob < self.min_target_prob or best_raw < self.min_clip_sim:
             return 0.0, None, None
+        best_score = best_prob
 
         ys, xs = np.where(best_seg)
         box = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
@@ -434,12 +531,18 @@ def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
     - "grounding_dino": Grounding DINO Tiny via HuggingFace.
     """
     key = name.lower().strip()
+    # Only the YOLO-World branch (directly or inside hybrid) uses the
+    # negative-class competition; pop it here so closed-set / GDino
+    # backends don't choke on an unknown kwarg.
+    negative_classes = kwargs.pop("negative_classes", None)
     if key in ("yolo", "yolo_world", "yoloworld"):
+        if negative_classes is not None:
+            kwargs.setdefault("negative_classes", negative_classes)
         return ObjectDetector(device=device, **kwargs)
     if key in ("coco_yolo", "yolov8", "coco"):
         return CocoYoloDetector(device=device, **kwargs)
     if key in ("hybrid",):
-        return HybridDetector(device=device, **kwargs)
+        return HybridDetector(device=device, negative_classes=negative_classes, **kwargs)
     if key in ("grounding_dino", "gdino", "groundingdino"):
         return GroundingDinoDetector(device=device, **kwargs)
     if key in ("sam_refined", "sam"):
@@ -454,7 +557,10 @@ def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
         min_mask_pixels = int(kwargs.pop("min_mask_pixels", 200))
         maskclip_input_size = int(kwargs.pop("maskclip_input_size", 448))
         maskclip_model_name = kwargs.pop("maskclip_model_name", "ViT-B/16")
-        base = make_detector(base_name, device=device, **kwargs)
+        softmax_temp = float(kwargs.pop("softmax_temp", 100.0))
+        min_target_prob = float(kwargs.pop("min_target_prob", 0.5))
+        base = make_detector(base_name, device=device,
+                             negative_classes=negative_classes, **kwargs)
         segmenter = MobileSAMSegmenter(checkpoint=sam_checkpoint, device=device)
         mask_clip = MaskCLIPSemantics(
             device=device, model_name=maskclip_model_name, input_size=maskclip_input_size,
@@ -462,5 +568,7 @@ def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
         return SamRefinedDetector(
             base, segmenter, mask_clip, device=device,
             min_clip_sim=min_clip_sim, min_mask_pixels=min_mask_pixels,
+            negative_texts=negative_classes, softmax_temp=softmax_temp,
+            min_target_prob=min_target_prob,
         )
     raise ValueError(f"Unknown detector backend: {name!r}")

@@ -35,7 +35,9 @@ from src.habitat.habitat_utils import (
     spawn_agent_at_pos
 )
 from src.habitat.sim_interface import SimInterface
-from src.perception.obj_detection import make_detector
+from src.perception.obj_detection import (
+    make_detector, encode_query_with_negatives, target_prob_from_sims,
+)
 from src.perception.perception_stack import PerceptionStack
 from src.perception.segmentation import MobileSAMSegmenter
 from src.perception.utils import unprojection
@@ -192,15 +194,20 @@ def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
     """Whole-image SAM → CLIP-scored best mask → BEV cells.
 
     Run MobileSAM's automatic mask generator over the full RGB frame, score
-    every proposal by mean CLIP cosine similarity to ``target_query``, pick
-    the highest-scoring mask, and project its pixels (gated by valid depth)
-    into BEV. The detector box is only used as a *trigger* upstream — it
-    does NOT constrain SAM. Rationale: at distance the box is often a full
-    box-width off, so box-prompted SAM inherits that error; auto-gen lets
-    SAM find object boundaries from scratch and CLIP picks the right one.
+    every proposal by softmax over its mean CLIP cosine to ``target_query``
+    plus the distractor vocabulary (``cfg.det_negative_classes``), pick the
+    mask with the highest target probability, and project its pixels (gated
+    by valid depth) into BEV. The relative "more pillow than wall" score is
+    used because raw CLIP cosines cluster in a narrow ~0.2–0.3 band where
+    distractor masks score nearly as high as the target. The detector box is
+    only used as a *trigger* upstream — it does NOT constrain SAM.
+    Rationale: at distance the box is often a full box-width off, so
+    box-prompted SAM inherits that error; auto-gen lets SAM find object
+    boundaries from scratch and CLIP picks the right one.
 
-    Returns a (num_z, num_x) bool numpy array, or None if no mask cleared
-    ``min_clip_sim`` or no valid depth pixels remained.
+    Returns a (num_z, num_x) bool numpy array, or None if the best mask's
+    target probability missed ``cfg.sam_min_target_prob``, its raw cosine
+    missed ``min_clip_sim``, or no valid depth pixels remained.
     """
     if rgb is None or depth is None or c2w is None or not target_query or segmenter is None:
         return None
@@ -209,6 +216,7 @@ def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
     segmenter.last_mask = None
     segmenter.last_box = None
     segmenter.last_score = 0.0
+    segmenter.last_prob = 0.0
 
     rgb_gpu = rgb.to(perception.device)
     depth_gpu = depth.to(perception.device)
@@ -218,18 +226,24 @@ def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
     if not masks:
         return None
 
-    feats = perception.mask_clip.extract_dense_features(rgb_gpu)  # (H, W, 512)
-    text_embed = perception.mask_clip.encode_text(target_query)   # (1, 512)
-    sim_2d = (feats @ text_embed.T).squeeze(-1)                   # (H, W) in [-1, 1]
-    if sim_2d.shape != (H_d, W_d):
-        sim_2d = torch.nn.functional.interpolate(
-            sim_2d[None, None].float(), size=(H_d, W_d),
+    feats = perception.mask_clip.extract_dense_features(rgb_gpu)      # (H, W, 512)
+    text_bank = encode_query_with_negatives(
+        perception.mask_clip, target_query,
+        getattr(cfg, 'det_negative_classes', None))                   # (K, 512)
+    sim_maps = (feats @ text_bank.T).permute(2, 0, 1)                 # (K, H, W) in [-1, 1]
+    if sim_maps.shape[1:] != (H_d, W_d):
+        sim_maps = torch.nn.functional.interpolate(
+            sim_maps[None].float(), size=(H_d, W_d),
             mode='bilinear', align_corners=False,
-        )[0, 0]
+        )[0]
 
     depth_mask = (depth_gpu > cfg.min_sensor_dist) & (depth_gpu < cfg.max_sensor_dist)
 
-    best_score = -float('inf')
+    softmax_temp = float(getattr(cfg, 'sam_softmax_temp', 100.0))
+    min_target_prob = float(getattr(cfg, 'sam_min_target_prob', 0.5))
+
+    best_prob = -float('inf')
+    best_raw = -float('inf')
     best_seg = None
     for m in masks:
         seg = m['segmentation']  # numpy bool (H_rgb, W_rgb)
@@ -244,13 +258,16 @@ def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
         valid = seg_t & depth_mask
         if not bool(valid.any()):
             continue
-        score = float(sim_2d[valid].mean())
-        if score > best_score:
-            best_score = score
+        sims = sim_maps[:, valid].mean(dim=1)                         # (K,)
+        prob, raw = target_prob_from_sims(sims, softmax_temp)
+        if prob > best_prob:
+            best_prob = prob
+            best_raw = raw
             best_seg = seg_t
 
-    if best_seg is None or best_score < min_clip_sim:
+    if best_seg is None or best_prob < min_target_prob or best_raw < min_clip_sim:
         return None
+    best_score = best_raw  # raw target cosine — keeps sam_score's scale stable
 
     final_mask = best_seg & depth_mask
     if not bool(final_mask.any()):
@@ -266,6 +283,7 @@ def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
         segmenter.last_mask = seg_np
         segmenter.last_box = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
         segmenter.last_score = float(best_score)
+        segmenter.last_prob = float(best_prob)
 
     world_points = unprojection(
         depth_gpu, intrinsics, c2w.to(perception.device), perception.device, mask=final_mask,
@@ -318,7 +336,7 @@ def snap_to_free(cell, bev_occ, free_val=1):
 
 def plan_one_action(perception, sim_iface, mppi, cfg,
                     action_queue: deque, k_max: int = 5,
-                    progress: float = 0.0, det_score: float = 0.0,
+                    det_score: float = 0.0,
                     detected: bool = False, det_box=None, rgb=None, depth=None, c2w=None,
                     last_box_goal=None, last_box_conf: float = -1.0,
                     segmenter=None):
@@ -416,7 +434,6 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
         initial_heading=heading,
         intrinsics=sim_iface.intrinsics,
         sensor_height=cfg.sensor_height,
-        progress=progress,
         ig_source=cfg.ig_source,
         goal_confidence=goal_confidence,
     )
@@ -439,29 +456,6 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
         w_rps = cfg.mppi_w_sign * float(U_opt[i, 1]) / cfg.mppi_dt
         action_queue.append([v_mps, w_rps])
 
-    # Wedge detection: MPPI returned a "valid" plan but its first action is
-    # essentially (0, 0). Happens against walls/corners where every nonzero
-    # sample collides and the do-nothing rollout is the lone survivor. After
-    # a few consecutive stuck replans, override with a recovery rotation —
-    # changing heading exposes a different occupancy projection and usually
-    # unblocks the next replan.
-    first_v, first_w = action_queue[0]
-    v_thresh = float(getattr(cfg, "mppi_stuck_v_thresh_mps", 0.02))
-    w_thresh = float(getattr(cfg, "mppi_stuck_w_thresh_rps", 0.05))
-    if abs(first_v) < v_thresh and abs(first_w) < w_thresh:
-        mppi.stuck_counter += 1
-    else:
-        mppi.stuck_counter = 0
-    stuck_n = int(getattr(cfg, "mppi_stuck_replan_threshold", 2))
-    if mppi.stuck_counter >= stuck_n:
-        recovery_w = float(getattr(cfg, "mppi_stuck_recovery_w_rps", np.pi / 4))
-        # Spin in place in a fixed direction to scan for a way out, rather than
-        # alternating left/right (which can pace the same arc back and forth).
-        print(f"  plan: WEDGED ({mppi.stuck_counter} stationary replans) — "
-              f"recovery rotate {recovery_w:+.2f} rad/s")
-        action_queue.clear()
-        return [0.0, recovery_w], None, opt_path, mppi_score, goal, box_goal
-
     return action_queue.popleft(), None, opt_path, mppi_score, goal, box_goal
 
 
@@ -471,16 +465,21 @@ def run(cfg: Config, save_enabled: bool = True,
     # 1. Init simulator
     sim, agent = init_simulator(
         cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov, sensor_height=cfg.sensor_height,
+        agent_radius=cfg.agent_radius,
+        agent_height=cfg.agent_height,
     )
-    spawn_agent_at_random_navpoint(sim, agent)
-    # spawn_agent_at_pos(sim, agent, [0.0, 0.0, 0.0])
+    # spawn_agent_at_random_navpoint(sim, agent)
+    spawn_agent_at_pos(sim, agent, [0.0, 0.0, -5.0])
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)
     perception = PerceptionStack(cfg, scene_bounds)  # owns target_query; initialised from cfg
 
     mppi = MPPIPlanner(cfg, device=cfg.device)
-    detector = make_detector(cfg.detector, device=cfg.device)
+    detector = make_detector(
+        cfg.detector, device=cfg.device,
+        negative_classes=getattr(cfg, 'det_negative_classes', None),
+    )
     # MobileSAM is only consulted when the detector fires (Layer-1 goal
     # update), so a load failure shouldn't kill the run — fall back to the
     # box-based path with a warning. The path is None-guarded downstream.
@@ -592,7 +591,6 @@ def run(cfg: Config, save_enabled: bool = True,
             t_plan = time.time()
             pos = sim_iface.agent_position.copy()
             heading = get_agent_heading(sim_iface.agent)
-            progress = step / max(1, cfg.iterations)
 
             rgb_cur, depth_cur, c2w_cur = perception.observe(sim_iface)
             det_score, det_box = detector.detect(rgb_cur, perception.target_query)
@@ -621,7 +619,7 @@ def run(cfg: Config, save_enabled: bool = True,
 
             action, ref_traj, opt_traj, score, goal_cell, box_goal = plan_one_action(
                 perception, sim_iface, mppi, cfg, action_queue,
-                progress=progress, det_score=det_score, detected=detected,
+                det_score=det_score, detected=detected,
                 det_box=det_box, rgb=rgb_cur, depth=depth_cur, c2w=c2w_cur,
                 last_box_goal=last_box_goal, last_box_conf=last_box_conf,
                 segmenter=segmenter,

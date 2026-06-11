@@ -1,32 +1,28 @@
 import torch
 import numpy as np
-import time
 from collections import deque
-from .utils import find_nearest_free_cell, compute_fov_ig, compute_batch_fov_ig
+from types import SimpleNamespace
+from .utils import find_nearest_free_cell, compute_batch_fov_ig
+
 
 class MPPIPlanner:
+    # Fixed cost constants (not exposed as config knobs).
+    CONTROL_COST_WEIGHT = 0.1   # penalty on per-step control magnitude
+    ARRIVAL_BONUS = 1000.0      # EXPLOIT reward per horizon-fraction dwelt at goal
+    IG_DISCOUNT = 0.95          # per-step discount on information gain
+    EXPLOIT_CONF = 0.99         # goal_confidence >= this ⇒ EXPLOIT (arrival freeze)
+
     def __init__(self, cfg, device="cuda"):
         self.cfg = cfg
         self.device = device
-        # Previous safe control sequence, used to warm-start the next call.
+        # Previous safe control sequence, warm-started into the next call.
         # None until the first successful optimize_trajectory.
         self.last_U = None
-        # Adaptive horizon: shrinks on consecutive "no safe rollout" failures
-        # so a stuck agent can find a shorter feasible plan, then snaps back
-        # to the default horizon on the first successful plan.
-        self.default_horizon = getattr(cfg, "mppi_horizon", 150)
-        self.horizon_shrink_step = getattr(cfg, "mppi_horizon_shrink_step", 20)
-        self.min_horizon = getattr(cfg, "mppi_min_horizon", 10)
-        self.current_horizon = self.default_horizon
-        # Latched exploit confidence — hysteresis so a brief detection keeps
-        # the goal-pull engaged after the target falls out of view. Updated
-        # each call as max(incoming, prev * decay).
+        # Latched detection confidence (hysteresis so a brief sighting keeps the
+        # goal-pull engaged after the target leaves view). `last_w_conf` is the
+        # resulting goal weight, read by the caller for logging.
         self.exploit_conf = 0.0
-        # Wedge counter: consecutive replans where MPPI's optimal first
-        # action is essentially (0, 0). Read/incremented by the caller; used
-        # to trigger a recovery rotation when the agent is stuck against a
-        # wall and every motion sample collides.
-        self.stuck_counter = 0
+        self.last_w_conf = 0.0
 
     def get_highest_sim_goal(self, sim_map, obstacle_val=2, occ_map=None):
         """
@@ -95,396 +91,339 @@ class MPPIPlanner:
                     queue.append((nz, nx))
         return candidates
 
-    def get_top_k_sim_goals(self, sim_map, occ_map=None, k=10, obstacle_val=2, min_separation=10):
-        """
-        Return up to k goal candidates ranked by semantic similarity. Each candidate
-        is snapped to the nearest free cell if it lands on an obstacle. Candidates
-        are spaced at least `min_separation` cells apart so the fallback list
-        explores genuinely different goals rather than near-duplicates.
-        """
-        target_sim = sim_map.copy().astype(np.float32)
-        if occ_map is not None:
-            target_sim[occ_map == 0] = -np.inf  # exclude unseen
+    # def get_top_k_sim_goals(self, sim_map, occ_map=None, k=10, obstacle_val=2, min_separation=10):
+    #     """
+    #     Return up to k goal candidates ranked by semantic similarity. Each candidate
+    #     is snapped to the nearest free cell if it lands on an obstacle. Candidates
+    #     are spaced at least `min_separation` cells apart so the fallback list
+    #     explores genuinely different goals rather than near-duplicates.
+    #     """
+    #     target_sim = sim_map.copy().astype(np.float32)
+    #     if occ_map is not None:
+    #         target_sim[occ_map == 0] = -np.inf  # exclude unseen
 
-        flat = target_sim.flatten()
-        # Argsort descending; -inf entries naturally land at the end
-        order = np.argsort(-flat)
+    #     flat = target_sim.flatten()
+    #     # Argsort descending; -inf entries naturally land at the end
+    #     order = np.argsort(-flat)
 
-        H, W = target_sim.shape
-        chosen = []
-        for idx in order:
-            if not np.isfinite(flat[idx]):
-                break
-            y, x = int(idx // W), int(idx % W)
-            cand = (y, x)
-            if occ_map is not None and occ_map[y, x] >= obstacle_val:
-                cand = find_nearest_free_cell(occ_map, cand, obstacle_val)
-                if cand is None:
-                    continue
-            # Enforce separation from already-chosen goals
-            if any(abs(cand[0] - cy) + abs(cand[1] - cx) < min_separation for cy, cx in chosen):
-                continue
-            chosen.append(cand)
-            if len(chosen) >= k:
-                break
-        return chosen
+    #     H, W = target_sim.shape
+    #     chosen = []
+    #     for idx in order:
+    #         if not np.isfinite(flat[idx]):
+    #             break
+    #         y, x = int(idx // W), int(idx % W)
+    #         cand = (y, x)
+    #         if occ_map is not None and occ_map[y, x] >= obstacle_val:
+    #             cand = find_nearest_free_cell(occ_map, cand, obstacle_val)
+    #             if cand is None:
+    #                 continue
+    #         # Enforce separation from already-chosen goals
+    #         if any(abs(cand[0] - cy) + abs(cand[1] - cx) < min_separation for cy, cx in chosen):
+    #             continue
+    #         chosen.append(cand)
+    #         if len(chosen) >= k:
+    #             break
+    #     return chosen
 
+    # ─────────────────────────── public API ───────────────────────────
 
     def optimize_trajectory(self, start, goal, ig_map, occ_map,
-    num_samples=250, num_iters=None, horizon=None,
-    lambda_weight=None, w_goal=1, w_ig=None,
-    intrinsics=None, sensor_height=1.5, initial_heading=None,
-    progress=0.0, ig_source="unseen", goal_confidence=0.0):
-        """
-        Optimize a trajectory from `start` to `goal` using MPPI unicycle
-        sampling. No A* reference; nominal controls start at zero and MPPI
-        refines them via softmax-weighted updates across iterations.
+                            num_samples=250, num_iters=None, horizon=None,
+                            intrinsics=None, sensor_height=1.5,
+                            initial_heading=None, ig_source="unseen",
+                            goal_confidence=0.0):
+        """MPPI unicycle trajectory optimization from `start` to `goal` (both
+        (z, x) grid cells). Returns (best_traj, best_U):
+          best_traj : list of (z, x) cells — the highest-scoring rollout.
+          best_U    : [H, 2] committed controls (v cells/step, w rad/step), or
+                      None when no collision-free rollout was found.
 
-        `start` and `goal` are (z, x) grid-cell tuples. Exploitation cost is
-        mean per-step Euclidean distance from rollout waypoints to `goal`.
-
-        Collision handling is hard exclusion: any rollout that touches an
-        obstacle in its horizon is scored -inf and dropped from both selection
-        and the softmax, so the committed plan is always collision-free. When
-        no rollout is safe, returns best_U=None and the caller recovers.
-
-        Cost weights (`mppi_lambda`, `mppi_w_ig`, `mppi_w_goal`) come from
-        cfg. Control-noise stddev is anchored to half the actuator limits and
-        modulated by DIAL annealing across MPPI iterations (`beta_traj`) and
-        horizon steps (`beta_action`).
+        Each iteration samples DIAL-annealed control noise around the warm-
+        started nominal, rolls out the unicycle, scores the rollouts, and
+        refines the nominal by a softmax-weighted update. Colliding rollouts
+        are hard-excluded (see `_score_rollouts` / `_select_and_weight`).
         """
         if start is None or goal is None:
-            return ([(int(start[0]), int(start[1]))] if start is not None else []), None, None, None
+            return ([(int(start[0]), int(start[1]))] if start is not None else []), None
 
-        mppi_lambda = self.cfg.mppi_lambda
-        w_ig = self.cfg.mppi_w_ig
-        w_goal = self.cfg.mppi_w_goal
+        cfg = self.cfg
+        num_iters = cfg.mppi_num_iters if num_iters is None else num_iters
+        horizon = cfg.mppi_horizon if horizon is None else horizon
+        dt, res = cfg.mppi_dt, cfg.voxel_resolution
 
-        # # Exploration→exploitation mixing weight, length-agnostic.
-        # # lam(progress=0) = 1.0 → pure IG; lam(progress=1) ≈ 0.368.
-        # lam = float(np.exp(-float(np.clip(progress, 0.0, 1.0))/2.0))
-
-        # Detection-confidence weighting with hysteresis.
-        #   latch = max(incoming, prev * decay)  → sticks high after a brief detection
-        #   below `threshold`: w_conf = 0 (exploitation hard-off, IG full)
-        #   above:            w_conf = conf_scale * (a^latch - 1)/(a - 1)
-        # With a < 1 the curve is concave/saturating — small post-threshold
-        # values already produce near-full goal pull. IG is damped
-        # symmetrically by `(1 - w_conf_norm)`.
-        a_conf = float(getattr(self.cfg, "mppi_conf_weight_a", 0.1))
-        conf_scale = float(getattr(self.cfg, "mppi_conf_weight_scale", 100.0))
-        conf_decay = float(getattr(self.cfg, "mppi_conf_decay", 0.9))
-        conf_threshold = float(getattr(self.cfg, "mppi_conf_threshold", 0.1))
-        incoming_conf = float(np.clip(goal_confidence, 0.0, 1.0))
-        self.exploit_conf = max(incoming_conf, self.exploit_conf * conf_decay)
-        if self.exploit_conf <= conf_threshold:
-            w_conf = 0.0
-            w_ig_conf = 1.0
-        else:
-            w_conf_norm = (a_conf ** self.exploit_conf - 1.0) / (a_conf - 1.0)
-            w_conf = conf_scale * w_conf_norm
-            w_ig_conf = 1.0 - w_conf_norm
-        # Expose for logging / visualization. Latched exploit confidence (post
-        # decay+ratchet) and the resulting goal-distance weight.
-        self.last_exploit_conf = float(self.exploit_conf)
-        self.last_w_conf = float(w_conf)
-
-        if num_iters is None:     num_iters = getattr(self.cfg, "mppi_num_iters", 5)
-        # Caller-supplied horizon pins the value (and bypasses adaptive
-        # shrinking entirely); otherwise use the planner's current adaptive
-        # horizon, which shrinks after each consecutive failed replan.
-        horizon_pinned = horizon is not None
-        if horizon is None:       horizon = self.current_horizon
-
-        start_z, start_x = float(start[0]), float(start[1])
-        goal_z,  goal_x  = float(goal[0]),  float(goal[1])
+        w_conf, w_ig_conf, in_exploit = self._confidence_weights(goal_confidence)
 
         occ_torch = torch.from_numpy(occ_map).to(self.device).long()
-        # Collision-only view of occupancy: carve a small disk around the goal
-        # so the target cell (which is often an obstacle — e.g. the bed, the
-        # pillow) is reachable. The original occ_torch is unchanged for IG
-        # raycasts, which still see the target as a proper occluder.
-        r_carve = getattr(self.cfg, "mppi_goal_carve_radius", 1)
-        occ_collision = occ_torch.clone()
-        if r_carve > 0:
-            gz = int(round(goal_z))
-            gx = int(round(goal_x))
-            z0, z1 = max(0, gz - r_carve), min(occ_torch.shape[0], gz + r_carve + 1)
-            x0, x1 = max(0, gx - r_carve), min(occ_torch.shape[1], gx + r_carve + 1)
-            zz, xx = torch.meshgrid(
-                torch.arange(z0, z1, device=self.device),
-                torch.arange(x0, x1, device=self.device),
-                indexing='ij',
-            )
-            disk = ((zz - gz) ** 2 + (xx - gx) ** 2) <= r_carve ** 2
-            patch = occ_collision[z0:z1, x0:x1]
-            patch[disk] = 1  # treat as free for collision
-            occ_collision[z0:z1, x0:x1] = patch
-        # IG signal: either the supplied uncertainty map ("epistemic"), or a
-        # binary mask of unseen occupancy cells ("unseen"). The unseen branch
-        # ignores ig_map entirely — the caller can pass anything (e.g. None
-        # placeholder or the epi map for logging) without affecting the cost.
+        # IG signal: a binary mask of unseen cells ("unseen"), or the supplied
+        # uncertainty map ("epistemic"). The unseen branch ignores ig_map.
         if ig_source == "unseen":
             ig_torch = (occ_torch == 0).float()
         else:
             ig_torch = torch.from_numpy(ig_map).to(self.device).float()
-
         Z_dim, X_dim = ig_torch.shape
 
-        # Control bounds (cells/step and rad/step).
-        max_v_cells = (getattr(self.cfg, "mppi_max_v_mps", 1.0) * self.cfg.mppi_dt) / self.cfg.voxel_resolution
-        min_v_cells = (getattr(self.cfg, "mppi_min_v_mps", 0.0) * self.cfg.mppi_dt) / self.cfg.voxel_resolution
-        max_w_rad   = getattr(self.cfg, "mppi_max_w_rps", 2.0) * self.cfg.mppi_dt
-
-        # Starting heading: agent's real pose if provided, else point at goal.
-        if initial_heading is not None:
-            theta_start = torch.tensor(float(initial_heading), device=self.device, dtype=torch.float32)
-        else:
-            theta_start = torch.tensor(float(np.arctan2(goal_z - start_z, goal_x - start_x)),
-                                       device=self.device, dtype=torch.float32)
-
-        # Warm-start: shift the previously committed control sequence left by
-        # one (drop the action already executed) and zero-pad the tail. On the
-        # first call (or after a manual reset), last_U is None and U_nom = 0.
-        had_warmstart = self.last_U is not None
-        U_nom = torch.zeros((horizon, 2), device=self.device, dtype=torch.float32)
-        if had_warmstart:
-            last_U_t = torch.as_tensor(self.last_U, device=self.device, dtype=torch.float32)
-            shifted_len = min(last_U_t.shape[0] - 1, horizon)
-            if shifted_len > 0:
-                U_nom[:shifted_len] = last_U_t[1:1 + shifted_len]
-
-        # Control-noise stddev per channel, anchored to half the actuator
-        # limit so the sampling envelope auto-scales when mppi_max_v_mps /
-        # mppi_max_w_rps change. No separate cov_scale knob — annealing
-        # (below) handles iteration- and horizon-time modulation.
-        cov_diag = torch.tensor(
-            [0.5 * max_v_cells, 0.5 * max_w_rad],
-            device=self.device, dtype=torch.float32,
+        # Per-call constants shared by the rollout/scoring helpers.
+        p = SimpleNamespace(
+            num_samples=num_samples, horizon=horizon,
+            start_z=float(start[0]), start_x=float(start[1]),
+            goal_z=float(goal[0]), goal_x=float(goal[1]),
+            Z_dim=Z_dim, X_dim=X_dim,
+            w_goal=cfg.mppi_w_goal, w_ig=cfg.mppi_w_ig, mppi_lambda=cfg.mppi_lambda,
+            w_conf=w_conf, w_ig_conf=w_ig_conf, in_exploit=in_exploit,
+            arrival_radius=cfg.stop_distance_m / res,
+            v_min=(cfg.mppi_min_v_mps * dt) / res,
+            v_max=(cfg.mppi_max_v_mps * dt) / res,
+            w_max=cfg.mppi_max_w_rps * dt,
+            intrinsics=intrinsics, sensor_height=sensor_height,
+            occ_torch=occ_torch, ig_torch=ig_torch,
+            occ_collision=self._carved_occupancy(occ_torch, float(goal[0]), float(goal[1])),
         )
+        # Heading: real pose if given, else aim straight at the goal.
+        p.theta_start = (float(initial_heading) if initial_heading is not None
+                         else float(np.arctan2(p.goal_z - p.start_z, p.goal_x - p.start_x)))
 
-        w_control = 0.1
+        U_nom, had_warmstart = self._warm_start(horizon)
+        cov_diag, action_scale = self._noise_envelope(p, had_warmstart)
 
-        # DIAL-MPC action-level annealing: noise variance grows with horizon
-        # index, so early steps (which we'll actually commit to) stay near the
-        # warm-started controls while tail steps explore widely. Precomputed
-        # once: shape [H], values in (0, 1], h=H-1 is full noise.
-        # On cold start (no warm-start to anchor to), annealing would squash
-        # h=0 noise to near-zero around U_nom=0, locking the agent into a
-        # stationary plan. Use uniform full noise across the horizon instead
-        # so every step explores freely.
-        beta_action = self.cfg.mppi_anneal_beta_action
-        beta_traj   = self.cfg.mppi_anneal_beta_traj
-        h_idx = torch.arange(horizon, device=self.device, dtype=torch.float32)
-        if had_warmstart:
-            action_scale = torch.exp(-(horizon - 1 - h_idx) / (beta_action * horizon))  # [H]
-        else:
-            action_scale = torch.ones(horizon, device=self.device, dtype=torch.float32)
-
-        best_traj = [(int(start_z), int(start_x))]
-        best_U = None
-        best_score = -float('inf')
+        best = SimpleNamespace(traj=[(int(p.start_z), int(p.start_x))], U=None,
+                               score=-float('inf'))
         for it in range(num_iters):
-             # Sample control noise at the per-channel stddev, then anneal.
-             noise = torch.randn((num_samples, horizon, 2), device=self.device) * cov_diag  # [K, H, 2]
-             # DIAL-MPC trajectory-level annealing: iter 0 = full noise (wide
-             # exploration), iter N-1 = shrunken noise (local refinement).
-             # Combined with action-level scaling so iter N-1 + h=0 is the
-             # most concentrated sample (refining the immediately-committed
-             # action), iter 0 + h=H-1 is the widest (rough global coverage).
-             traj_scale = float(np.exp(-it / (beta_traj * max(num_iters, 1))))
-             noise = noise * (traj_scale * action_scale).view(1, horizon, 1)
-             # Pin sample 0 to zero noise so the unmutated warm-start is always
-             # evaluated as-is — protects against the case where every noisy
-             # variant happens to be worse than the carried-over plan. Skip
-             # this on cold start, where "U_nom + 0 noise" is just the
-             # do-nothing plan and would bias the softmax toward stillness.
-             if had_warmstart:
-                 noise[0] = 0.0
-             U_samples = U_nom.unsqueeze(0) + noise
+            noise = self._sample_noise(cov_diag, action_scale, it, num_iters, had_warmstart, p)
+            U_samples, Z, X, Theta = self._rollout(U_nom, noise, p)
+            ev = self._score_rollouts(U_samples, Z, X, Theta, p)
+            weights = self._select_and_weight(ev, p, best)
+            U_nom = U_nom + (weights.view(-1, 1, 1) * noise).sum(dim=0)
 
-             # Clamp linear / angular velocity bounds
-             U_samples[:, :, 0] = torch.clamp(U_samples[:, :, 0], min=min_v_cells, max=max_v_cells)
-             U_samples[:, :, 1] = torch.clamp(U_samples[:, :, 1], min=-max_w_rad, max=max_w_rad)
+        # On failure, clear the warm-start so the next replan samples from zero
+        # rather than biasing back toward the plan that led into the dead-end.
+        self.last_U = best.U.copy() if best.U is not None else None
+        return best.traj, best.U
 
-             # Rollout kinematics - Vectorized
-             Theta_samples = torch.zeros((num_samples, horizon), device=self.device)
-             Theta_samples[:, 0] = theta_start
-             Theta_samples[:, 1:] = theta_start + torch.cumsum(U_samples[:, :-1, 1], dim=1)
+    # ──────────────────────────── setup ────────────────────────────
 
-             Z_samples = torch.zeros((num_samples, horizon), device=self.device)
-             X_samples = torch.zeros((num_samples, horizon), device=self.device)
-             Z_samples[:, 0] = start_z
-             X_samples[:, 0] = start_x
-
-             # Turn-first integration: translate using the heading AFTER each
-             # step's angular control, so w_0 actually steers the first step.
-             Z_samples[:, 1:] = start_z + torch.cumsum(U_samples[:, :-1, 0] * torch.sin(Theta_samples[:, 1:]), dim=1)
-             X_samples[:, 1:] = start_x + torch.cumsum(U_samples[:, :-1, 0] * torch.cos(Theta_samples[:, 1:]), dim=1)
-
-             # ── Collision: hard exclusion ──────────────────────────────────
-             # Waypoint-level occupancy check. No segment sub-sampling: at the
-             # default config a step covers at most ~1 cell (max_v_cells =
-             # max_v_mps * dt / resolution), so consecutive waypoints are
-             # adjacent cells and there is nothing to tunnel through.
-             # A rollout that touches an obstacle ANYWHERE in its horizon is
-             # discarded outright (scored -inf below), so only genuinely
-             # collision-free plans compete and the argmax commits to a clean
-             # escape instead of dwelling on a least-bad path.
-             Z_idx = torch.clamp(Z_samples.round().long(), 0, Z_dim - 1)
-             X_idx = torch.clamp(X_samples.round().long(), 0, X_dim - 1)
-             occ_vals = occ_collision[Z_idx, X_idx]
-
-             # Forgive the starting cell: if the agent is pressed against a wall
-             # and technically starts inside an obstacle (especially with
-             # dilation), we don't want to penalize rollouts just for being in
-             # the start cell. Only entry into *new* obstacle cells counts.
-             start_z_idx = min(max(int(round(start_z)), 0), Z_dim - 1)
-             start_x_idx = min(max(int(round(start_x)), 0), X_dim - 1)
-             at_start = (Z_idx == start_z_idx) & (X_idx == start_x_idx)
-
-             # Arrival radius (cells): a single distance that drives BOTH the
-             # obstacle-contact forgiveness below and the EXPLOIT arrival freeze.
-             # Anchored to the episode-termination distance in main.py so
-             # "arrived" here means the same thing as "done" there — keep these
-             # in sync. (`mppi_goal_carve_radius`, the tiny disk opened around
-             # the goal cell in `occ_collision`, is a separate, smaller knob.)
-             arrival_radius = float(getattr(self.cfg, "stop_distance_m", 1.5)) / self.cfg.voxel_resolution
-
-             # "Has the rollout reached the goal yet?" — monotonic in rollout
-             # time via cummax, computed once and reused for both purposes:
-             #   1) forgive obstacle contact once inside the radius (the target
-             #      object is itself an obstacle, so the final approach must
-             #      touch it — without this the planner is left orbiting it);
-             #   2) mark the EXPLOIT absorbing region (below).
-             sq_dist = (Z_samples - goal_z) ** 2 + (X_samples - goal_x) ** 2     # [K, H]
-             reached_goal = torch.cummax(
-                 (sq_dist <= arrival_radius ** 2).long(), dim=1).values.bool()   # [K, H]
-
-             collide = (occ_vals >= 2) & ~at_start & ~reached_goal
-             safe_mask = ~collide.any(dim=1)                                # [K]
-             row = torch.arange(num_samples, device=self.device)
-
-             # EXPLOIT absorbing terminal state: once a rollout enters the
-             # arrival radius it is frozen for the rest of the horizon —
-             # position pinned to the arrival point, controls zeroed. This makes
-             # "reach the target fast, then sit" the highest-scoring behavior:
-             # post-arrival motion costs nothing and earlier arrival earns more
-             # dwell-step reward. Colliding rollouts are dropped by `safe_mask`
-             # in selection, so none can profit by "arriving" through a wall.
-             in_exploit = incoming_conf >= 0.99
-             if in_exploit:
-                 # First-arrival waypoint per rollout (argmax → first True; 0 for
-                 # rollouts that never arrive — harmless, since `reached_goal` is
-                 # all-False there and the freeze is then a no-op).
-                 first_arr_idx = torch.argmax(reached_goal.long(), dim=1)        # [K]
-                 ar_z = Z_samples[row, first_arr_idx]                            # [K]
-                 ar_x = X_samples[row, first_arr_idx]                            # [K]
-                 Z_samples = torch.where(reached_goal, ar_z.unsqueeze(1), Z_samples)
-                 X_samples = torch.where(reached_goal, ar_x.unsqueeze(1), X_samples)
-                 U_samples = U_samples * (~reached_goal).unsqueeze(-1).float()
-                 # Distance pull over the pre-arrival approach only.
-                 pre_arr = ~reached_goal
-                 n_pre = pre_arr.float().sum(dim=1).clamp(min=1.0)
-                 dist_cost = (sq_dist * pre_arr.float()).sum(dim=1) / n_pre
-                 post_arr_wp = reached_goal
-             else:
-                 dist_cost = sq_dist.mean(dim=1)
-                 post_arr_wp = torch.zeros((num_samples, horizon), dtype=torch.bool, device=self.device)
-
-             # Re-discretize after the EXPLOIT arrival freeze (round, don't
-             # truncate) so IG / best_traj see a rollout that stops at the
-             # target rather than continuing through it.
-             Z_idx = torch.clamp(Z_samples.round().long(), 0, Z_dim - 1)
-             X_idx = torch.clamp(X_samples.round().long(), 0, X_dim - 1)
-
-             scores = torch.zeros(num_samples, device=self.device)
-             # Cost 1: Goal-distance pull (squared, to weight far points harder).
-             scores -= w_goal * w_conf * dist_cost
-
-             # Graded terminal-arrival reward (EXPLOIT only): proportional to the
-             # fraction of the horizon spent absorbed at the target, so a rollout
-             # that arrives early (drives straight in) outscores one that arrives
-             # late or merely grazes the radius and drifts off.
-             arrival_bonus = float(1000.0)
-             scores += arrival_bonus * post_arr_wp.float().mean(dim=1)
-
-             control_cost = torch.mean(torch.sqrt(U_samples[:, :, 0]**2 + U_samples[:, :, 1]**2), dim=1)
-             scores -= w_control * control_cost
-
-             # Cost 2: Information Gain (vectorized). Only rewarded for
-             # collision-free rollouts (the FOV raycast already handles unseen
-             # cells via line-of-sight) and skipped entirely when the IG weight
-             # is ~0 (EXPLOIT), which saves the most expensive cost term.
-             if w_ig_conf * w_ig > 1e-6 and safe_mask.any():
-                 batch_ig, _ = compute_batch_fov_ig(
-                     Z_idx[safe_mask], X_idx[safe_mask], Theta_samples[safe_mask],
-                     ig_torch, occ_torch, self.cfg, self.device,
-                     gamma_ig=0.95, intrinsics=intrinsics,
-                     sensor_height=sensor_height,
-                 )
-                 scores[safe_mask] += w_ig_conf * w_ig * batch_ig
-
-             # Hard-exclude colliding rollouts from selection and weighting.
-             # When at least one safe rollout exists, argmax + softmax run over
-             # the safe set only, so the committed plan is guaranteed collision-
-             # free. When none survive (truly wedged), fall through to the soft
-             # branch so U_nom still drifts toward a less-bad region; if best_U
-             # stays None the caller spins to scan for a way out.
-             if safe_mask.any():
-                 NEG_INF = torch.tensor(float('-inf'), device=scores.device)
-                 masked_scores = torch.where(safe_mask, scores, NEG_INF)
-                 iter_best_idx = torch.argmax(masked_scores)
-                 if masked_scores[iter_best_idx] > best_score:
-                     best_score = masked_scores[iter_best_idx].item()
-                     best_traj = [(int(Z_idx[iter_best_idx, t]), int(X_idx[iter_best_idx, t])) for t in range(horizon)]
-                     best_U = U_samples[iter_best_idx].detach().cpu().numpy()  # [H, 2] (v_cells_per_step, w_rad_per_step)
-                 beta = masked_scores.max()
-                 weights = torch.exp((masked_scores - beta) / mppi_lambda)
-             else:
-                 # No safe rollout this iter. Don't weight by `scores`: its
-                 # goal-distance term is actively misleading here — in a corner
-                 # the goal sits behind the wall, so "closest to goal" means
-                 # "drove straight into it", and U_nom would be nudged deeper
-                 # into the obstacle. Instead steer the next iter's samples
-                 # toward the controls that survived LONGEST before colliding
-                 # (delaying contact ≈ turning out of the pocket). Across the
-                 # iter loop this is a CE-style refit toward feasibility.
-                 print("NO SAFE ROLLOUTS")
-                 # First-collision step per rollout. `collide` is False at the
-                 # forgiven start cell, so every rollout here collides at step
-                 # >= 1 and argmax returns that first step (higher = better).
-                 survival = torch.argmax(collide.long(), dim=1).float()         # [K]
-                 # Goal proximity as a sub-step tiebreak among equal-survival
-                 # rollouts, normalized to [0, 1) so it can never outweigh one
-                 # extra surviving step.
-                 d_span = dist_cost.max() - dist_cost.min()
-                 goal_tiebreak = (dist_cost.max() - dist_cost) / (d_span + 1e-8)
-                 soft = survival + 0.5 * goal_tiebreak
-                 beta = soft.max()
-                 weights = torch.exp((soft - beta) / mppi_lambda)
-             weights = weights / (torch.sum(weights) + 1e-8)
-             
-             # Update nominal controls
-             U_nom = U_nom + torch.sum(weights.view(-1, 1, 1) * noise, dim=0)
-
-        # No safe rollout found this call: clear the warm-start so the next
-        # replan samples from zero instead of biasing back toward the plan
-        # that led us into the dead-end. The caller handles best_U=None by
-        # spinning in place to scan for new options.
-        if best_U is None:
-            self.last_U = None
-            # # Shrink horizon for the next call until either a safe plan is
-            # # found or we hit min_horizon. Skip when the caller pinned the
-            # # horizon explicitly — they own the schedule in that case.
-            # if not horizon_pinned:
-            #     self.current_horizon = max(
-            #         self.min_horizon,
-            #         self.current_horizon - self.horizon_shrink_step,
-            #     )
+    def _confidence_weights(self, goal_confidence):
+        """Latched detection confidence → (goal-pull weight, IG weight, exploit
+        flag). Hysteresis: exploit_conf = max(incoming, prev * decay). Below
+        threshold the goal pull is off (pure IG); above it the concave curve
+        w = scale * (a^conf - 1)/(a - 1) saturates quickly (a < 1), and IG is
+        damped symmetrically by (1 - w_conf_norm)."""
+        cfg = self.cfg
+        incoming = float(np.clip(goal_confidence, 0.0, 1.0))
+        self.exploit_conf = max(incoming, self.exploit_conf * cfg.mppi_conf_decay)
+        if self.exploit_conf <= cfg.mppi_conf_threshold:
+            w_conf, w_ig_conf = 0.0, 1.0
         else:
-            self.last_U = best_U.copy()
-            if not horizon_pinned:
-                self.current_horizon = self.default_horizon
+            a = cfg.mppi_conf_weight_a
+            norm = (a ** self.exploit_conf - 1.0) / (a - 1.0)
+            w_conf, w_ig_conf = cfg.mppi_conf_weight_scale * norm, 1.0 - norm
+        self.last_w_conf = float(w_conf)
+        return w_conf, w_ig_conf, incoming >= self.EXPLOIT_CONF
 
-        return best_traj, best_U
+    def _carved_occupancy(self, occ_torch, goal_z, goal_x):
+        """Collision-map clone with a small free disk (`mppi_goal_carve_radius`)
+        carved around the goal cell, so the target — often itself an obstacle
+        (a bed, a pillow) — is reachable. IG raycasts keep the un-carved map."""
+        r = self.cfg.mppi_goal_carve_radius
+        occ = occ_torch.clone()
+        if r <= 0:
+            return occ
+        gz, gx = int(round(goal_z)), int(round(goal_x))
+        z0, z1 = max(0, gz - r), min(occ.shape[0], gz + r + 1)
+        x0, x1 = max(0, gx - r), min(occ.shape[1], gx + r + 1)
+        zz, xx = torch.meshgrid(
+            torch.arange(z0, z1, device=self.device),
+            torch.arange(x0, x1, device=self.device), indexing='ij')
+        disk = ((zz - gz) ** 2 + (xx - gx) ** 2) <= r ** 2
+        patch = occ[z0:z1, x0:x1]
+        patch[disk] = 1  # treat as free for collision
+        occ[z0:z1, x0:x1] = patch
+        return occ
+
+    def _warm_start(self, horizon):
+        """Nominal seed: the previous control sequence shifted left by one (the
+        executed action dropped) and zero-padded. Cold start → zeros."""
+        U_nom = torch.zeros((horizon, 2), device=self.device, dtype=torch.float32)
+        had = self.last_U is not None
+        if had:
+            last = torch.as_tensor(self.last_U, device=self.device, dtype=torch.float32)
+            n = min(last.shape[0] - 1, horizon)
+            if n > 0:
+                U_nom[:n] = last[1:1 + n]
+        return U_nom, had
+
+    def _noise_envelope(self, p, had_warmstart):
+        """Per-channel noise stddev and the DIAL action-level scale [H]. stddev
+        is half the actuator limit (auto-scales with the bounds). On cold start
+        the action scale is flat so every horizon step explores; with a warm-
+        start it grows toward the tail, keeping committed early steps near the
+        carried-over plan."""
+        cov_diag = torch.tensor([0.5 * p.v_max, 0.5 * p.w_max],
+                                device=self.device, dtype=torch.float32)
+        h_idx = torch.arange(p.horizon, device=self.device, dtype=torch.float32)
+        if had_warmstart:
+            beta_a = self.cfg.mppi_anneal_beta_action
+            action_scale = torch.exp(-(p.horizon - 1 - h_idx) / (beta_a * p.horizon))
+        else:
+            action_scale = torch.ones(p.horizon, device=self.device, dtype=torch.float32)
+        return cov_diag, action_scale
+
+    # ──────────────────────── per-iteration ────────────────────────
+
+    def _sample_noise(self, cov_diag, action_scale, it, num_iters, had_warmstart, p):
+        """Annealed control noise [K, H, 2]. Trajectory-level annealing shrinks
+        the variance across iterations (iter 0 widest, iter N-1 narrowest);
+        combined with the action-level scale, iter N-1 / step 0 is the most
+        concentrated sample. Sample 0 is pinned to the unmutated warm-start when
+        one exists, so the carried-over plan is always evaluated as-is."""
+        noise = torch.randn((p.num_samples, p.horizon, 2), device=self.device) * cov_diag
+        traj_scale = float(np.exp(-it / (self.cfg.mppi_anneal_beta_traj * max(num_iters, 1))))
+        noise = noise * (traj_scale * action_scale).view(1, p.horizon, 1)
+        if had_warmstart:
+            noise[0] = 0.0
+        return noise
+
+    def _rollout(self, U_nom, noise, p):
+        """Turn-first unicycle rollout of U_nom + noise (clamped to the control
+        bounds). Returns (U_samples, Z, X, Theta), each [K, H]."""
+        U = U_nom.unsqueeze(0) + noise
+        U[:, :, 0].clamp_(p.v_min, p.v_max)
+        U[:, :, 1].clamp_(-p.w_max, p.w_max)
+
+        Theta = torch.zeros((p.num_samples, p.horizon), device=self.device)
+        Theta[:, 0] = p.theta_start
+        Theta[:, 1:] = p.theta_start + torch.cumsum(U[:, :-1, 1], dim=1)
+
+        Z = torch.zeros((p.num_samples, p.horizon), device=self.device)
+        X = torch.zeros((p.num_samples, p.horizon), device=self.device)
+        Z[:, 0], X[:, 0] = p.start_z, p.start_x
+        # Translate using the heading AFTER each step's turn, so w_0 steers step 0.
+        Z[:, 1:] = p.start_z + torch.cumsum(U[:, :-1, 0] * torch.sin(Theta[:, 1:]), dim=1)
+        X[:, 1:] = p.start_x + torch.cumsum(U[:, :-1, 0] * torch.cos(Theta[:, 1:]), dim=1)
+        return U, Z, X, Theta
+
+    def _score_rollouts(self, U_samples, Z, X, Theta, p):
+        """Score every rollout. Hard-exclude any that hits an obstacle (the
+        start cell always forgiven; the goal-arrival region forgiven in
+        EXPLOIT only), apply the EXPLOIT arrival freeze, then combine
+        goal-distance, arrival, control, and IG terms. Returns a namespace with the per-rollout `scores`, the
+        `safe_mask`/`collide` collision info, `dist_cost`, and the post-freeze
+        `U`/`Z_idx`/`X_idx` used to commit the winner."""
+        K, H = p.num_samples, p.horizon
+        Z_idx = torch.clamp(Z.round().long(), 0, p.Z_dim - 1)
+        X_idx = torch.clamp(X.round().long(), 0, p.X_dim - 1)
+
+        # Forgive the start cell (the agent may legitimately start dilated into
+        # a wall). `reached_goal` is monotonic in rollout time (cummax) and
+        # drives the EXPLOIT freeze below.
+        #
+        # Arrival forgiveness is EXPLOIT-only: there the goal is a confirmed
+        # detection and itself an obstacle, so the final approach must be
+        # allowed to touch it. In SEARCH the goal is just a similarity peak —
+        # often ON or BEHIND a wall — and `sq_dist` knows nothing about
+        # geometry, so forgiving near-goal contact licenses rollouts to
+        # tunnel through the wall for the last `arrival_radius` cells.
+        # (SEARCH still gets the small `mppi_goal_carve_radius` disk carved
+        # in `occ_collision`, which is the intended, much tighter escape.)
+        start_z_idx = min(max(int(round(p.start_z)), 0), p.Z_dim - 1)
+        start_x_idx = min(max(int(round(p.start_x)), 0), p.X_dim - 1)
+        at_start = (Z_idx == start_z_idx) & (X_idx == start_x_idx)
+        sq_dist = (Z - p.goal_z) ** 2 + (X - p.goal_x) ** 2
+        reached_goal = torch.cummax(
+            (sq_dist <= p.arrival_radius ** 2).long(), dim=1).values.bool()
+        forgive_arrival = (reached_goal if p.in_exploit
+                           else torch.zeros_like(reached_goal))
+        collide = (p.occ_collision[Z_idx, X_idx] >= 2) & ~at_start & ~forgive_arrival
+
+        # Subsample each waypoint→waypoint segment. The agent can travel >1
+        # cell per horizon step, so a waypoint-only check tunnels through thin
+        # walls that fall between two consecutive waypoints. We interpolate
+        # `S` interior points per segment, discretize, and fold any hit into
+        # the *arrival* waypoint (t+1) so `collide`'s shape and the wedged-
+        # branch survival time stay correct.
+        S = int(self.cfg.mppi_collision_substeps)
+        if S > 0 and H > 1:
+            fracs = (torch.arange(1, S + 1, device=self.device, dtype=Z.dtype)
+                     / (S + 1)).view(1, 1, S)                 # interior fractions
+            Z_mid = Z[:, :-1, None] + (Z[:, 1:] - Z[:, :-1])[..., None] * fracs
+            X_mid = X[:, :-1, None] + (X[:, 1:] - X[:, :-1])[..., None] * fracs
+            Zi = torch.clamp(Z_mid.round().long(), 0, p.Z_dim - 1)  # [K, H-1, S]
+            Xi = torch.clamp(X_mid.round().long(), 0, p.X_dim - 1)
+            mid_occ = p.occ_collision[Zi, Xi] >= 2
+            mid_at_start = (Zi == start_z_idx) & (Xi == start_x_idx)
+            # EXPLOIT-only, same as the waypoint check above.
+            seg_forgive = forgive_arrival[:, 1:, None]  # arrived by segment end (monotone)
+            mid_collide = (mid_occ & ~mid_at_start & ~seg_forgive).any(dim=2)  # [K, H-1]
+            collide[:, 1:] = collide[:, 1:] | mid_collide
+
+        safe_mask = ~collide.any(dim=1)
+
+        # EXPLOIT absorbing terminal state: freeze each rollout at its first
+        # arrival waypoint (position pinned, controls zeroed) so "reach the
+        # target fast, then sit" is the highest-scoring behavior. SEARCH skips
+        # the freeze. Colliding rollouts are dropped by `safe_mask` in
+        # selection, so none can profit by "arriving" through a wall.
+        if p.in_exploit:
+            row = torch.arange(K, device=self.device)
+            first_arr = torch.argmax(reached_goal.long(), dim=1)
+            Z = torch.where(reached_goal, Z[row, first_arr].unsqueeze(1), Z)
+            X = torch.where(reached_goal, X[row, first_arr].unsqueeze(1), X)
+            U_samples = U_samples * (~reached_goal).unsqueeze(-1).float()
+            pre_arr = (~reached_goal).float()
+            dist_cost = (sq_dist * pre_arr).sum(dim=1) / pre_arr.sum(dim=1).clamp(min=1.0)
+            post_arr = reached_goal
+            # Re-discretize so IG / best_traj see a rollout that stops at the goal.
+            Z_idx = torch.clamp(Z.round().long(), 0, p.Z_dim - 1)
+            X_idx = torch.clamp(X.round().long(), 0, p.X_dim - 1)
+        else:
+            dist_cost = sq_dist.mean(dim=1)
+            post_arr = torch.zeros((K, H), dtype=torch.bool, device=self.device)
+
+        # Goal-distance pull (squared), graded arrival reward, control penalty.
+        scores = -p.w_goal * p.w_conf * dist_cost
+        scores += self.ARRIVAL_BONUS * post_arr.float().mean(dim=1)
+        control_cost = torch.sqrt(U_samples[:, :, 0] ** 2 + U_samples[:, :, 1] ** 2).mean(dim=1)
+        scores -= self.CONTROL_COST_WEIGHT * control_cost
+
+        # Information gain (collision-free rollouts only; skipped when its
+        # weight is ~0, i.e. EXPLOIT — saves the most expensive cost term).
+        if p.w_ig_conf * p.w_ig > 1e-6 and safe_mask.any():
+            batch_ig, _ = compute_batch_fov_ig(
+                Z_idx[safe_mask], X_idx[safe_mask], Theta[safe_mask],
+                p.ig_torch, p.occ_torch, self.cfg, self.device,
+                gamma_ig=self.IG_DISCOUNT, intrinsics=p.intrinsics,
+                sensor_height=p.sensor_height)
+            scores[safe_mask] += p.w_ig_conf * p.w_ig * batch_ig
+
+        return SimpleNamespace(scores=scores, safe_mask=safe_mask, collide=collide,
+                               dist_cost=dist_cost, U=U_samples, Z_idx=Z_idx, X_idx=X_idx)
+
+    def _select_and_weight(self, ev, p, best):
+        """Update `best` with this iteration's top collision-free rollout and
+        return the softmax weights for the U_nom update.
+
+        With safe rollouts the argmax + softmax run over them only, so the
+        committed plan is guaranteed collision-free. With NONE safe (wedged),
+        weight instead by survival time — steps before first collision — so the
+        next iter's samples steer toward delaying contact (turning out of the
+        pocket) rather than toward the goal-closest crash. Goal proximity is a
+        normalized sub-step tiebreak. If `best.U` stays None the caller recovers."""
+        if ev.safe_mask.any():
+            neg_inf = torch.tensor(float('-inf'), device=self.device)
+            logits = torch.where(ev.safe_mask, ev.scores, neg_inf)
+            idx = torch.argmax(logits)
+            if logits[idx] > best.score:
+                best.score = logits[idx].item()
+                best.traj = [(int(ev.Z_idx[idx, t]), int(ev.X_idx[idx, t]))
+                             for t in range(p.horizon)]
+                best.U = ev.U[idx].detach().cpu().numpy()  # [H, 2]
+        else:
+            print("NO SAFE ROLLOUTS")
+            # `collide` is False at the forgiven start cell, so every rollout
+            # here collides at step >= 1 and argmax gives that first step.
+            survival = torch.argmax(ev.collide.long(), dim=1).float()
+            span = ev.dist_cost.max() - ev.dist_cost.min()
+            goal_tiebreak = (ev.dist_cost.max() - ev.dist_cost) / (span + 1e-8)
+            logits = survival + 0.5 * goal_tiebreak
+
+        weights = torch.exp((logits - logits.max()) / p.mppi_lambda)
+        return weights / (weights.sum() + 1e-8)

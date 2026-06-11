@@ -67,7 +67,8 @@ class MobileSAMSegmenter:
         # plan_one_action's return tuple.
         self.last_mask: "np.ndarray | None" = None
         self.last_box: "tuple | None" = None
-        self.last_score: float = 0.0
+        self.last_score: float = 0.0   # raw CLIP cosine of the chosen mask
+        self.last_prob: float = 0.0    # softmax target prob vs. distractor vocab
 
     @torch.no_grad()
     def segment_all(

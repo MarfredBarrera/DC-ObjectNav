@@ -79,8 +79,16 @@ def make_cfg(
     return habitat_sim.Configuration(sim_cfg, [agent_cfg])
 
 
-def init_simulator(scene_filepath: str, **make_cfg_kwargs):
-    """Build config, create simulator, and initialise agent 0. Returns (sim, agent)."""
+def init_simulator(scene_filepath: str, agent_radius: float = 0.1,
+                   agent_height: float = 1.5, **make_cfg_kwargs):
+    """Build config, create simulator, and initialise agent 0. Returns (sim, agent).
+
+    When `agent_radius > 0`, recompute the navmesh with that radius instead of
+    using the scene's prebaked .navmesh. The navmesh insets walls by this
+    radius, so a smaller value lets `pathfinder.try_step` (which moves the
+    agent in SimInterface) squeeze through narrower gaps. Must run before any
+    navmesh-dependent setup (random spawn, scene-bounds query).
+    """
     cfg = make_cfg(scene_filepath, **make_cfg_kwargs)
     try:
         sim = habitat_sim.Simulator(cfg)
@@ -88,6 +96,20 @@ def init_simulator(scene_filepath: str, **make_cfg_kwargs):
         print(f"Error loading simulator: {exc}")
         raise SystemExit(1) from exc
     agent = sim.initialize_agent(0)
+
+    if agent_radius and agent_radius > 0:
+        navmesh_settings = habitat_sim.NavMeshSettings()
+        navmesh_settings.set_defaults()
+        navmesh_settings.agent_radius = float(agent_radius)
+        navmesh_settings.agent_height = float(agent_height)
+        ok = sim.recompute_navmesh(sim.pathfinder, navmesh_settings)
+        if not ok:
+            print(f"[init] navmesh recompute failed (r={agent_radius}); "
+                  "keeping prebaked navmesh")
+        else:
+            print(f"[init] recomputed navmesh: agent_radius={agent_radius}m "
+                  f"agent_height={agent_height}m")
+
     return sim, agent
 
 

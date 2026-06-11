@@ -29,6 +29,14 @@ class Config:
         self.sensor_height = 1.0
         self.min_sensor_dist = 0.00
         self.max_sensor_dist = 10.0
+        # Navmesh agent radius (m). Habitat's `pathfinder.try_step` (used to
+        # move the agent in SimInterface) clamps motion to the navmesh, which
+        # insets every wall by this radius — so narrow gaps the BEV considers
+        # open can be sealed in the navmesh, wedging the agent. Recomputed on
+        # load (overrides the scene's prebaked .navmesh). Smaller = the agent
+        # squeezes through tighter gaps. <=0 keeps the scene's baked navmesh.
+        self.agent_radius = 0.1
+        self.agent_height = 1.5
         
         # Semantics Settings (MaskCLIP)
         self.maskclip_model_name = "ViT-B/16"
@@ -104,25 +112,33 @@ class Config:
         self.grid_max_height = 2.0
 
         # Planning
-        self.mppi_dt = 0.5
+        self.mppi_dt = 0.1
         self.mppi_w_sign = -1.0  # flip if Habitat ω rotates opposite of MPPI's heading convention
         self.mppi_max_w_rps = 2.0  # rad/s clamp — prevents huge spins from sharp A* turns
         self.mppi_min_v_mps = 0.0
         self.mppi_max_v_mps = 1.0
+        self.mppi_horizon = 150           # rollout length (steps)
+        self.mppi_goal_carve_radius = 1   # free disk carved around the goal cell for collision
+        # Collision-check subsampling: number of intermediate points checked
+        # along each waypoint-to-waypoint segment (in addition to the
+        # waypoints). The agent can move >1 cell per horizon step, so a
+        # waypoint-only check tunnels through thin walls that fall between two
+        # consecutive waypoints. Set to N so the spacing between checks is
+        # ~(cells per step)/(N+1); 0 disables (waypoints only).
+        self.mppi_collision_substeps = 4
 
-        # MPPI exploration→exploitation schedule. progress=0 uses *_start,
-        # progress=1 uses *_end, linearly interpolated.
         self.mppi_lambda = 1.0     # softmax temperature: high = flatter weights, wider sampling
         self.mppi_w_ig = 30.0      # information-gain reward: high = chase uncertainty
         self.mppi_w_goal = 1.0     # goal-distance pull: low early = pure IG exploration
-        # Truncate-and-score collision penalty: per fraction of the horizon a
-        # rollout loses to its first collision (dying later scores better).
-        self.mppi_w_dead = 1e4
-        # ESDF clearance cost: per-step penalty exp(-d/d0) where d is the
-        # distance (m) to the nearest obstacle. Keeps surviving rollouts off
-        # walls before they're trapped.
-        self.mppi_w_clearance = 50.0
-        self.mppi_clearance_d0_m = 0.3
+
+        # Detection-confidence → goal-pull weighting, with hysteresis. The
+        # latched exploit_conf ratchets up on a sighting and decays on misses;
+        # below threshold the goal pull is off (pure IG), above it the concave
+        # curve w = scale*(a^conf - 1)/(a - 1) saturates quickly (a < 1).
+        self.mppi_conf_weight_a = 0.1
+        self.mppi_conf_weight_scale = 100.0
+        self.mppi_conf_decay = 0.9
+        self.mppi_conf_threshold = 0.1
         # Control-noise stddev is anchored to half the actuator limits inside
         # optimize_trajectory; no scalar knob. Trajectory- and action-level
         # annealing (mppi_anneal_beta_traj / mppi_anneal_beta_action) shape
@@ -144,7 +160,24 @@ class Config:
         # Visualization
         self.viz_interval = 1000
 
-        self.detector = "yolo"
+        self.detector = "hybrid"
+
+        # Canonical distractor vocabulary for false-positive suppression.
+        # Used at two levels:
+        #   1) YOLO-World: registered as competing classes alongside the
+        #      target query; only boxes whose winning class is the target
+        #      are accepted, so salient walls/doors get claimed by their
+        #      own class instead of leaking into the target's.
+        #   2) SAM mask scoring: per-mask CLIP similarity is converted to a
+        #      softmax over [target + distractors] ("more pillow than wall")
+        #      instead of a raw cosine, which is far more discriminative in
+        #      CLIP's compressed similarity range.
+        # Stored as bare nouns; the CLIP path prepends "a " to match the
+        # repo's "a [object]" prompt convention.
+        self.det_negative_classes = [
+            "wall", "door", "window", "floor", "ceiling",
+            "curtain", "cabinet", "shelf", "picture",
+        ]
 
         # Detection-based termination. Once `det_score >= detected_conf_threshold`
         # for `detected_persistence` consecutive replans, latch into DETECTED
@@ -172,6 +205,15 @@ class Config:
         self.sam_min_mask_region_area = 200
         self.sam_min_mask_pixels = 200
         self.sam_min_clip_sim = 0.18
+        # Softmax-over-distractors acceptance for the chosen mask (see
+        # det_negative_classes). `sam_softmax_temp` is the CLIP-style logit
+        # scale applied to the cosine vector before softmax; the best mask
+        # is accepted only if its target probability clears
+        # `sam_min_target_prob` AND its raw target cosine clears
+        # `sam_min_clip_sim` (absolute floor — a mask can win the softmax
+        # while matching nothing at all).
+        self.sam_softmax_temp = 100.0
+        self.sam_min_target_prob = 0.5
         # Visualization-only: when rendering nav_history.mp4, overlay the
         # most recent saved SAM mask whose step is within this many ticks
         # of the current viz frame. Larger = more frames get an overlay
@@ -213,6 +255,10 @@ class Config:
                 self.min_sensor_dist = habitat['min_sensor_dist']
             if 'max_sensor_dist' in habitat:
                 self.max_sensor_dist = habitat['max_sensor_dist']
+            if 'agent_radius' in habitat:
+                self.agent_radius = habitat['agent_radius']
+            if 'agent_height' in habitat:
+                self.agent_height = habitat['agent_height']
             if 'training_queue_size' in habitat:
                 self.training_queue_size = habitat['training_queue_size']
         
@@ -360,12 +406,9 @@ class Config:
             if 'mppi_max_v_mps' in planning:
                 self.mppi_max_v_mps = planning['mppi_max_v_mps']
             for key in (
-                'mppi_lambda_start', 'mppi_lambda_end',
-                'mppi_w_ig_start', 'mppi_w_ig_end',
-                'mppi_w_goal_start', 'mppi_w_goal_end',
                 'mppi_num_iters',
                 'mppi_anneal_beta_traj', 'mppi_anneal_beta_action',
-                'mppi_w_dead', 'mppi_w_clearance', 'mppi_clearance_d0_m',
+                'mppi_collision_substeps',
             ):
                 if key in planning:
                     setattr(self, key, planning[key])
@@ -373,7 +416,8 @@ class Config:
         # Detection / termination
         if 'detection' in yaml_data:
             det = yaml_data['detection']
-            for key in ('detected_conf_threshold', 'detected_persistence', 'stop_distance_m'):
+            for key in ('detector', 'detected_conf_threshold', 'detected_persistence',
+                        'stop_distance_m', 'det_negative_classes'):
                 if key in det:
                     setattr(self, key, det[key])
 
@@ -385,6 +429,7 @@ class Config:
                 'sam_points_per_side', 'sam_pred_iou_thresh',
                 'sam_stability_score_thresh', 'sam_min_mask_region_area',
                 'sam_min_mask_pixels', 'sam_min_clip_sim',
+                'sam_softmax_temp', 'sam_min_target_prob',
                 'sam_lookback_steps',
             ):
                 if key in sam:

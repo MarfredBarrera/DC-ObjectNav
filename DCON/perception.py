@@ -30,7 +30,11 @@ def spin_policy(perception: PerceptionStack) -> list:
 
 def run(cfg: Config, policy_fn=spin_policy, save_enabled: bool = True,
         use_pretrained: bool = False, save_as_pretrained: bool = False) -> None:
-    sim, agent = init_simulator(cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov)
+    sim, agent = init_simulator(
+        cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov,
+        agent_radius=cfg.agent_radius,
+        agent_height=cfg.agent_height,
+    )
     spawn_agent_at_random_navpoint(sim, agent)
     target_point = np.array([0.0, 0.0, 1.0])
     # spawn_agent_at_pos(sim, agent, target_point)

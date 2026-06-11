@@ -13,6 +13,11 @@ habitat:
   sensor_height: 1.0
   data_queue_size: 30
   training_queue_size: 20
+  # Navmesh agent radius (m): walls are inset by this much, so smaller =
+  # agent squeezes through narrower gaps. Recomputed on load (the prebaked
+  # Gibson navmesh is baked at 0.1). <=0 keeps the prebaked navmesh.
+  agent_radius: 0.05
+  agent_height: 1.5
 
 # Semantics Settings (MaskCLIP)
 semantics:
@@ -92,8 +97,20 @@ grid:
 planning:
   mppi_dt: 0.1
   mppi_w_sign: -1.0
+  # Intermediate collision checks per rollout segment (prevents tunneling
+  # through thin walls between waypoints). 0 = waypoints only.
+  mppi_collision_substeps: 4
 
 detection:
+  detector: "hybrid"            # yolo / coco_yolo / hybrid / grounding_dino
   detected_conf_threshold: 0.4  # det_score required to latch DETECTED
   detected_persistence: 2       # consecutive replans above threshold to latch
   stop_distance_m: 0.75          # terminate within this distance of sim peak
+  # Distractor vocabulary: competing YOLO-World classes + CLIP softmax
+  # negatives for SAM mask scoring (bare nouns; "a " is prepended for CLIP).
+  det_negative_classes: ["wall", "door", "window", "floor", "ceiling",
+                         "curtain", "cabinet", "shelf", "picture", "refrigerator"]
+
+sam:
+  sam_softmax_temp: 100.0       # CLIP logit scale before the mask softmax
+  sam_min_target_prob: 0.5      # min softmax prob of the target for the best mask
