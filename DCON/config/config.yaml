@@ -93,6 +93,13 @@ ensemble:
 grid:
   voxel_resolution: 0.10
   max_height: 2.0
+  # Soft coverage: each depth update adds min(1,(ref/d)^2) per confirmed
+  # voxel; IG deficit = exp(-coverage/tau). Bigger tau = slower saturation.
+  coverage_ref_dist_m: 2.0
+  coverage_tau: 3.0
+  # Zero uncertainty at observed-free voxels (kills phantom epistemic
+  # traces over traversed empty rooms; field never trains on air).
+  mask_free_epistemic: true
 
 planning:
   mppi_dt: 0.1

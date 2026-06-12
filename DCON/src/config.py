@@ -13,7 +13,7 @@ class Config:
         """
         # Visualization
         self.viz_interval = 500
-        self.vmax_epi = 0.25
+        self.vmax_epi = 0.5
         # Set all default values first
         # Paths
         self.output_dir = "/workspace/DCON/output/current_scene"
@@ -110,6 +110,20 @@ class Config:
         # Grid
         self.voxel_resolution = 0.05
         self.grid_max_height = 2.0
+        # Soft coverage accumulator (OccupancyGrid.coverage). Each depth
+        # update adds min(1, (ref_dist/d)^2) to every voxel it confirms —
+        # close views count fully, distant ones fractionally. The IG-facing
+        # deficit is exp(-coverage/tau): tau = how many full-quality views a
+        # voxel needs before it stops attracting exploration (~63% drained
+        # after tau views, ~95% after 3*tau).
+        self.coverage_ref_dist_m = 2.0
+        self.coverage_tau = 3.0
+        # Zero epistemic/aleatoric uncertainty at observed-FREE voxels when
+        # building maps. The field only trains on surface points, so free-air
+        # uncertainty is init noise ("phantom traces" over traversed rooms),
+        # not signal. Occupied keeps real surface uncertainty; unseen keeps
+        # the frontier signal. Also switches the BEV reduction to max-over-Y.
+        self.mask_free_epistemic = True
 
         # Planning
         self.mppi_dt = 0.1
@@ -391,6 +405,9 @@ class Config:
                 self.voxel_resolution = grid['voxel_resolution']
             if 'max_height' in grid:
                 self.grid_max_height = grid['max_height']
+            for key in ('coverage_ref_dist_m', 'coverage_tau', 'mask_free_epistemic'):
+                if key in grid:
+                    setattr(self, key, grid[key])
 
         # Planning
         if 'planning' in yaml_data:

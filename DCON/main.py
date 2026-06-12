@@ -363,6 +363,15 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
         print("  plan: missing map(s); idling")
         return (action_queue.popleft() if action_queue else None), None, None, None, None, None
 
+    # IG map by source: 'coverage' = soft observation-count deficit
+    # (continuous, keeps a gradient after binary unseen is locally
+    # exhausted); 'epistemic' = masked field uncertainty; 'unseen' ignores
+    # the map (MPPI builds a binary mask from occupancy internally).
+    if cfg.ig_source == 'coverage':
+        bev_ig = _to_numpy(perception.occupancy_grid.get_2d_coverage_deficit_map(min_y=0.1, max_y=1.5))
+    else:
+        bev_ig = bev_epi
+
     pos = sim_iface.agent_position
     heading = get_agent_heading(sim_iface.agent)
     start_grid = world_to_grid(pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution)
@@ -430,7 +439,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     goal_confidence = 1.0 if detected else float(det_score)
 
     opt_path, U_opt = mppi.optimize_trajectory(
-        start_grid, goal, bev_epi, bev_occ,
+        start_grid, goal, bev_ig, bev_occ,
         initial_heading=heading,
         intrinsics=sim_iface.intrinsics,
         sensor_height=cfg.sensor_height,
@@ -779,7 +788,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=str, default="0", help="GPU device index")
     parser.add_argument("--no-save", action="store_true", default=False,
                         help="Skip saving BEV maps to disk during the live loop")
-    parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic"], default="epistemic",
+    parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic", "coverage"], default="epistemic",
                         help="Information gain source for MPPI (unseen or epistemic)")
     parser.add_argument("--detector", type=str,
                         choices=["yolo", "coco_yolo", "hybrid", "grounding_dino"],

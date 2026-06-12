@@ -155,7 +155,8 @@ class MPPIPlanner:
 
         occ_torch = torch.from_numpy(occ_map).to(self.device).long()
         # IG signal: a binary mask of unseen cells ("unseen"), or the supplied
-        # uncertainty map ("epistemic"). The unseen branch ignores ig_map.
+        # map ("epistemic" = masked field uncertainty, "coverage" = soft
+        # observation-count deficit). The unseen branch ignores ig_map.
         if ig_source == "unseen":
             ig_torch = (occ_torch == 0).float()
         else:

@@ -221,8 +221,12 @@ class PerceptionStack:
         """Compute all VOXEL maps (uncertainty, occupancy, similarity). Saves to disk only if save_enabled."""
         t0 = time.time()
 
-        # Uncertainty Reduction
-        self.ugrid.forward_pass(batch_size=batch_size)
+        # Uncertainty Reduction (free voxels masked to kill phantom traces —
+        # the field never trains on air, so free-air uncertainty is noise).
+        self.ugrid.forward_pass(
+            batch_size=batch_size,
+            occupancy_grid=self.occupancy_grid if self.cfg.mask_free_epistemic else None,
+        )
         if save_enabled:
             self.ugrid.save(step)
 
