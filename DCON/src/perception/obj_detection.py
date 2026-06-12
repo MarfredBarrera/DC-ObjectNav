@@ -23,6 +23,7 @@ import torch
 from PIL import Image
 
 from ultralytics import YOLO
+import re
 
 
 # Canonical distractor vocabulary (mirrors the default of
@@ -522,6 +523,117 @@ def _to_float_rgb_tensor(image: Union[torch.Tensor, np.ndarray, Image.Image], de
     return t
 
 
+class LocateAnythingDetector:
+    """Open-vocabulary detector using NVIDIA LocateAnything-3B via Hugging Face.
+
+    Returns binary detection scores: 1.0 if it generates a bounding box, 0.0 otherwise.
+    Since it produces point predictions, we parse the output to construct a bounding box.
+    """
+    name = "locate_anything"
+
+    def backend_for(self, query: str) -> str:
+        return self.name
+
+    def __init__(
+        self,
+        device: str = "cuda",
+        model_name: str = "nvidia/LocateAnything-3B",
+        threshold: float = 0.5, # ignored, binary signal
+        max_new_tokens: int = 128,
+        repetition_penalty: float = 1.3,
+    ):
+        import os
+        import glob
+        # Apply patch for Python 3.9 type hints inside the downloaded remote code
+        for f in glob.glob("/root/.cache/huggingface/modules/transformers_modules/nvidia/LocateAnything_hyphen_3B/*/*.py"):
+            os.system(f"grep -q 'from __future__ import annotations' {f} || sed -i '1s/^/from __future__ import annotations\\n/' {f}")
+
+        from transformers import AutoModel, AutoProcessor, AutoTokenizer
+        self.device = device
+        self.model_name = model_name
+        self.dtype = torch.bfloat16
+        # The model's MTP/AR decode loop frequently fails to emit <|im_end|> and
+        # instead repeats one box until the token budget runs out, so generate()
+        # always runs to max_new_tokens — keep it small to bound per-call latency
+        # (~1 s at 128). The meaningful, tight boxes are emitted first; the tail
+        # degenerates into oversized/full-image repeats. repetition_penalty only
+        # affects already-seen tokens, so the leading box stays pristine.
+        self.max_new_tokens = int(max_new_tokens)
+        self.repetition_penalty = float(repetition_penalty)
+        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.processor.tokenizer = self.tokenizer
+
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            torch_dtype=self.dtype,
+        ).to(device)
+        self.model.eval()
+
+    @torch.no_grad()
+    def detect(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
+        arr = ObjectDetector._to_uint8(image)
+        pil = Image.fromarray(arr).convert("RGB")
+        w, h = pil.size
+
+        prompt = (
+            "Locate all the instances that matches the following "
+            f"description: {query}."
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+        # LocateAnything ships its own chat template + vision-info helpers;
+        # the generic HF ones don't emit the <image-N> placeholders it needs.
+        text = self.processor.py_apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        images, videos = self.processor.process_vision_info(messages)
+        inputs = self.processor(
+            text=[text], images=images, videos=videos, return_tensors="pt",
+        ).to(self.device)
+
+        # NOTE: model.generate() runs its own MTP/AR decode loop and returns an
+        # already-decoded response *string* (not token ids), so we must NOT call
+        # processor.decode() on it. pixel_values is cast to the model dtype
+        # internally. image_grid_hws stays a numpy array (generate handles it).
+        response = self.model.generate(
+            pixel_values=inputs["pixel_values"],
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            image_grid_hws=inputs.get("image_grid_hws", None),
+            tokenizer=self.tokenizer,
+            max_new_tokens=self.max_new_tokens,
+            repetition_penalty=self.repetition_penalty,
+            use_cache=True,
+            generation_mode="hybrid",
+        )
+
+        # Output boxes are emitted as <box><x1><y1><x2><y2></box> with each
+        # coordinate a 0-999 normalized integer special token (<box>None</box>
+        # when nothing matches). Take the FIRST box: the model emits its
+        # highest-priority, tightest detection first, then degenerates into
+        # repeated oversized / full-image boxes — so "largest" would pick noise.
+        m = re.search(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", response)
+        if m is not None:
+            x1, y1, x2, y2 = (int(g) / 1000.0 for g in m.groups())
+            box = (x1 * w, y1 * h, x2 * w, y2 * h)
+            return 1.0, box
+        return 0.0, None
+
+
 def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
     """Factory: pick a detector backend by short name.
 
@@ -529,12 +641,15 @@ def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
     - "coco_yolo": closed-set COCO YOLOv8.
     - "hybrid": COCO classes → YOLOv8, everything else → YOLO-Worldv2.
     - "grounding_dino": Grounding DINO Tiny via HuggingFace.
+    - "locate_anything": NVIDIA LocateAnything-3B via HuggingFace pipeline.
     """
     key = name.lower().strip()
     # Only the YOLO-World branch (directly or inside hybrid) uses the
     # negative-class competition; pop it here so closed-set / GDino
     # backends don't choke on an unknown kwarg.
     negative_classes = kwargs.pop("negative_classes", None)
+    if key in ("locate_anything", "locateanything"):
+        return LocateAnythingDetector(device=device, **kwargs)
     if key in ("yolo", "yolo_world", "yoloworld"):
         if negative_classes is not None:
             kwargs.setdefault("negative_classes", negative_classes)

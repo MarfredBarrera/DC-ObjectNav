@@ -187,6 +187,51 @@ def bev_cells_from_det_box(perception, cfg, intrinsics, det_box, depth, c2w):
     return cell_mask.cpu().numpy()
 
 
+def bev_cell_from_box_center(perception, cfg, intrinsics, det_box, depth, c2w):
+    """Single BEV (z_idx, x_idx) cell the *center* of `det_box` projects to.
+
+    Unlike `bev_cells_from_det_box` (which returns every cell the box covers),
+    this unprojects only a small patch around the box-center pixel to one world
+    point and returns its lone BEV cell. Used as the goal verbatim — no SAM
+    re-localization, no similarity argmax, no snap-to-free. Best paired with a
+    detector that emits tight, accurate boxes (e.g. LocateAnything).
+
+    A small window (not the single center pixel) is sampled and its median
+    world point taken so one depth hole at the exact center doesn't drop the
+    goal. Returns (z_idx, x_idx) or None if no valid depth near the center.
+    """
+    if det_box is None or depth is None or c2w is None:
+        return None
+    xmin, ymin, xmax, ymax = det_box
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
+    depth_gpu = depth.to(perception.device)
+    H_d, W_d = depth_gpu.shape[-2:]
+    # Half-window: 5% of the smaller box side, clamped to >=1px.
+    half = max(1, int(0.05 * min(xmax - xmin, ymax - ymin)))
+    yy, xx = torch.meshgrid(
+        torch.arange(H_d, device=perception.device),
+        torch.arange(W_d, device=perception.device),
+        indexing='ij',
+    )
+    win = ((xx >= int(cx) - half) & (xx <= int(cx) + half) &
+           (yy >= int(cy) - half) & (yy <= int(cy) + half))
+    depth_mask = (depth_gpu > cfg.min_sensor_dist) & (depth_gpu < cfg.max_sensor_dist)
+    mask = win & depth_mask
+    if not bool(mask.any()):
+        return None
+    world_points = unprojection(
+        depth_gpu, intrinsics, c2w.to(perception.device), perception.device, mask=mask)
+    if world_points.shape[0] == 0:
+        return None
+    wx = float(world_points[:, 0].median())
+    wz = float(world_points[:, 2].median())
+    sg = perception.similarity_grid
+    z_idx = int(np.clip((wz - sg.min_z) / cfg.voxel_resolution, 0, sg.num_z - 1))
+    x_idx = int(np.clip((wx - sg.min_x) / cfg.voxel_resolution, 0, sg.num_x - 1))
+    return (z_idx, x_idx)
+
+
 def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
                        target_query, segmenter,
                        min_mask_pixels: int = 200,
@@ -399,24 +444,35 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     # at all times — weak transient detections can't displace a strong one.
     # SAM runs on the *whole image* (not box-prompted) because the box is
     # often offset by ~one box-width at distance; CLIP picks the right mask.
-    if det_box is not None and det_score > last_box_conf and segmenter is not None:
-        det_cells = bev_cells_from_sam(
-            perception, cfg, sim_iface.intrinsics,
-            rgb, depth, c2w, perception.target_query,
-            segmenter,
-            min_mask_pixels=int(getattr(cfg, 'sam_min_mask_pixels', 200)),
-            min_clip_sim=float(getattr(cfg, 'sam_min_clip_sim', 0.18)),
-        )
-        if det_cells is not None and det_cells.any():
-            # Goal = the mask cell closest to the agent (near face of the
-            # object's projected footprint), not the argmax of the smeared
-            # similarity field. If that cell sits on the object (occupied),
-            # snap to the nearest navigable free cell so the agent stops in
-            # front of the target rather than inside it.
-            cand = closest_cell_in_mask(det_cells, start_grid)
+    if det_box is not None and det_score > last_box_conf:
+        if cfg.goal_projection == "box_center":
+            # Project the box center straight to one BEV cell and use it as
+            # the goal verbatim (no SAM, no argmax, no snapping). MPPI already
+            # carves a free disk around the goal and forgives collisions on
+            # arrival, so a cell sitting on the target surface is fine.
+            cand = bev_cell_from_box_center(
+                perception, cfg, sim_iface.intrinsics, det_box, depth, c2w)
             if cand is not None:
-                goal = snap_to_free(cand, bev_occ)
+                goal = cand
                 box_goal = goal
+        elif segmenter is not None:
+            det_cells = bev_cells_from_sam(
+                perception, cfg, sim_iface.intrinsics,
+                rgb, depth, c2w, perception.target_query,
+                segmenter,
+                min_mask_pixels=int(getattr(cfg, 'sam_min_mask_pixels', 200)),
+                min_clip_sim=float(getattr(cfg, 'sam_min_clip_sim', 0.18)),
+            )
+            if det_cells is not None and det_cells.any():
+                # Goal = the mask cell closest to the agent (near face of the
+                # object's projected footprint), not the argmax of the smeared
+                # similarity field. If that cell sits on the object (occupied),
+                # snap to the nearest navigable free cell so the agent stops in
+                # front of the target rather than inside it.
+                cand = closest_cell_in_mask(det_cells, start_grid)
+                if cand is not None:
+                    goal = snap_to_free(cand, bev_occ)
+                    box_goal = goal
     if goal is None and last_box_goal is not None:
         gz, gx = int(last_box_goal[0]), int(last_box_goal[1])
         if 0 <= gz < H and 0 <= gx < W:
@@ -602,7 +658,24 @@ def run(cfg: Config, save_enabled: bool = True,
             heading = get_agent_heading(sim_iface.agent)
 
             rgb_cur, depth_cur, c2w_cur = perception.observe(sim_iface)
-            det_score, det_box = detector.detect(rgb_cur, perception.target_query)
+
+            # Throttle the detector in EXPLOIT mode: the goal is already pinned
+            # to the cached box cell, so skip the (expensive) detector on most
+            # replans and reuse the cache. SEARCH mode always detects. A skipped
+            # replan reports no detection (det_box=None), so plan_one_action
+            # falls through to the cached box-goal (Layer 2). The latch logic is
+            # guarded by `if not detected`, so a skipped 0.0 score is harmless.
+            replan_idx = step // REPLAN_INTERVAL
+            if detected and cfg.exploit_redetect_interval <= 0:
+                run_detector = False
+            elif detected:
+                run_detector = (replan_idx % cfg.exploit_redetect_interval == 0)
+            else:
+                run_detector = True
+            if run_detector:
+                det_score, det_box = detector.detect(rgb_cur, perception.target_query)
+            else:
+                det_score, det_box = 0.0, None
 
             # Clear last replan's SAM side-channel so a mask is only persisted
             # on the frame SAM actually ran. `bev_cells_from_sam` resets these
@@ -791,11 +864,11 @@ if __name__ == "__main__":
     parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic", "coverage"], default="epistemic",
                         help="Information gain source for MPPI (unseen or epistemic)")
     parser.add_argument("--detector", type=str,
-                        choices=["yolo", "coco_yolo", "hybrid", "grounding_dino"],
+                        choices=["yolo", "coco_yolo", "hybrid", "grounding_dino", "locate_anything"],
                         default="hybrid",
                         help="Detector backend: yolo (YOLO-Worldv2), coco_yolo "
                              "(closed-set YOLOv8), hybrid (COCO→YOLOv8 else "
-                             "YOLO-Worldv2), or grounding_dino")
+                             "YOLO-Worldv2), grounding_dino, or locate_anything")
     parser.add_argument("--no-visualize", action="store_true", default=False,
                         help="Skip rendering nav_history video after the run")
     parser.add_argument("--viz-output", type=str, default="./figs/nav_history.mp4",

@@ -107,7 +107,7 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
   - **Goal-distance**: mean Euclidean from rollout waypoints to the single goal cell.
   - **Collision (truncate-and-score)**: waypoint occupancy check; a rollout is frozen at its first collision (position, heading, controls zeroed) and scored on its surviving prefix plus a death penalty (`mppi_w_dead`) proportional to the lost horizon — so dying later scores better and a usable gradient survives even when every sample eventually collides (corners, clutter). No hard `-inf` masking: all rollouts keep softmax weight, so `U_nom` drifts toward the longer-surviving directions instead of stalling. The start cell and cells inside the goal-arrival radius are forgiven. Only rollouts that survive their *first* transition are eligible to be committed; if none do, `best_U=None` and the caller recovers (spin + horizon shrink).
   - **Clearance**: smooth ESDF wall-proximity penalty `exp(-d/d0)` per step (`mppi_w_clearance`, `mppi_clearance_d0_m`), from a per-replan `cv2.distanceTransform` of the occupancy grid. Pulls samples away from walls before they're trapped; forgiven inside the goal-arrival radius.
-  - **Information gain**: FOV raycast against epistemic-uncertainty map, computed for all rollouts (frozen tails are deduped per-rollout); skipped when the IG weight is ~0 (EXPLOIT).
+  - **Information gain**: FOV raycast against the IG map selected by `cfg.ig_source` — `"epistemic"` (masked field uncertainty), `"coverage"` (soft observation-count deficit; continuous, so the gradient survives after binary unseen is locally exhausted), or `"unseen"` (binary mask MPPI builds from occupancy, ignoring the supplied map); skipped when the IG weight is ~0 (EXPLOIT).
 - **DIAL action-level annealing** ([mppi.py:200-207](DCON/src/planning/mppi.py#L200-L207)): noise variance is *smaller* for early horizon indices (which will actually be committed) and grows toward the tail.
 - **DIAL trajectory-level annealing** ([mppi.py:216-222](DCON/src/planning/mppi.py#L216-L222)): noise variance shrinks across MPPI iterations — iter 0 is wide exploration, iter N-1 is local refinement.
 - **Exploration→exploitation schedule**: `scheduled_params(progress)` lerps `lambda_weight`, `w_ig`, `w_goal`, `cov_scale` from `*_start` to `*_end` based on `progress = step / iterations`.
@@ -154,8 +154,8 @@ Three complementary BEV representations:
 
 | Grid Type | Purpose | Input | Output (per voxel) |
 |-----------|---------|-------|-------------------|
-| **UncertaintyGrid** | Epistemic + aleatoric | Ensemble forward-pass disagreement | 2 scalars |
-| **OccupancyGrid** | Free / occupied / unseen | Depth voxelization (incremental) | trinary value |
+| **UncertaintyGrid** | Epistemic + aleatoric | Ensemble forward-pass disagreement | 2 scalars; observed-FREE voxels zeroed when `mask_free_epistemic` (field never trains on air → free-air uncertainty is phantom noise; BEV reduction switches to max-over-Y) |
+| **OccupancyGrid** | Free / occupied / unseen + soft coverage | Depth voxelization (incremental) | trinary value + quality-weighted observation count (`min(1,(coverage_ref_dist_m/d)²)` per confirming view); BEV deficit `exp(-coverage/coverage_tau)` is the graded exploration signal |
 | **SimilarityGrid** | Target relevance | Mean CLIP feature ⋅ text-query embedding | 1 scalar |
 
 **Coordinates**: World space with `scene_bounds = ((xmin,ymin,zmin),(xmax,ymax,zmax))`; BEV cells index `(z, x)`; `y` is ignored for planning.
@@ -206,6 +206,7 @@ Key settings:
 - **MPPI**: `mppi_dt`, `mppi_max_v_mps`, `mppi_max_w_rps`, `mppi_num_iters`, `mppi_anneal_beta_action`, `mppi_anneal_beta_traj`, `mppi_*_start`/`mppi_*_end` for the schedule.
 - **Detection**: `detector` (`yolo` / `coco_yolo` / `hybrid` / `grounding_dino` / `sam_refined`), `detected_conf_threshold`, `detected_persistence`, `stop_distance_m`.
 - **MobileSAM**: `use_mobile_sam` (toggle the SAM goal-refinement path), `sam_checkpoint` (default `SAM_models/mobile_sam.pt`), `sam_points_per_side` (auto-gen density; 16 → ~0.5 s/call, 32 → ~2 s/call), `sam_pred_iou_thresh`, `sam_stability_score_thresh`, `sam_min_mask_region_area`, `sam_min_mask_pixels` (post-gen mask size floor), `sam_min_clip_sim` (CLIP-score floor for accepting a mask), `sam_lookback_steps` (viz-only: how far back to grab the most recent saved SAM mask when overlaying on a viz frame).
+- **Coverage / uncertainty masking** (`grid:` YAML section): `mask_free_epistemic` (zero epistemic/aleatoric at observed-FREE voxels — the field never trains on air, so free-air uncertainty is phantom noise over traversed rooms; also switches the uncertainty BEV reduction from bottom-k-mean to max-over-Y), `coverage_ref_dist_m` (observations closer than this earn a full count, farther ones `(ref/d)²`), `coverage_tau` (coverage deficit = `exp(-count/tau)`; ≈ number of full-quality views that drain a voxel's exploration pull). `--ig-source coverage` makes MPPI raycast the soft deficit instead of binary unseen or field epistemic.
 
 ## Testing
 

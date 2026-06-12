@@ -202,6 +202,26 @@ class Config:
         self.detected_persistence = 1
         self.stop_distance_m = 1.5
 
+        # Detector cadence once latched into EXPLOIT (`detected`) mode. The goal
+        # is pinned to the cached box cell and committed hard there, so
+        # re-running an expensive detector (e.g. LocateAnything ~1 s/call) every
+        # replan buys little. While detected, run the detector only once every
+        # `exploit_redetect_interval` replans (<=0 → never re-detect after
+        # latching; the cached goal is reused for the rest of the run). A
+        # periodic value > 0 lets the goal refine as the agent closes in and
+        # the box gets more accurate. SEARCH mode always detects every replan.
+        self.exploit_redetect_interval = 0
+
+        # How a fresh detection box is turned into the MPPI goal cell:
+        #   "box_center" — project the *center pixel* of the detector's box
+        #     straight to one BEV cell and use it as the goal verbatim (no SAM,
+        #     no similarity argmax, no free-cell snapping). Suited to detectors
+        #     that already emit tight, accurate boxes (e.g. LocateAnything).
+        #   "sam" — re-localize with MobileSAM whole-image auto-gen + MaskCLIP
+        #     best-mask scoring, then take the mask cell closest to the agent
+        #     (the legacy path; see the MobileSAM block below).
+        self.goal_projection = "box_center"
+
         # MobileSAM goal refinement. When the detector fires AND the new
         # det_score beats the cached one, we re-localize the target by:
         #   1) running MobileSAM auto-mask-gen on the whole image,
@@ -434,7 +454,8 @@ class Config:
         if 'detection' in yaml_data:
             det = yaml_data['detection']
             for key in ('detector', 'detected_conf_threshold', 'detected_persistence',
-                        'stop_distance_m', 'det_negative_classes'):
+                        'stop_distance_m', 'det_negative_classes', 'goal_projection',
+                        'exploit_redetect_interval'):
                 if key in det:
                     setattr(self, key, det[key])
 
