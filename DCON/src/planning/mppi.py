@@ -7,7 +7,7 @@ from .utils import find_nearest_free_cell, compute_batch_fov_ig
 
 class MPPIPlanner:
     # Fixed cost constants (not exposed as config knobs).
-    CONTROL_COST_WEIGHT = 0.1   # penalty on per-step control magnitude
+    CONTROL_COST_WEIGHT = 0.0   # penalty on per-step control magnitude
     ARRIVAL_BONUS = 1000.0      # EXPLOIT reward per horizon-fraction dwelt at goal
     IG_DISCOUNT = 0.95          # per-step discount on information gain
     EXPLOIT_CONF = 0.99         # goal_confidence >= this ⇒ EXPLOIT (arrival freeze)

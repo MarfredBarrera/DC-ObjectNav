@@ -187,18 +187,14 @@ def bev_cells_from_det_box(perception, cfg, intrinsics, det_box, depth, c2w):
     return cell_mask.cpu().numpy()
 
 
-def bev_cell_from_box_center(perception, cfg, intrinsics, det_box, depth, c2w):
-    """Single BEV (z_idx, x_idx) cell the *center* of `det_box` projects to.
+def box_center_world_xz(perception, cfg, intrinsics, det_box, depth, c2w):
+    """Median world (x, z) of a small patch around the center of `det_box`.
 
-    Unlike `bev_cells_from_det_box` (which returns every cell the box covers),
-    this unprojects only a small patch around the box-center pixel to one world
-    point and returns its lone BEV cell. Used as the goal verbatim — no SAM
-    re-localization, no similarity argmax, no snap-to-free. Best paired with a
-    detector that emits tight, accurate boxes (e.g. LocateAnything).
-
-    A small window (not the single center pixel) is sampled and its median
-    world point taken so one depth hole at the exact center doesn't drop the
-    goal. Returns (z_idx, x_idx) or None if no valid depth near the center.
+    Unprojects only a small window (not the single center pixel, so one depth
+    hole at the exact center doesn't drop the result) and returns the median
+    world point's BEV-plane coordinates (wx, wz), or None if no valid depth
+    near the center. Shared by goal projection and the detection size/distance
+    gate. Box pixel coords must be in `depth`'s pixel space.
     """
     if det_box is None or depth is None or c2w is None:
         return None
@@ -224,12 +220,67 @@ def bev_cell_from_box_center(perception, cfg, intrinsics, det_box, depth, c2w):
         depth_gpu, intrinsics, c2w.to(perception.device), perception.device, mask=mask)
     if world_points.shape[0] == 0:
         return None
-    wx = float(world_points[:, 0].median())
-    wz = float(world_points[:, 2].median())
+    return float(world_points[:, 0].median()), float(world_points[:, 2].median())
+
+
+def bev_cell_from_box_center(perception, cfg, intrinsics, det_box, depth, c2w):
+    """Single BEV (z_idx, x_idx) cell the *center* of `det_box` projects to.
+
+    Unlike `bev_cells_from_det_box` (which returns every cell the box covers),
+    this projects only the box-center patch to one world point and returns its
+    lone BEV cell. Used as the goal verbatim — no SAM re-localization, no
+    similarity argmax, no snap-to-free. Best paired with a detector that emits
+    tight, accurate boxes (e.g. LocateAnything). Returns (z_idx, x_idx) or None.
+    """
+    wxz = box_center_world_xz(perception, cfg, intrinsics, det_box, depth, c2w)
+    if wxz is None:
+        return None
+    wx, wz = wxz
     sg = perception.similarity_grid
     z_idx = int(np.clip((wz - sg.min_z) / cfg.voxel_resolution, 0, sg.num_z - 1))
     x_idx = int(np.clip((wx - sg.min_x) / cfg.voxel_resolution, 0, sg.num_x - 1))
     return (z_idx, x_idx)
+
+
+def classify_detection(perception, cfg, intrinsics, det_box, depth, c2w,
+                       agent_pos):
+    """Classify a detection by object distance + box size into how it may be used.
+
+    Returns (is_persistent, contributes_confidence):
+      - TOO CLOSE — object distance < cfg.detected_min_dist_m OR box covers more
+        than cfg.detected_max_box_frac of the frame. The box fills the view and
+        carries no usable localization → (False, False): ignored entirely
+        (no goal, no confidence weight, no latch).
+      - TOO FAR — object distance > cfg.detected_max_dist_m OR box smaller than
+        cfg.detected_min_box_frac of the frame. A distant, uncertain sighting →
+        (False, True): may pull the confidence weight but doesn't latch and
+        isn't cached as a goal.
+      - USABLE BAND (anything else) → (True, True): a persistent detection that
+        latches and is cached as the goal, and contributes the confidence weight.
+
+    Each threshold disables at a non-positive value. A missing box or
+    unrangeable depth (no valid depth at the box center) → (False, False).
+    """
+    if det_box is None:
+        return (False, False)
+    xmin, ymin, xmax, ymax = det_box
+    H_img, W_img = depth.shape[-2:]
+    box_frac = ((xmax - xmin) * (ymax - ymin)) / float(W_img * H_img)
+    wxz = box_center_world_xz(perception, cfg, intrinsics, det_box, depth, c2w)
+    if wxz is None:
+        return (False, False)
+    dist_m = float(np.hypot(wxz[0] - agent_pos[0], wxz[1] - agent_pos[2]))
+
+    box_too_large = cfg.detected_max_box_frac > 0.0 and box_frac > cfg.detected_max_box_frac
+    box_too_small = cfg.detected_min_box_frac > 0.0 and box_frac < cfg.detected_min_box_frac
+    dist_too_small = cfg.detected_min_dist_m > 0.0 and dist_m < cfg.detected_min_dist_m
+    dist_too_large = cfg.detected_max_dist_m > 0.0 and dist_m > cfg.detected_max_dist_m
+
+    if dist_too_small or box_too_large:
+        return (False, False)   # too close: ignore entirely
+    if dist_too_large or box_too_small:
+        return (False, True)    # too far: confidence only, not persistent
+    return (True, True)         # usable band
 
 
 def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
@@ -383,8 +434,8 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
                     action_queue: deque, k_max: int = 5,
                     det_score: float = 0.0,
                     detected: bool = False, det_box=None, rgb=None, depth=None, c2w=None,
-                    last_box_goal=None, last_box_conf: float = -1.0,
-                    segmenter=None):
+                    last_box_goal=None,
+                    segmenter=None, det_investigate: bool = False):
     """Run MPPI from current pose and return (action, ref_traj, opt_traj).
 
     action is [v_mps, w_rad_per_s] or None if idling.
@@ -437,14 +488,17 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     goal = None
     box_goal = None  # None unless THIS frame's detection produced a fresh goal
     H, W = sim_for_goal.shape
-    # Layer 1: only spend a fresh SAM + MaskCLIP pass when this frame's
-    # detection actually beats the cached max. Otherwise the cached goal
-    # already represents the strongest sighting and we should aim at it
-    # (see Layer 2). This makes the agent pursue the max-confidence goal
-    # at all times — weak transient detections can't displace a strong one.
-    # SAM runs on the *whole image* (not box-prompted) because the box is
-    # often offset by ~one box-width at distance; CLIP picks the right mask.
-    if det_box is not None and det_score > last_box_conf:
+    # Layer 1: project a fresh box-derived goal from THIS frame's detection
+    # whenever it's worth investigating (`det_investigate` — anything but a
+    # too-close box that fills the frame). This INCLUDES too-far detections, so
+    # the agent steers toward and investigates a distant sighting even though it
+    # won't latch on it yet (latching needs the usable band; see the caller).
+    # Every such detection re-projects, so in SEARCH mode the caller's cache
+    # tracks the most recent bounding box. Until a detection is worth
+    # investigating the agent explores via the global similarity argmax
+    # (Layer 3). SAM runs on the *whole image* (not box-prompted) because the
+    # box is often offset by ~one box-width at distance; CLIP picks the mask.
+    if det_box is not None and det_investigate:
         if cfg.goal_projection == "box_center":
             # Project the box center straight to one BEV cell and use it as
             # the goal verbatim (no SAM, no argmax, no snapping). MPPI already
@@ -632,13 +686,13 @@ def run(cfg: Config, save_enabled: bool = True,
     detected = False
     detected_streak = 0
 
-    # Best goal cell derived from a detection bounding box so far, with its
-    # detector confidence. Persists across replans so a missing detection
-    # this frame doesn't drop the agent back to global-argmax exploration.
-    # Only overwritten when a NEW detection beats `last_box_conf` — a noisy
-    # low-conf detection can't displace an earlier strong sighting.
+    # Goal cell derived from the most recent qualifying detection box. Persists
+    # across replans so a missing detection this frame doesn't drop the agent
+    # back to global-argmax exploration. In SEARCH mode every qualifying box
+    # overwrites it (track the latest sighting); once EXPLOIT latches the
+    # detector is throttled off, so it freezes on the object that triggered the
+    # latch and the agent commits to it.
     last_box_goal = None
-    last_box_conf = -1.0
 
     # Tracks the last step actually executed by the loop. Used to cap the
     # post-run visualization so it doesn't pull in stale .npy snapshots left
@@ -687,10 +741,30 @@ def run(cfg: Config, save_enabled: bool = True,
                 segmenter.last_box = None
                 segmenter.last_score = 0.0
 
+            # Classify the detection by object distance + box size into three
+            # tiers of consequence:
+            #   too close (near OR fills the frame) → ignored entirely: no goal,
+            #     no confidence weight, no latch.
+            #   too far (distant OR tiny box)       → INVESTIGATE: steer toward
+            #     it (goal set + cached) and pull the confidence weight, but it
+            #     is NOT persistent — it can't latch yet.
+            #   usable band                         → persistent: investigate +
+            #     contribute confidence AND count toward the latch streak.
+            # `det_investigate` (= not too close) drives the goal + confidence;
+            # `det_persistent` (usable band, clearing the confidence threshold)
+            # additionally drives latching. So the agent approaches a far sighting
+            # and only commits to it once it has closed into the usable band.
+            det_persistent, det_investigate = classify_detection(
+                perception, cfg, sim_iface.intrinsics,
+                det_box, depth_cur, c2w_cur, pos)
+            det_persistent = det_persistent and det_score >= cfg.detected_conf_threshold
+            conf_score = det_score if det_investigate else 0.0
+
             # Latch into DETECTED once we get `detected_persistence` consecutive
-            # detections above threshold. Never unlatches — see comment above.
+            # persistent detections (a non-persistent frame resets the streak).
+            # Never unlatches — see comment above.
             if not detected:
-                if det_score >= cfg.detected_conf_threshold:
+                if det_persistent:
                     detected_streak += 1
                 else:
                     detected_streak = 0
@@ -701,19 +775,21 @@ def run(cfg: Config, save_enabled: bool = True,
 
             action, ref_traj, opt_traj, score, goal_cell, box_goal = plan_one_action(
                 perception, sim_iface, mppi, cfg, action_queue,
-                det_score=det_score, detected=detected,
+                det_score=conf_score, detected=detected,
                 det_box=det_box, rgb=rgb_cur, depth=depth_cur, c2w=c2w_cur,
-                last_box_goal=last_box_goal, last_box_conf=last_box_conf,
-                segmenter=segmenter,
+                last_box_goal=last_box_goal,
+                segmenter=segmenter, det_investigate=det_investigate,
             )
-            # Cache only when THIS frame's box yielded a valid goal AND its
-            # confidence beats the best we've seen. Fallback paths (cached /
-            # global argmax) return goal_cell but leave box_goal=None, so they
-            # never touch the cache.
-            if box_goal is not None and det_score > last_box_conf:
+            # Cache the goal of the most recent investigated detection.
+            # `box_goal` is non-None only for an investigated box (Layer 1 gates
+            # on `det_investigate`), so this tracks the latest sighting worth
+            # steering toward — including too-far ones — in SEARCH mode; in
+            # EXPLOIT the detector is throttled off so box_goal stays None and
+            # the cache freezes on the latched object. Fallback paths (cached /
+            # global argmax) leave box_goal=None.
+            if box_goal is not None:
                 last_box_goal = box_goal
-                last_box_conf = float(det_score)
-                print(f"  cached new goal {box_goal} (conf {det_score:.3f})")
+                print(f"  cached new goal {box_goal} (det_score={det_score:.3f})")
             # If SAM produced a fresh mask this replan, persist it for the
             # offline visualizer. The mask file is named by step so
             # visualize.py can look up the most recent SAM result at or

@@ -202,6 +202,24 @@ class Config:
         self.detected_persistence = 1
         self.stop_distance_m = 1.5
 
+        # Classify each detection by BOTH object distance and box size (see
+        # classify_detection in main.py). Box fractions are detector box area /
+        # image area; distances (m) are to the box-center world point. Each
+        # threshold disables at <=0.
+        #   TOO CLOSE  (dist < detected_min_dist_m OR box > detected_max_box_frac)
+        #     → ignored entirely: no goal, no confidence weight, no latch (the
+        #       box fills the frame and carries no usable localization).
+        #   TOO FAR    (dist > detected_max_dist_m OR box < detected_min_box_frac)
+        #     → may contribute the confidence weight but is NOT persistent: it
+        #       doesn't latch and isn't cached as a goal.
+        #   USABLE BAND (anything else) → persistent: latches (after
+        #     `detected_persistence` consecutive), is cached as the goal, and
+        #     contributes the confidence weight.
+        self.detected_min_box_frac = 0.01
+        self.detected_max_box_frac = 0.95
+        self.detected_min_dist_m = 0.1
+        self.detected_max_dist_m = 3.0
+
         # Detector cadence once latched into EXPLOIT (`detected`) mode. The goal
         # is pinned to the cached box cell and committed hard there, so
         # re-running an expensive detector (e.g. LocateAnything ~1 s/call) every
@@ -455,7 +473,9 @@ class Config:
             det = yaml_data['detection']
             for key in ('detector', 'detected_conf_threshold', 'detected_persistence',
                         'stop_distance_m', 'det_negative_classes', 'goal_projection',
-                        'exploit_redetect_interval'):
+                        'exploit_redetect_interval',
+                        'detected_min_box_frac', 'detected_max_box_frac',
+                        'detected_min_dist_m', 'detected_max_dist_m'):
                 if key in det:
                     setattr(self, key, det[key])
 
