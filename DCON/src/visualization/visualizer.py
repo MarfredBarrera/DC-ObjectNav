@@ -154,7 +154,8 @@ class Visualizer:
                              opt_traj_world=None, current_pos=None, current_heading=0.0,
                              step=None, save_path=None, avg_cost=None, current_cost=None,
                              det_conf=None, goal_world=None, goal_cell=None,
-                             mode=None, w_conf=None):
+                             mode=None, w_conf=None, sink_prob=None,
+                             sink_thresh=0.5):
         """
         Renders a diagnostic grid of maps with trajectory overlays:
         [RGB, _, BEVSim]
@@ -241,6 +242,14 @@ class Visualizer:
                 ax_rgb.text(0.5, -0.04, f"Detection confidence: {det_conf:.3f}",
                             transform=ax_rgb.transAxes, ha='center', va='top',
                             fontsize=10)
+            # Sink-gate target probability: green when the target beats the
+            # neutral sink (kept), red when a sink wins (dropped as a false
+            # positive). Only present when the gate ran on this frame.
+            if sink_prob is not None:
+                sink_col = '#1a8a1a' if sink_prob >= sink_thresh else '#c01818'
+                ax_rgb.text(0.5, -0.10, f"sink target prob: {sink_prob:.2f}",
+                            transform=ax_rgb.transAxes, ha='center', va='top',
+                            fontsize=10, color=sink_col)
         
         # 1. Uncertainty
         epi = maps_dict.get('epi')

@@ -37,6 +37,7 @@ from src.habitat.habitat_utils import (
 from src.habitat.sim_interface import SimInterface
 from src.perception.obj_detection import (
     make_detector, encode_query_with_negatives, target_prob_from_sims,
+    SinkGatedDetector,
 )
 from src.perception.perception_stack import PerceptionStack
 from src.perception.segmentation import MobileSAMSegmenter
@@ -558,13 +559,13 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     )
     mppi_score = None
     if U_opt is None or U_opt.shape[0] == 0:
-        # No safe MPPI plan this replan — spin in place to scan for new
-        # options. Rotating doesn't translate the agent, so it's always safe
-        # in a free start cell, and the heading change usually reveals new
-        # geometry that makes the next replan more likely to find a safe plan.
-        print("  plan: MPPI returned no safe control sequence, replanning")
+        # No safe MPPI plan this replan — idle and let the next replan retry.
+        # Goal disconfirmation and freshly observed geometry usually open a new
+        # option within a few replans, so we wait rather than commit a forced
+        # maneuver.
+        print("  plan: MPPI returned no safe control sequence, idling this replan")
         action_queue.clear()
-        return [0.0, -np.pi/4], None, None, None, goal, box_goal
+        return None, None, None, None, goal, box_goal
 
     # Successful plan: replace queue with full MPPI control sequence.
     # MPPI U units: v in [grid cells / mppi_step], w in [rad / mppi_step].
@@ -588,7 +589,7 @@ def run(cfg: Config, save_enabled: bool = True,
         agent_height=cfg.agent_height,
     )
     # spawn_agent_at_random_navpoint(sim, agent)
-    spawn_agent_at_pos(sim, agent, [0.0, 0.0, -5.0])
+    spawn_agent_at_pos(sim, agent, [0.0, 0.0, 0.0])
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)
@@ -599,6 +600,19 @@ def run(cfg: Config, save_enabled: bool = True,
         cfg.detector, device=cfg.device,
         negative_classes=getattr(cfg, 'det_negative_classes', None),
     )
+    # Neutral attention-sink false-positive gate (Ruis et al., ICLR 2026):
+    # wrap the base detector so each fired box is verified against the target
+    # query vs. a semantically-neutral sink in CLIP space and dropped if the
+    # sink wins. Reuses the perception stack's MaskCLIP (no second CLIP load).
+    if cfg.sink_gate:
+        detector = SinkGatedDetector(
+            detector, perception.mask_clip, device=cfg.device,
+            sink_init=cfg.sink_init, sink_num=cfg.sink_num,
+            sink_special_str=cfg.sink_special_str,
+            softmax_temp=cfg.sink_softmax_temp,
+            min_target_prob=cfg.sink_min_target_prob,
+            crop_pad=cfg.sink_crop_pad, seed=cfg.sink_seed,
+        )
     # MobileSAM is only consulted when the detector fires (Layer-1 goal
     # update), so a load failure shouldn't kill the run — fall back to the
     # box-based path with a warning. The path is None-guarded downstream.
@@ -773,6 +787,21 @@ def run(cfg: Config, save_enabled: bool = True,
                     print(f"step {step}: DETECTED — entering exploit mode "
                           f"(det_score={det_score:.3f})")
 
+            # SEARCH-mode goal disconfirmation: if the agent has reached its
+            # cached box-goal but nothing is detected there now, the earlier
+            # sighting was a false positive (a transient detector spike or a
+            # similarity blip). Drop the cache so the planner resumes exploration
+            # instead of dwelling next to the spike. EXPLOIT never reaches here
+            # (it has latched on a confirmed target), and a fresh investigated
+            # detection this frame leaves `det_investigate` True so we keep it.
+            if not detected and last_box_goal is not None and not det_investigate:
+                agz, agx = world_to_grid(pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution)
+                reach_cells = cfg.stop_distance_m / cfg.voxel_resolution
+                if float(np.hypot(agz - last_box_goal[0], agx - last_box_goal[1])) <= reach_cells:
+                    print(f"  goal disconfirmed at {last_box_goal} "
+                          f"(reached, no detection) — clearing cache")
+                    last_box_goal = None
+
             action, ref_traj, opt_traj, score, goal_cell, box_goal = plan_one_action(
                 perception, sim_iface, mppi, cfg, action_queue,
                 det_score=conf_score, detected=detected,
@@ -810,6 +839,10 @@ def run(cfg: Config, save_enabled: bool = True,
             det_backend = detector.backend_for(perception.target_query)
             mode = 'EXPLOIT' if detected else 'SEARCH'
             w_conf = float(getattr(mppi, 'last_w_conf', 0.0))
+            # Sink-gate target probability for this frame's detection (None when
+            # the gate is off, the detector didn't fire, or the crop was tiny).
+            sink_p = detector.last_target_prob if cfg.sink_gate else None
+            sink_str = f" | sink: {sink_p:.2f}" if sink_p is not None else ""
             if goal_cell is not None:
                 sg = perception.similarity_grid
                 goal_x_m = sg.min_x + goal_cell[1] * cfg.voxel_resolution
@@ -822,12 +855,12 @@ def run(cfg: Config, save_enabled: bool = True,
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | "
                       f"action [v={action[0]:+.3f} m/s, w={action[1]:+.3f} rad/s] | "
                       f"position: {pos[0]:.2f}, {pos[2]:.2f} | "
-                      f"det[{det_backend}]: {det_score:.3f} | "
+                      f"det[{det_backend}]: {det_score:.3f}{sink_str} | "
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
                       f"mode: {mode}")
             else:
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | no action | "
-                      f"det[{det_backend}]: {det_score:.3f} | "
+                      f"det[{det_backend}]: {det_score:.3f}{sink_str} | "
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
                       f"mode: {mode}")
 
@@ -865,6 +898,9 @@ def run(cfg: Config, save_enabled: bool = True,
                     'goal': [int(goal_cell[0]), int(goal_cell[1])] if goal_cell is not None else None,
                     'mode': mode,
                     'w_conf': w_conf,
+                    'sink_prob': (float(detector.last_target_prob)
+                                  if cfg.sink_gate and detector.last_target_prob is not None
+                                  else None),
                 }) + '\n')
 
             if stop_now:

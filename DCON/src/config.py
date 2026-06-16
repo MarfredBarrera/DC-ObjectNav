@@ -266,6 +266,36 @@ class Config:
         # while matching nothing at all).
         self.sam_softmax_temp = 100.0
         self.sam_min_target_prob = 0.5
+
+        # Neutral attention-sink false-positive gate (Ruis et al., "Fantastic
+        # Tractor-Dogs...", ICLR 2026), realized as a post-hoc CLIP check on the
+        # detector's box (see SinkGatedDetector). When enabled, every box the
+        # base detector emits is cropped, mean-CLIP-encoded, and compared
+        # against the target query and a semantically-NEUTRAL sink via a sharp
+        # softmax; if the sink out-scores the query (target prob <
+        # sink_min_target_prob) the box is dropped as "none of the above". This
+        # is the faithful adaptation of the paper's mechanism to a generative
+        # grounding detector (LocateAnything), which has no class-prompt softmax
+        # to redirect internally. The sink is NOT a semantic negative — the
+        # paper shows real negatives ("wall", "door") don't suppress false
+        # positives; det_negative_classes is unused by this gate.
+        #   sink_init: "mean" (mean CLIP encoding over a generic category-spread
+        #     vocab — output-space analog of the paper's mean-of-vocabulary
+        #     init; best default for CLIP), "special" (encode sink_special_str,
+        #     the paper's best for LLM-trained detectors), or "random".
+        #   sink_min_target_prob: target must win at least this softmax mass
+        #     over [query, sinks] to survive (0.5 with one sink ≈ "query beats
+        #     sink"); raise to gate harder.
+        # Cost: one CLIP forward per *fired* detection — negligible against
+        # LocateAnything (~1 s/call), ~3x overhead on a ~15 ms YOLO-World.
+        self.sink_gate = True
+        self.sink_init = "mean"
+        self.sink_num = 1
+        self.sink_special_str = "[()]"
+        self.sink_softmax_temp = 100.0
+        self.sink_min_target_prob = 0.5
+        self.sink_crop_pad = 0.0
+        self.sink_seed = 0
         # Visualization-only: when rendering nav_history.mp4, overlay the
         # most recent saved SAM mask whose step is within this many ticks
         # of the current viz frame. Larger = more frames get an overlay
@@ -475,7 +505,10 @@ class Config:
                         'stop_distance_m', 'det_negative_classes', 'goal_projection',
                         'exploit_redetect_interval',
                         'detected_min_box_frac', 'detected_max_box_frac',
-                        'detected_min_dist_m', 'detected_max_dist_m'):
+                        'detected_min_dist_m', 'detected_max_dist_m',
+                        'sink_gate', 'sink_init', 'sink_num', 'sink_special_str',
+                        'sink_softmax_temp', 'sink_min_target_prob',
+                        'sink_crop_pad', 'sink_seed'):
                 if key in det:
                     setattr(self, key, det[key])
 

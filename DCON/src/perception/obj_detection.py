@@ -79,6 +79,75 @@ def target_prob_from_sims(sims: torch.Tensor, temp: float) -> Tuple[float, float
     return float(probs[0]), float(sims[0])
 
 
+# Generic, category-spread vocabulary used to build the "mean" neutral sink:
+# the CLIP-output-space analog of the paper's "mean of all word embeddings in
+# vocabulary V" init. Deliberately ordinary words spanning many categories so
+# their average text embedding lands on no object in particular.
+_SINK_MEAN_VOCAB = [
+    "thing", "object", "stuff", "area", "place", "surface", "material",
+    "color", "shape", "pattern", "texture", "light", "shadow", "space",
+    "background", "scene", "image", "picture", "view", "region", "part",
+    "side", "edge", "corner", "center", "line", "spot", "mark", "point",
+    "person", "animal", "plant", "tool", "food", "vehicle", "building",
+    "room", "ground", "sky", "water", "metal", "wood", "plastic", "glass",
+    "fabric", "paper", "stone", "dirt", "grass", "cloud",
+]
+
+# (id(mask_clip), init, n_sinks, special_str, seed) -> (S, 512) sink bank.
+_SINK_BANK_CACHE: dict = {}
+
+
+def build_sink_bank(
+    mask_clip,
+    init: str = "mean",
+    n_sinks: int = 1,
+    special_str: str = "[()]",
+    seed: int = 0,
+) -> torch.Tensor:
+    """(S, 512) L2-normalized neutral *attention-sink* embeddings in CLIP's
+    text-output space — the training-free "none of the above" reference from
+    Ruis et al., "Fantastic Tractor-Dogs..." (ICLR 2026), adapted to a
+    late-interaction CLIP gate.
+
+    Sinks are intentionally NOT semantic negatives ("wall", "door"): the paper
+    shows real negative classes do not suppress background false positives. A
+    sink is semantically neutral and only serves as a calibrated floor the
+    target query must out-score for a detection to survive.
+
+    init strategies (mirroring the paper's three, mapped to CLIP output space):
+      - "mean":    mean of CLIP text encodings over a generic, category-spread
+                   vocabulary — the output-space analog of "mean of all word
+                   embeddings". One sink. Best default for a CLIP comparison.
+      - "special": encode a neutral special-character string (default "[()]",
+                   the paper's best init for LLM-trained detectors). One sink.
+      - "random":  `n_sinks` random unit vectors. Weak in CLIP's
+                   near-orthogonal output space (cos ~0 to everything);
+                   included for ablation parity with the paper.
+    """
+    key = (id(mask_clip), str(init).lower(), int(n_sinks), special_str, int(seed))
+    cached = _SINK_BANK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    init = str(init).lower()
+    if init == "special":
+        bank = mask_clip.encode_text(special_str)                       # (1, 512)
+    elif init == "mean":
+        embs = torch.cat([mask_clip.encode_text(w) for w in _SINK_MEAN_VOCAB], dim=0)
+        bank = embs.mean(dim=0, keepdim=True)                           # (1, 512)
+    elif init == "random":
+        ref = mask_clip.encode_text("object")
+        g = torch.Generator(device=ref.device).manual_seed(int(seed))
+        bank = torch.randn(int(n_sinks), ref.shape[1], generator=g,
+                           device=ref.device, dtype=ref.dtype)
+    else:
+        raise ValueError(
+            f"Unknown sink init {init!r} (expected 'mean', 'special', or 'random')")
+    bank = bank / (bank.norm(dim=-1, keepdim=True) + 1e-8)
+    _SINK_BANK_CACHE[key] = bank
+    return bank
+
+
 class ObjectDetector:
     """Open-vocabulary detector using YOLO-World (via Ultralytics).
 
@@ -521,6 +590,112 @@ def _to_float_rgb_tensor(image: Union[torch.Tensor, np.ndarray, Image.Image], de
     arr = ObjectDetector._to_uint8(image)
     t = torch.from_numpy(arr).to(device).float() / 255.0
     return t
+
+
+class SinkGatedDetector:
+    """Wrap any base detector with a neutral *attention-sink* false-positive
+    gate (Ruis et al., "Fantastic Tractor-Dogs...", ICLR 2026).
+
+    The paper's training-free fix appends semantically-neutral sink tokens to
+    an open-vocabulary detector's prompt and discards any box the model assigns
+    to a sink — giving the model a "none of the above" option so it stops
+    forcing the target class onto background. That exact mechanism only applies
+    to early-fusion OVD heads (Grounding DINO, GLIP, ...). Generative grounding
+    models like LocateAnything emit box coordinate *tokens* with no per-box
+    class-vs-prompt softmax to redirect, so we realize the same idea post-hoc in
+    CLIP space: crop the base detector's box, take its mean CLIP feature, and
+    compare it against the target query and the neutral sink(s) via a sharp
+    softmax. If a sink out-scores the query (target probability falls below
+    `min_target_prob`), the region is "none of the above" → discarded.
+
+    Crucially, and per the paper, the sinks are NOT semantic negatives
+    ("wall", "door"); they are neutral references (see `build_sink_bank`). On
+    accept, the base detector's score and box pass through unchanged. The gate
+    only runs when the base detector actually fires, so it adds one CLIP forward
+    per detection — negligible next to a ~1 s/call LocateAnything, more
+    noticeable on a ~15 ms YOLO-World.
+    """
+
+    name = "sink_gated"
+
+    def __init__(
+        self,
+        base_detector,
+        mask_clip,
+        device: str = "cuda",
+        sink_init: str = "mean",
+        sink_num: int = 1,
+        sink_special_str: str = "[()]",
+        softmax_temp: float = 100.0,
+        min_target_prob: float = 0.5,
+        crop_pad: float = 0.0,
+        min_crop_px: int = 8,
+        seed: int = 0,
+    ):
+        self.base = base_detector
+        self.mask_clip = mask_clip
+        self.device = device
+        self.softmax_temp = float(softmax_temp)
+        self.min_target_prob = float(min_target_prob)
+        self.crop_pad = float(crop_pad)
+        self.min_crop_px = int(min_crop_px)
+        self.sinks = build_sink_bank(
+            mask_clip, init=sink_init, n_sinks=sink_num,
+            special_str=sink_special_str, seed=seed)               # (S, 512)
+        # Cache the query embedding — the target query rarely changes in a run.
+        self._q_text: Optional[str] = None
+        self._q_emb: Optional[torch.Tensor] = None
+        # Side channel: target probability of the most recent gated detection
+        # (None when the base detector didn't fire or the crop was too small).
+        self.last_target_prob: Optional[float] = None
+
+    def backend_for(self, query: str) -> str:
+        return self.base.backend_for(query)
+
+    def _query_emb(self, query: str) -> torch.Tensor:
+        if query != self._q_text:
+            self._q_text = query
+            self._q_emb = self.mask_clip.encode_text(query)        # (1, 512)
+        return self._q_emb
+
+    @torch.no_grad()
+    def detect(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
+        score, box = self.base.detect(image, query)
+        self.last_target_prob = None
+        if box is None or score <= 0.0:
+            return score, box
+
+        arr = ObjectDetector._to_uint8(image)
+        H, W = arr.shape[:2]
+        x0, y0, x1, y1 = box
+        if self.crop_pad > 0.0:
+            pw = (x1 - x0) * self.crop_pad
+            ph = (y1 - y0) * self.crop_pad
+            x0, y0, x1, y1 = x0 - pw, y0 - ph, x1 + pw, y1 + ph
+        xi0, yi0 = max(0, int(round(x0))), max(0, int(round(y0)))
+        xi1, yi1 = min(W, int(round(x1))), min(H, int(round(y1)))
+        # Degenerate / tiny crop: can't verify reliably → pass the box through.
+        if xi1 - xi0 < self.min_crop_px or yi1 - yi0 < self.min_crop_px:
+            return score, box
+
+        crop = arr[yi0:yi1, xi0:xi1]
+        rgb = torch.from_numpy(crop).to(self.device).float() / 255.0   # (h, w, 3)
+        feats = self.mask_clip.extract_dense_features(rgb)             # (h, w, 512)
+        crop_emb = feats.reshape(-1, feats.shape[-1]).mean(dim=0, keepdim=True)
+        crop_emb = crop_emb / (crop_emb.norm(dim=-1, keepdim=True) + 1e-8)  # (1, 512)
+
+        bank = torch.cat([self._query_emb(query), self.sinks], dim=0)  # (1+S, 512)
+        sims = (crop_emb @ bank.T).squeeze(0)                          # (1+S,)
+        prob, _ = target_prob_from_sims(sims, self.softmax_temp)
+        self.last_target_prob = prob
+        if prob < self.min_target_prob:
+            # A neutral sink out-scored the query → background false positive.
+            return 0.0, None
+        return score, box
 
 
 class LocateAnythingDetector:

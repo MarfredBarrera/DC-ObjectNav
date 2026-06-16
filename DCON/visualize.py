@@ -272,6 +272,12 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         mode = (current_entry.get('mode') if current_entry else None) or 'SEARCH'
         w_conf = float(current_entry.get('w_conf', 0.0) or 0.0) if current_entry else 0.0
 
+        # Sink-gate target probability for this frame's detection (absent/None
+        # when the gate was off, the detector didn't fire, or the crop was tiny).
+        sink_prob = current_entry.get('sink_prob') if current_entry else None
+        if sink_prob is not None:
+            sink_prob = float(sink_prob)
+
         maps_dict = {'occ': occ, 'sim': sim, 'epi': epi, 'rgb': rgb}
         
         # Optional: compute CombinedZ if we want to match analysis.py perfectly
@@ -290,6 +296,8 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
             det_conf=det_conf,
             goal_world=goal_world, goal_cell=goal_cell,
             mode=mode, w_conf=w_conf,
+            sink_prob=sink_prob,
+            sink_thresh=float(getattr(cfg, 'sink_min_target_prob', 0.5)),
         )
         frames.append(viz.fig_to_numpy(fig))
         plt.close(fig)

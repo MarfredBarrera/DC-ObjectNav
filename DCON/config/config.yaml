@@ -6,7 +6,7 @@ paths:
   output_name: "model.pt"
 
 habitat:
-  scene_path: "/workspace/DCON/gibson_scenes/Cantwell.glb"
+  scene_path: "/workspace/DCON/gibson_scenes/Corozal.glb"
   img_width: 512
   img_height: 512
   fov: 90
