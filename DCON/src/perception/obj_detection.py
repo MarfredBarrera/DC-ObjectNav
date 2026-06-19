@@ -645,9 +645,14 @@ class SinkGatedDetector:
         # Cache the query embedding — the target query rarely changes in a run.
         self._q_text: Optional[str] = None
         self._q_emb: Optional[torch.Tensor] = None
-        # Side channel: target probability of the most recent gated detection
-        # (None when the base detector didn't fire or the crop was too small).
+        # Side channels for logging/viz: the target probability of the most
+        # recent gated detection and the box it scored. Both are None when the
+        # gate didn't run (base detector didn't fire, or the crop was too
+        # small). `last_box` is set even when the detection is rejected, so the
+        # viz can still draw the false-positive box. They are always set/cleared
+        # together: a non-None `last_target_prob` always has a `last_box`.
         self.last_target_prob: Optional[float] = None
+        self.last_box: Optional[Tuple[float, float, float, float]] = None
 
     def backend_for(self, query: str) -> str:
         return self.base.backend_for(query)
@@ -666,6 +671,7 @@ class SinkGatedDetector:
     ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
         score, box = self.base.detect(image, query)
         self.last_target_prob = None
+        self.last_box = None
         if box is None or score <= 0.0:
             return score, box
 
@@ -692,6 +698,9 @@ class SinkGatedDetector:
         sims = (crop_emb @ bank.T).squeeze(0)                          # (1+S,)
         prob, _ = target_prob_from_sims(sims, self.softmax_temp)
         self.last_target_prob = prob
+        # Remember the scored box even on rejection so the viz can still draw
+        # the false positive (paired with last_target_prob).
+        self.last_box = (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
         if prob < self.min_target_prob:
             # A neutral sink out-scored the query → background false positive.
             return 0.0, None
@@ -804,7 +813,12 @@ class LocateAnythingDetector:
         m = re.search(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", response)
         if m is not None:
             x1, y1, x2, y2 = (int(g) / 1000.0 for g in m.groups())
-            box = (x1 * w, y1 * h, x2 * w, y2 * h)
+            # The model occasionally emits corners out of order; sort so the
+            # box is always (xmin, ymin, xmax, ymax) for every downstream
+            # consumer (CLIP crop, BEV projection, PIL rectangle in viz).
+            xs = sorted((x1 * w, x2 * w))
+            ys = sorted((y1 * h, y2 * h))
+            box = (xs[0], ys[0], xs[1], ys[1])
             return 1.0, box
         return 0.0, None
 

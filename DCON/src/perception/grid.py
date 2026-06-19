@@ -133,8 +133,10 @@ class SimilarityGrid(VoxelGrid):
         all_sims = torch.cat(all_sims, dim=0)
         self.voxels = all_sims.reshape(grid_shape)
 
-    def get_2d_map(self, min_y=0.0, max_y=1.5):
+    def get_2d_map(self, min_y=None, max_y=None):
         if self.voxels is None: return None
+        if min_y is None: min_y = self.cfg.bev_height_min
+        if max_y is None: max_y = self.cfg.bev_height_max
         y_start, y_end = self.get_y_indices(min_y, max_y)
         if y_start >= y_end: return torch.zeros((self.num_z, self.num_x), device=self.device)
         
@@ -238,12 +240,14 @@ class OccupancyGrid(VoxelGrid):
         w = torch.clamp((ref / v_dist[update_mask].clamp(min=1e-3)) ** 2, max=1.0)
         self.coverage[y_sel, z_sel, x_sel] += w
 
-    def get_2d_map(self, min_y=0.2, max_y=1.5):
+    def get_2d_map(self, min_y=None, max_y=None):
+        if min_y is None: min_y = self.cfg.bev_height_min
+        if max_y is None: max_y = self.cfg.bev_height_max
         y_start, y_end = self.get_y_indices(min_y, max_y)
         if y_start >= y_end: return torch.zeros((self.num_z, self.num_x), device=self.device)
         return self.voxels[y_start:y_end].max(dim=0)[0]
 
-    def get_2d_map_dilated(self, min_y=0.2, max_y=1.5, radius=1):
+    def get_2d_map_dilated(self, min_y=None, max_y=None, radius=1):
         """Return a 2D occupancy BEV with obstacles dilated by `radius` cells.
 
         Only free cells (val==1) adjacent to obstacles are promoted to
@@ -267,12 +271,14 @@ class OccupancyGrid(VoxelGrid):
         out[promote] = self.occupied_val
         return out
 
-    def get_2d_coverage_deficit_map(self, min_y=0.1, max_y=1.5, tau=None):
+    def get_2d_coverage_deficit_map(self, min_y=None, max_y=None, tau=None):
         """BEV coverage deficit in [0, 1]: mean over the Y band of
         exp(-coverage / tau). 1 = never observed, →0 with accumulating
         (quality-weighted) views. Continuous, monotonically decaying —
         the graded replacement for the binary unseen mask as an IG source.
         """
+        if min_y is None: min_y = self.cfg.bev_height_min
+        if max_y is None: max_y = self.cfg.bev_height_max
         if tau is None:
             tau = float(self.cfg.coverage_tau)
         y_start, y_end = self.get_y_indices(min_y, max_y)
@@ -305,8 +311,14 @@ class UncertaintyGrid(VoxelGrid):
         # switches the BEV reduction from bottom-k-mean to max.
         self.masked = False
 
-    def forward_pass(self, height_filter=(0.1,2.0), batch_size=100000, occupancy_grid=None):
+    def forward_pass(self, height_filter=None, batch_size=100000, occupancy_grid=None):
         if not self.initialized: return
+        # The epistemic/aleatoric BEV (get_2d_map) pools over the WHOLE computed
+        # volume — it doesn't re-slice a band — so the configured BEV band is
+        # applied here, when the 3D volume is built. Keeps uncertainty aligned
+        # with the other BEV maps (and the target floor for multi-floor scenes).
+        if height_filter is None:
+            height_filter = (self.cfg.bev_height_min, self.cfg.bev_height_max)
         points, grid_shape = self.generate_sample_points(height_filter)
         pts_tensor = torch.from_numpy(points).float().to(self.device)
 
@@ -346,7 +358,9 @@ class UncertaintyGrid(VoxelGrid):
         self.voxels_epi = epi
         self.voxels_ale = ale
 
-    def get_2d_map(self, min_y=0.1, max_y=1.5, type='epistemic'):
+    def get_2d_map(self, type='epistemic'):
+        # No height band here: the volume was already restricted to the
+        # configured BEV band in forward_pass, and this pools over all of it.
         voxels = self.voxels_epi if type == 'epistemic' else self.voxels_ale
         if voxels is None: return None
         if self.masked:

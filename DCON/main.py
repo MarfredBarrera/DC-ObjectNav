@@ -5,8 +5,9 @@ Three cadences in a single process:
     B. replan + 1 agent step   every REPLAN_INTERVAL       (MPPI is cheap)
     C. refresh buffer + maps   every cfg.hash_buffer_refresh_interval (bottleneck)
 
-Bootstrap: spin a full circle observing each frame, then cold-train for
-BOOTSTRAP_TRAIN_STEPS so the first map is meaningful before the first plan.
+Startup: a single observation seeds perception and the first BEV maps are
+built directly from the untrained feature field — no spin, no cold-train. The
+maps fill in online as the loop trains and cadence C recomputes them.
 """
 
 import argparse
@@ -19,6 +20,8 @@ os.environ['HABITAT_SIM_LOG'] = 'quiet'
 
 import gc
 import json
+import shutil
+import signal
 import time
 from collections import deque
 
@@ -48,9 +51,6 @@ from visualize import render_navigation
 
 
 REPLAN_INTERVAL = 100
-SPIN_FRAMES = 36                       # 36 * 10° = full circle
-SPIN_OMEGA = np.deg2rad(10) / 0.1      # 10° per 0.1s sim step
-BOOTSTRAP_TRAIN_STEPS = 2000
 
 
 def get_agent_heading(agent) -> float:
@@ -431,6 +431,80 @@ def snap_to_free(cell, bev_occ, free_val=1):
     return (int(fz[i]), int(fx[i]))
 
 
+def project_box_goal(perception, sim_iface, cfg, det_box, rgb, depth, c2w,
+                     segmenter=None, start_grid=None, bev_occ=None):
+    """Project a detection box to a BEV goal cell — the Layer-1 goal logic
+    used by `plan_one_action`.
+
+    `box_center` needs only depth + camera pose, so it works before any BEV map
+    is meaningful (e.g. on the untrained field at startup). The `sam` path needs
+    `bev_occ` + `start_grid` to snap the chosen mask cell to free space; it is
+    skipped when those aren't available. Returns a (z, x) cell, or None.
+    """
+    if det_box is None:
+        return None
+    if cfg.goal_projection == "box_center":
+        return bev_cell_from_box_center(
+            perception, cfg, sim_iface.intrinsics, det_box, depth, c2w)
+    if segmenter is not None and bev_occ is not None and start_grid is not None:
+        det_cells = bev_cells_from_sam(
+            perception, cfg, sim_iface.intrinsics,
+            rgb, depth, c2w, perception.target_query, segmenter,
+            min_mask_pixels=int(getattr(cfg, 'sam_min_mask_pixels', 200)),
+            min_clip_sim=float(getattr(cfg, 'sam_min_clip_sim', 0.18)),
+        )
+        if det_cells is not None and det_cells.any():
+            cand = closest_cell_in_mask(det_cells, start_grid)
+            if cand is not None:
+                return snap_to_free(cand, bev_occ)
+    return None
+
+
+def detect_classify_latch(detector, perception, sim_iface, cfg, segmenter,
+                          rgb, depth, c2w, pos, detected, detected_streak,
+                          run_detector=True, tag=""):
+    """Run the detector, classify the detection, and advance the latch state.
+
+    Classifies the box by object distance + box size into
+    three tiers (see `classify_detection`): *too close* → ignored; *too far* →
+    investigate (steer + confidence) but not persistent; *usable band* →
+    persistent (also counts toward the latch streak). Latches into DETECTED
+    once `cfg.detected_persistence` consecutive persistent detections accrue
+    (never unlatches).
+
+    Returns (det_score, det_box, det_persistent, det_investigate, conf_score,
+    detected, detected_streak).
+    """
+    if run_detector:
+        det_score, det_box = detector.detect(rgb, perception.target_query)
+    else:
+        det_score, det_box = 0.0, None
+
+    # Reset the SAM side-channel so a mask is only persisted on the frame SAM
+    # actually ran (bev_cells_from_sam refills it on a qualifying detection).
+    if segmenter is not None:
+        segmenter.last_mask = None
+        segmenter.last_box = None
+        segmenter.last_score = 0.0
+
+    det_persistent, det_investigate = classify_detection(
+        perception, cfg, sim_iface.intrinsics, det_box, depth, c2w, pos)
+    det_persistent = det_persistent and det_score >= cfg.detected_conf_threshold
+    conf_score = det_score if det_investigate else 0.0
+
+    if not detected:
+        if det_persistent:
+            detected_streak += 1
+        else:
+            detected_streak = 0
+        if detected_streak >= cfg.detected_persistence:
+            detected = True
+            print(f"{tag}: DETECTED — entering exploit mode "
+                  f"(det_score={det_score:.3f})")
+    return (det_score, det_box, det_persistent, det_investigate, conf_score,
+            detected, detected_streak)
+
+
 def plan_one_action(perception, sim_iface, mppi, cfg,
                     action_queue: deque, k_max: int = 5,
                     det_score: float = 0.0,
@@ -452,7 +526,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     noisy detections). `detected=True` overrides it with goal_confidence=1.0,
     saturating the conf curve so `w_ig_conf = 0` and IG is hard-off.
     """
-    bev_sim = _to_numpy(perception.similarity_grid.get_2d_map(min_y=0.1, max_y=1.5))
+    bev_sim = _to_numpy(perception.similarity_grid.get_2d_map())
     bev_epi = _to_numpy(perception.ugrid.get_2d_map(type='epistemic'))
     bev_occ = _to_numpy(perception.occupancy_grid.get_2d_map())
 
@@ -465,7 +539,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     # exhausted); 'epistemic' = masked field uncertainty; 'unseen' ignores
     # the map (MPPI builds a binary mask from occupancy internally).
     if cfg.ig_source == 'coverage':
-        bev_ig = _to_numpy(perception.occupancy_grid.get_2d_coverage_deficit_map(min_y=0.1, max_y=1.5))
+        bev_ig = _to_numpy(perception.occupancy_grid.get_2d_coverage_deficit_map())
     else:
         bev_ig = bev_epi
 
@@ -500,34 +574,16 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     # (Layer 3). SAM runs on the *whole image* (not box-prompted) because the
     # box is often offset by ~one box-width at distance; CLIP picks the mask.
     if det_box is not None and det_investigate:
-        if cfg.goal_projection == "box_center":
-            # Project the box center straight to one BEV cell and use it as
-            # the goal verbatim (no SAM, no argmax, no snapping). MPPI already
-            # carves a free disk around the goal and forgives collisions on
-            # arrival, so a cell sitting on the target surface is fine.
-            cand = bev_cell_from_box_center(
-                perception, cfg, sim_iface.intrinsics, det_box, depth, c2w)
-            if cand is not None:
-                goal = cand
-                box_goal = goal
-        elif segmenter is not None:
-            det_cells = bev_cells_from_sam(
-                perception, cfg, sim_iface.intrinsics,
-                rgb, depth, c2w, perception.target_query,
-                segmenter,
-                min_mask_pixels=int(getattr(cfg, 'sam_min_mask_pixels', 200)),
-                min_clip_sim=float(getattr(cfg, 'sam_min_clip_sim', 0.18)),
-            )
-            if det_cells is not None and det_cells.any():
-                # Goal = the mask cell closest to the agent (near face of the
-                # object's projected footprint), not the argmax of the smeared
-                # similarity field. If that cell sits on the object (occupied),
-                # snap to the nearest navigable free cell so the agent stops in
-                # front of the target rather than inside it.
-                cand = closest_cell_in_mask(det_cells, start_grid)
-                if cand is not None:
-                    goal = snap_to_free(cand, bev_occ)
-                    box_goal = goal
+        # box_center: project the box center straight to one BEV cell, used
+        # verbatim (MPPI carves a free disk around the goal and forgives arrival
+        # collisions, so a cell on the target surface is fine). sam: pick the
+        # near-face mask cell and snap to free space. See project_box_goal.
+        cand = project_box_goal(
+            perception, sim_iface, cfg, det_box, rgb, depth, c2w,
+            segmenter=segmenter, start_grid=start_grid, bev_occ=bev_occ)
+        if cand is not None:
+            goal = cand
+            box_goal = goal
     if goal is None and last_box_goal is not None:
         gz, gx = int(last_box_goal[0]), int(last_box_goal[1])
         if 0 <= gz < H and 0 <= gx < W:
@@ -589,7 +645,7 @@ def run(cfg: Config, save_enabled: bool = True,
         agent_height=cfg.agent_height,
     )
     # spawn_agent_at_random_navpoint(sim, agent)
-    spawn_agent_at_pos(sim, agent, [0.0, 0.0, 0.0])
+    spawn_agent_at_pos(sim, agent, [-1.0, 0.0, -7.0])
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)
@@ -632,36 +688,38 @@ def run(cfg: Config, save_enabled: bool = True,
             print(f"[init] MobileSAM unavailable ({e}); EXPLOIT goals will skip SAM refinement")
     action_queue: deque = deque()
 
-    # 2. Bootstrap A: spin in a full circle, observe each frame
-    print(f"[bootstrap A] spinning {SPIN_FRAMES} frames (~360°)...")
-    for f in range(SPIN_FRAMES):
-        sim_iface.step([0.0, SPIN_OMEGA])
-        rgb, depth, c2w = perception.observe(sim_iface)
-        perception.update_replay_buffer(rgb, depth, c2w, sim_iface.intrinsics)
-        perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
-        
-        if save_enabled:
-            # Save periodic bootstrap views
-            rgb_dir = os.path.join(cfg.output_dir, "rgbs")
-            os.makedirs(rgb_dir, exist_ok=True)
-        #     rgb_img = (rgb.numpy() * 255).astype(np.uint8)
-        #     imageio.imwrite(os.path.join(rgb_dir, f"bootstrap_{f:03d}.png"), rgb_img)
-            
-        torch.cuda.empty_cache()
+    # Planner state. `detected` latches True (and never releases) once
+    # cfg.detected_persistence consecutive persistent detections accrue; while
+    # latched MPPI silences IG and pulls hard toward the cached goal.
+    # `last_box_goal` caches the goal cell of the most recent investigated
+    # detection so a missed frame doesn't drop the agent back to global-argmax
+    # exploration.
+    detected = False
+    detected_streak = 0
+    last_box_goal = None
 
-        print(f"  bootstrap frame {f + 1}/{SPIN_FRAMES}")
+    # Clear per-step artifact dirs from any previous run sharing this
+    # output_dir. They hold step-numbered .npy/.png/.npz files; unlike
+    # traj_log.jsonl (truncated below) they were never cleared, so a previous,
+    # longer run (often a different scene) left stale snapshots that visualize.py
+    # then interleaved into the new navigation history. Wipe them so only the
+    # current run's maps exist.
+    if save_enabled:
+        for sub in ("umaps", "occ_maps", "sim_maps", "sam_masks", "rgbs"):
+            shutil.rmtree(os.path.join(cfg.output_dir, sub), ignore_errors=True)
+
+    # 2. Startup: a single observation seeds the replay buffer + occupancy, then
+    # the first BEV maps are built directly from the untrained feature field —
+    # no spin, no cold-train. The maps start as field noise / mostly-unseen and
+    # fill in online as the loop trains and cadence C recomputes them.
+    print("[init] seeding maps from the untrained feature field (no bootstrap)...")
+    rgb, depth, c2w = perception.observe(sim_iface)
+    perception.update_replay_buffer(rgb, depth, c2w, sim_iface.intrinsics)
+    perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
     super_pts, super_feats = perception.make_super_batch()
+    torch.cuda.empty_cache()
 
-    # 3. Bootstrap B: cold-train so first BEV maps have signal
-    print(f"[bootstrap B] cold-training {BOOTSTRAP_TRAIN_STEPS} steps...")
-    t0 = time.time()
-    for s in range(BOOTSTRAP_TRAIN_STEPS):
-        loss = perception.train_step(super_pts, super_feats)
-        if s % 200 == 0:
-            print(f"  bootstrap step {s:04d} | loss {loss:.5f} | t {time.time()-t0:.1f}s")
-
-    # 4. Bootstrap C: build first maps, save grid extent for visualize.py
-    print("[bootstrap C] computing first BEV maps...")
+    # First maps + grid extent for visualize.py
     perception.update_maps(step=0, save_enabled=save_enabled)
     if save_enabled:
         # Save RGB
@@ -693,28 +751,41 @@ def run(cfg: Config, save_enabled: bool = True,
           f"(replan every {REPLAN_INTERVAL}, refresh every {cfg.hash_buffer_refresh_interval})")
     start_time = time.time()
 
-    # Two-phase planner state. `detected` latches to True (and never releases)
-    # once `det_score >= cfg.detected_conf_threshold` for
-    # `cfg.detected_persistence` consecutive replans. While latched, MPPI
-    # silences IG and pulls hard toward the BEV similarity peak.
-    detected = False
-    detected_streak = 0
-
-    # Goal cell derived from the most recent qualifying detection box. Persists
-    # across replans so a missing detection this frame doesn't drop the agent
-    # back to global-argmax exploration. In SEARCH mode every qualifying box
-    # overwrites it (track the latest sighting); once EXPLOIT latches the
-    # detector is throttled off, so it freezes on the object that triggered the
-    # latch and the agent commits to it.
-    last_box_goal = None
-
     # Tracks the last step actually executed by the loop. Used to cap the
     # post-run visualization so it doesn't pull in stale .npy snapshots left
     # over from a previous, longer run (traj_log.jsonl is truncated each run,
     # but the umaps/occ_maps/sim_maps directories are not).
     last_step = 0
 
+    # Graceful early stop. Two ways to request it; both let the loop break at
+    # the next step and fall through to the final map snapshot + visualization
+    # below (instead of losing them to a hard kill):
+    #   1. Ctrl-C (SIGINT) → sets a flag. A second Ctrl-C hard-aborts in case
+    #      something is wedged.
+    #   2. Create the sentinel file `<output_dir>/STOP` (e.g. `touch` it, handy
+    #      when running under `docker exec` without an attached TTY).
+    # A stale STOP from a previous run is removed up front so it doesn't end the
+    # new run immediately.
+    stop_file = os.path.join(cfg.output_dir, "STOP")
+    if os.path.exists(stop_file):
+        os.remove(stop_file)
+    stop_requested = {"flag": False}
+
+    def _on_sigint(signum, frame):
+        if stop_requested["flag"]:
+            raise KeyboardInterrupt
+        stop_requested["flag"] = True
+        print("\n[main] stop requested (Ctrl-C) — finishing the current step, "
+              "then saving maps + rendering the visualization. "
+              "Press Ctrl-C again to abort immediately.")
+
+    prev_sigint = signal.signal(signal.SIGINT, _on_sigint)
+
     for step in range(1, cfg.iterations + 1):
+        if stop_requested["flag"] or os.path.exists(stop_file):
+            reason = "Ctrl-C" if stop_requested["flag"] else f"{stop_file} sentinel"
+            print(f"[main] ending early at step {last_step} ({reason})")
+            break
         last_step = step
         # A. train every step
         loss = perception.train_step(super_pts, super_feats)
@@ -740,52 +811,17 @@ def run(cfg: Config, save_enabled: bool = True,
                 run_detector = (replan_idx % cfg.exploit_redetect_interval == 0)
             else:
                 run_detector = True
-            if run_detector:
-                det_score, det_box = detector.detect(rgb_cur, perception.target_query)
-            else:
-                det_score, det_box = 0.0, None
-
-            # Clear last replan's SAM side-channel so a mask is only persisted
-            # on the frame SAM actually ran. `bev_cells_from_sam` resets these
-            # too, but it only runs on a fresh qualifying detection — without
-            # this reset the previous mask lingers and gets re-saved/re-logged
-            # every replan, leaving a stale overlay on frames with no detection.
-            if segmenter is not None:
-                segmenter.last_mask = None
-                segmenter.last_box = None
-                segmenter.last_score = 0.0
-
-            # Classify the detection by object distance + box size into three
-            # tiers of consequence:
-            #   too close (near OR fills the frame) → ignored entirely: no goal,
-            #     no confidence weight, no latch.
-            #   too far (distant OR tiny box)       → INVESTIGATE: steer toward
-            #     it (goal set + cached) and pull the confidence weight, but it
-            #     is NOT persistent — it can't latch yet.
-            #   usable band                         → persistent: investigate +
-            #     contribute confidence AND count toward the latch streak.
-            # `det_investigate` (= not too close) drives the goal + confidence;
-            # `det_persistent` (usable band, clearing the confidence threshold)
-            # additionally drives latching. So the agent approaches a far sighting
-            # and only commits to it once it has closed into the usable band.
-            det_persistent, det_investigate = classify_detection(
-                perception, cfg, sim_iface.intrinsics,
-                det_box, depth_cur, c2w_cur, pos)
-            det_persistent = det_persistent and det_score >= cfg.detected_conf_threshold
-            conf_score = det_score if det_investigate else 0.0
-
-            # Latch into DETECTED once we get `detected_persistence` consecutive
-            # persistent detections (a non-persistent frame resets the streak).
-            # Never unlatches — see comment above.
-            if not detected:
-                if det_persistent:
-                    detected_streak += 1
-                else:
-                    detected_streak = 0
-                if detected_streak >= cfg.detected_persistence:
-                    detected = True
-                    print(f"step {step}: DETECTED — entering exploit mode "
-                          f"(det_score={det_score:.3f})")
+            # Detect (subject to the throttle above), classify into too-close /
+            # too-far / usable-band, and advance the latch. `det_investigate`
+            # (= not too close) drives the goal + confidence; `det_persistent`
+            # (usable band over threshold) also drives latching, so the agent
+            # approaches a far sighting and commits only once it has closed into
+            # the usable band.
+            (det_score, det_box, det_persistent, det_investigate, conf_score,
+             detected, detected_streak) = detect_classify_latch(
+                detector, perception, sim_iface, cfg, segmenter,
+                rgb_cur, depth_cur, c2w_cur, pos, detected, detected_streak,
+                run_detector=run_detector, tag=f"step {step}")
 
             # SEARCH-mode goal disconfirmation: if the agent has reached its
             # cached box-goal but nothing is detected there now, the earlier
@@ -839,9 +875,14 @@ def run(cfg: Config, save_enabled: bool = True,
             det_backend = detector.backend_for(perception.target_query)
             mode = 'EXPLOIT' if detected else 'SEARCH'
             w_conf = float(getattr(mppi, 'last_w_conf', 0.0))
-            # Sink-gate target probability for this frame's detection (None when
-            # the gate is off, the detector didn't fire, or the crop was tiny).
-            sink_p = detector.last_target_prob if cfg.sink_gate else None
+            # Sink-gate target probability + the box it scored, for this frame's
+            # detection (both None when the gate is off, the detector didn't
+            # fire, or the crop was tiny). Gate on `run_detector` so a throttled
+            # EXPLOIT replan doesn't log the stale side-channel from an earlier
+            # detect call. `sink_box` is logged even on rejection so the viz can
+            # draw the false positive.
+            sink_p = detector.last_target_prob if (cfg.sink_gate and run_detector) else None
+            sink_b = detector.last_box if (cfg.sink_gate and run_detector) else None
             sink_str = f" | sink: {sink_p:.2f}" if sink_p is not None else ""
             if goal_cell is not None:
                 sg = perception.similarity_grid
@@ -898,9 +939,8 @@ def run(cfg: Config, save_enabled: bool = True,
                     'goal': [int(goal_cell[0]), int(goal_cell[1])] if goal_cell is not None else None,
                     'mode': mode,
                     'w_conf': w_conf,
-                    'sink_prob': (float(detector.last_target_prob)
-                                  if cfg.sink_gate and detector.last_target_prob is not None
-                                  else None),
+                    'sink_prob': float(sink_p) if sink_p is not None else None,
+                    'sink_box': [float(v) for v in sink_b] if sink_b is not None else None,
                 }) + '\n')
 
             if stop_now:
@@ -938,11 +978,15 @@ def run(cfg: Config, save_enabled: bool = True,
         # if step % 100 == 0:
         #     print(f"  step {step:05d} | loss {loss:.5f} | t {time.time()-start_time:.1f}s")
 
+    # Restore the default Ctrl-C behavior so the (potentially long) finalization
+    # + visualization below can be aborted normally.
+    signal.signal(signal.SIGINT, prev_sigint)
+
     # Snapshot maps + RGB + 2D-sim aligned to last_step so the visualizer's
     # final frame is up-to-date. The C cadence only fires every refresh
-    # interval, and early termination via `stop_now` can leave it 100+ steps
-    # behind the actual last action. Skipped when last_step already matches
-    # the most recent refresh tick — same files would just be overwritten.
+    # interval, and early termination via `stop_now` or Ctrl-C can leave it
+    # 100+ steps behind the actual last action. Skipped when last_step already
+    # matches the most recent refresh tick — same files would just be overwritten.
     if save_enabled and last_step % cfg.hash_buffer_refresh_interval != 0:
         print(f"[main] saving final maps at step {last_step}...")
         rgb_f, depth_f, c2w_f = perception.observe(sim_iface)

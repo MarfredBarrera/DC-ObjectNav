@@ -26,14 +26,34 @@ from src.config import Config
 from src.visualization.visualizer import Visualizer
 
 
-def annotate_detection(rgb_uint8: np.ndarray, box) -> np.ndarray:
-    """Draw the detector's bounding box on a uint8 RGB image. No text overlay."""
+def _norm_box(box):
+    """Return (x0, y0, x1, y1) with x0<=x1, y0<=y1, or None if degenerate.
+
+    Some detectors (e.g. LocateAnything) occasionally emit coordinates out of
+    order; PIL's draw.rectangle raises if x1<x0, so normalize and drop empties.
+    """
+    if box is None:
+        return None
+    xa, ya, xb, yb = box
+    x0, x1 = (xa, xb) if xa <= xb else (xb, xa)
+    y0, y1 = (ya, yb) if ya <= yb else (yb, ya)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def annotate_detection(rgb_uint8: np.ndarray, box, color=(255, 64, 64),
+                       label=None) -> np.ndarray:
+    """Draw a bounding box (and optional label) on a uint8 RGB image."""
+    box = _norm_box(box)
     if box is None:
         return rgb_uint8
     img = Image.fromarray(rgb_uint8)
     draw = ImageDraw.Draw(img)
     xmin, ymin, xmax, ymax = box
-    draw.rectangle([xmin, ymin, xmax, ymax], outline=(255, 64, 64), width=3)
+    draw.rectangle([xmin, ymin, xmax, ymax], outline=color, width=3)
+    if label is not None:
+        draw.text((int(xmin) + 2, max(0, int(ymin) - 12)), label, fill=color)
     return np.asarray(img)
 
 
@@ -61,6 +81,7 @@ def annotate_sam(rgb_uint8: np.ndarray, mask: Optional[np.ndarray],
         arr[mask] = 0.6 * arr[mask] + 0.4 * green
         img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
+    box = _norm_box(box)
     if box is not None:
         draw = ImageDraw.Draw(img)
         xmin, ymin, xmax, ymax = box
@@ -172,9 +193,17 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
     if not traj_log:
         print("WARNING: traj_log.jsonl is empty or missing — trajectories won't be shown.")
 
-    # Determine map steps from config, capped at the run's actual final step
-    # (defaults to cfg.iterations when called standalone via CLI).
-    cap = cfg.iterations if max_step is None else int(max_step)
+    # Determine map steps from config, capped at the run's actual final step.
+    # When max_step isn't given (standalone CLI), bound to the last step in the
+    # freshly-truncated traj_log rather than cfg.iterations — otherwise we'd
+    # scan all the way to cfg.iterations and risk pulling in stale .npy
+    # snapshots left by a previous, longer run sharing this output_dir.
+    if max_step is not None:
+        cap = int(max_step)
+    elif traj_log:
+        cap = int(traj_log[-1]['step'])
+    else:
+        cap = cfg.iterations
     map_steps = [s for s in range(0, cap + 1, cfg.viz_interval)]
 
     # Always include the run's final step (main.py snapshots aligned maps at
@@ -242,11 +271,25 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         current_pos     = tuple(current_entry['pos'])     if current_entry else None
         current_heading = float(current_entry['heading']) if current_entry else 0.0
 
-        # Recorded detection from the most-recent plan step.
+        # Recorded detection from the most-recent plan step. When the sink gate
+        # ran (a sink_prob exists), draw the box it scored — green if the target
+        # beat the neutral sink (kept) or red if a sink won (false positive) —
+        # so rejected detections stay visible. Otherwise draw the accepted box.
         det_conf = float(current_entry.get('det_conf', 0.0) or 0.0) if current_entry else 0.0
         det_box = current_entry.get('det_box') if current_entry else None
+        sink_prob = current_entry.get('sink_prob') if current_entry else None
+        if sink_prob is not None:
+            sink_prob = float(sink_prob)
+        sink_box = current_entry.get('sink_box') if current_entry else None
+        sink_thresh = float(getattr(cfg, 'sink_min_target_prob', 0.5))
         if rgb is not None:
-            rgb = annotate_detection(rgb, det_box)
+            if sink_prob is not None and sink_box is not None:
+                kept = sink_prob >= sink_thresh
+                color = (26, 138, 26) if kept else (200, 40, 40)
+                rgb = annotate_detection(rgb, sink_box, color=color,
+                                         label=f"{sink_prob:.2f}")
+            else:
+                rgb = annotate_detection(rgb, det_box)
 
         # SAM overlay: most recent saved mask at or before this frame,
         # capped at `sam_lookback_steps` so we don't paint a stale mask
@@ -271,12 +314,6 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         # Planner mode (SEARCH/EXPLOIT) and current exploit weight.
         mode = (current_entry.get('mode') if current_entry else None) or 'SEARCH'
         w_conf = float(current_entry.get('w_conf', 0.0) or 0.0) if current_entry else 0.0
-
-        # Sink-gate target probability for this frame's detection (absent/None
-        # when the gate was off, the detector didn't fire, or the crop was tiny).
-        sink_prob = current_entry.get('sink_prob') if current_entry else None
-        if sink_prob is not None:
-            sink_prob = float(sink_prob)
 
         maps_dict = {'occ': occ, 'sim': sim, 'epi': epi, 'rgb': rgb}
         

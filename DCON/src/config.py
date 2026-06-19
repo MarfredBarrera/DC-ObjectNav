@@ -110,6 +110,19 @@ class Config:
         # Grid
         self.voxel_resolution = 0.05
         self.grid_max_height = 2.0
+        # Height band (world-Y meters, ABSOLUTE coordinates) collapsed into the
+        # 2D BEV maps — similarity, occupancy, coverage deficit, and the
+        # epistemic uncertainty volume all reduce over this slice. Defaults
+        # assume the floor sits near Y=0. min must sit ~0.2 m ABOVE the floor
+        # surface: the occupancy grid marks the floor plane itself occupied and
+        # it bleeds up ~one voxel row, so a min flush with the floor makes the
+        # whole walkable area read as obstacle (0.2 is what OccupancyGrid used
+        # before the band was unified). For a multi-floor scene, set the band to
+        # the target floor (floor+0.2 .. floor+1.5) so upper floors don't bleed
+        # in; raise grid_max_height if the band exceeds 2.0 m. min must be >= the
+        # scene's min_y; max is clipped by grid_max_height.
+        self.bev_height_min = 0.2
+        self.bev_height_max = 1.5
         # Soft coverage accumulator (OccupancyGrid.coverage). Each depth
         # update adds min(1, (ref_dist/d)^2) to every voxel it confirms —
         # close views count fully, distant ones fractionally. The IG-facing
@@ -172,7 +185,7 @@ class Config:
         self.mppi_anneal_beta_action = 1.5
 
         # Visualization
-        self.viz_interval = 1000
+        self.viz_interval = 500
 
         self.detector = "hybrid"
 
@@ -293,7 +306,7 @@ class Config:
         self.sink_num = 1
         self.sink_special_str = "[()]"
         self.sink_softmax_temp = 100.0
-        self.sink_min_target_prob = 0.5
+        self.sink_min_target_prob = 0.4
         self.sink_crop_pad = 0.0
         self.sink_seed = 0
         # Visualization-only: when rendering nav_history.mp4, overlay the
@@ -473,7 +486,8 @@ class Config:
                 self.voxel_resolution = grid['voxel_resolution']
             if 'max_height' in grid:
                 self.grid_max_height = grid['max_height']
-            for key in ('coverage_ref_dist_m', 'coverage_tau', 'mask_free_epistemic'):
+            for key in ('coverage_ref_dist_m', 'coverage_tau', 'mask_free_epistemic',
+                        'bev_height_min', 'bev_height_max'):
                 if key in grid:
                     setattr(self, key, grid[key])
 

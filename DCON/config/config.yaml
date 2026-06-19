@@ -6,7 +6,7 @@ paths:
   output_name: "model.pt"
 
 habitat:
-  scene_path: "/workspace/DCON/gibson_scenes/Corozal.glb"
+  scene_path: "/workspace/DCON/gibson_scenes/Goffs.glb"
   img_width: 512
   img_height: 512
   fov: 90
@@ -16,7 +16,7 @@ habitat:
   # Navmesh agent radius (m): walls are inset by this much, so smaller =
   # agent squeezes through narrower gaps. Recomputed on load (the prebaked
   # Gibson navmesh is baked at 0.1). <=0 keeps the prebaked navmesh.
-  agent_radius: 0.05
+  agent_radius: 0.02
   agent_height: 1.5
 
 # Semantics Settings (MaskCLIP)
@@ -83,7 +83,7 @@ hashgrid:
   train_batch_size: 8192
   inference_batch_size: 16384
   replay_buffer_size: 10
-  buffer_refresh_interval: 1000
+  buffer_refresh_interval: 500
   train_every_n_steps: 1
   warmup_steps: 0
 
@@ -93,6 +93,20 @@ ensemble:
 grid:
   voxel_resolution: 0.10
   max_height: 2.0
+  # Height band (world-Y meters, absolute) collapsed into every 2D BEV map
+  # (similarity, occupancy, coverage, epistemic). min MUST sit ~0.2 m ABOVE the
+  # floor surface: occupancy marks the floor plane itself occupied, and at
+  # voxel_resolution the surface bleeds up ~one voxel row, so a min flush with
+  # the floor turns the whole walkable area into "obstacle". For a multi-floor
+  # scene, set the band to the target floor (floor+0.2 .. floor+1.5) so upper
+  # floors don't bleed in (raise max_height if the band exceeds it).
+  bev_height_min: 0.2     # y=0 floor: 0.2 m above the surface
+  bev_height_max: 1.5
+
+  # Bottom floor (same rule: min must be ~0.2 m above that floor's surface,
+  # or the floor plane bleeds in and the whole level reads as obstacle):
+  # bev_height_min: -2.8
+  # bev_height_max: -1.4
   # Soft coverage: each depth update adds min(1,(ref/d)^2) per confirmed
   # voxel; IG deficit = exp(-coverage/tau). Bigger tau = slower saturation.
   coverage_ref_dist_m: 2.0
