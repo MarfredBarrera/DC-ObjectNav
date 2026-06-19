@@ -131,6 +131,7 @@ detection:
   # negatives for SAM mask scoring (bare nouns; "a " is prepended for CLIP).
   det_negative_classes: ["wall", "door", "window", "floor", "ceiling",
                          "curtain", "cabinet", "shelf", "picture", "refrigerator"]
+  sink_pool: "top_pct"
 
 sam:
   sam_softmax_temp: 100.0       # CLIP logit scale before the mask softmax

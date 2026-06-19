@@ -164,7 +164,7 @@ class Config:
         # curve w = scale*(a^conf - 1)/(a - 1) saturates quickly (a < 1).
         self.mppi_conf_weight_a = 0.1
         self.mppi_conf_weight_scale = 100.0
-        self.mppi_conf_decay = 0.9
+        self.mppi_conf_decay = 0.98
         self.mppi_conf_threshold = 0.1
         # Control-noise stddev is anchored to half the actuator limits inside
         # optimize_trajectory; no scalar knob. Trajectory- and action-level
@@ -307,7 +307,13 @@ class Config:
         self.sink_special_str = "[()]"
         self.sink_softmax_temp = 100.0
         self.sink_min_target_prob = 0.4
-        self.sink_crop_pad = 0.0
+        self.sink_crop_pad = 1.0
+        # Crop pooling for the gate: "mean" pools the whole crop into one CLIP
+        # feature; "top_pct" scores each text on its best `sink_top_pct` fraction
+        # of patch cosines, rescuing small/partial-object boxes the mean-pool
+        # gate over-rejects (the object's patches no longer get averaged away).
+        self.sink_pool = "top_pct"
+        self.sink_top_pct = 0.05
         self.sink_seed = 0
         # Visualization-only: when rendering nav_history.mp4, overlay the
         # most recent saved SAM mask whose step is within this many ticks
@@ -522,7 +528,8 @@ class Config:
                         'detected_min_dist_m', 'detected_max_dist_m',
                         'sink_gate', 'sink_init', 'sink_num', 'sink_special_str',
                         'sink_softmax_temp', 'sink_min_target_prob',
-                        'sink_crop_pad', 'sink_seed'):
+                        'sink_crop_pad', 'sink_pool', 'sink_top_pct',
+                        'sink_seed'):
                 if key in det:
                     setattr(self, key, det[key])
 

@@ -645,7 +645,7 @@ def run(cfg: Config, save_enabled: bool = True,
         agent_height=cfg.agent_height,
     )
     # spawn_agent_at_random_navpoint(sim, agent)
-    spawn_agent_at_pos(sim, agent, [-1.0, 0.0, -7.0])
+    spawn_agent_at_pos(sim, agent, [0.0, 0.0, 4.0])
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)
@@ -667,7 +667,9 @@ def run(cfg: Config, save_enabled: bool = True,
             sink_special_str=cfg.sink_special_str,
             softmax_temp=cfg.sink_softmax_temp,
             min_target_prob=cfg.sink_min_target_prob,
-            crop_pad=cfg.sink_crop_pad, seed=cfg.sink_seed,
+            crop_pad=cfg.sink_crop_pad,
+            pool=cfg.sink_pool, top_pct=cfg.sink_top_pct,
+            seed=cfg.sink_seed,
         )
     # MobileSAM is only consulted when the detector fires (Layer-1 goal
     # update), so a load failure shouldn't kill the run — fall back to the

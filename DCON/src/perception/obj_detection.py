@@ -630,6 +630,8 @@ class SinkGatedDetector:
         min_target_prob: float = 0.5,
         crop_pad: float = 0.0,
         min_crop_px: int = 8,
+        pool: str = "mean",
+        top_pct: float = 0.05,
         seed: int = 0,
     ):
         self.base = base_detector
@@ -639,6 +641,12 @@ class SinkGatedDetector:
         self.min_target_prob = float(min_target_prob)
         self.crop_pad = float(crop_pad)
         self.min_crop_px = int(min_crop_px)
+        # Crop pooling for the gate: "mean" pools the whole crop into one CLIP
+        # feature (diluted by background on small/partial boxes); "top_pct" keeps
+        # only each text's best `top_pct` fraction of patch cosines, so a small
+        # object that fills part of the crop isn't averaged away.
+        self.pool = str(pool).lower()
+        self.top_pct = float(top_pct)
         self.sinks = build_sink_bank(
             mask_clip, init=sink_init, n_sinks=sink_num,
             special_str=sink_special_str, seed=seed)               # (S, 512)
@@ -691,11 +699,17 @@ class SinkGatedDetector:
         crop = arr[yi0:yi1, xi0:xi1]
         rgb = torch.from_numpy(crop).to(self.device).float() / 255.0   # (h, w, 3)
         feats = self.mask_clip.extract_dense_features(rgb)             # (h, w, 512)
-        crop_emb = feats.reshape(-1, feats.shape[-1]).mean(dim=0, keepdim=True)
-        crop_emb = crop_emb / (crop_emb.norm(dim=-1, keepdim=True) + 1e-8)  # (1, 512)
 
         bank = torch.cat([self._query_emb(query), self.sinks], dim=0)  # (1+S, 512)
-        sims = (crop_emb @ bank.T).squeeze(0)                          # (1+S,)
+        P = feats.reshape(-1, feats.shape[-1])                         # (N, 512), L2-normed
+        if self.pool == "top_pct":
+            per_patch = P @ bank.T                                     # (N, 1+S) per-patch cosine
+            k = max(1, int(round(self.top_pct * per_patch.shape[0])))
+            sims = per_patch.topk(k, dim=0).values.mean(dim=0)        # (1+S,) top-k% mean per text
+        else:
+            crop_emb = P.mean(dim=0, keepdim=True)
+            crop_emb = crop_emb / (crop_emb.norm(dim=-1, keepdim=True) + 1e-8)  # (1, 512)
+            sims = (crop_emb @ bank.T).squeeze(0)                      # (1+S,)
         prob, _ = target_prob_from_sims(sims, self.softmax_temp)
         self.last_target_prob = prob
         # Remember the scored box even on rejection so the viz can still draw
