@@ -1,1 +1,0 @@
-CUDA_VISIBLE_DEVICES=1 ns-train splatfacto --data /workspace/DCON/output/current_scene

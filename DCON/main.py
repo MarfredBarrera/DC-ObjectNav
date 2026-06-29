@@ -34,20 +34,14 @@ from src.config import Config
 from src.habitat.habitat_utils import (
     get_scene_bounds_from_pathfinder,
     init_simulator,
-    spawn_agent_at_random_navpoint,
     spawn_agent_at_pos,
     geodesic_distance,
 )
 from src.habitat.sim_interface import SimInterface
-from src.perception.obj_detection import (
-    make_detector, encode_query_with_negatives, target_prob_from_sims,
-    SinkGatedDetector,
-)
+from src.perception.obj_detection import make_detector
 from src.perception.perception_stack import PerceptionStack
-from src.perception.segmentation import MobileSAMSegmenter
 from src.perception.utils import unprojection
 from src.planning.mppi import MPPIPlanner
-from src.planning.utils import normalize_sim
 from visualize import render_navigation
 
 
@@ -76,117 +70,6 @@ def _to_numpy(maybe_tensor):
     if isinstance(maybe_tensor, torch.Tensor):
         return maybe_tensor.detach().cpu().numpy()
     return maybe_tensor
-
-
-def bev_cells_from_sim_pixels(perception, cfg, intrinsics, rgb, depth, c2w,
-                              target_query, det_box=None, expand_factor=2.0,
-                              top_frac=0.05, min_pixels=50):
-    """BEV cells from the top-K% most target-similar pixels around the detection.
-
-    The detector's box at distance is often *almost right* — frequently offset
-    by ~one box-length from the actual object — so trusting its exact pixels
-    smears wall/floor into the goal region. We instead build an expanded
-    search window (`expand_factor` × box dims, centered on the box) and pick
-    the top-K% of CLIP-similar pixels within it. That forgives offset error
-    while still anchoring to where the detector thinks the object is.
-
-    If `det_box` is None or `expand_factor <= 0`, the search runs over the
-    full frame (no spatial constraint).
-
-    `top_frac`: fraction of valid pixels to keep. 0.05 = top 5%.
-    `min_pixels`: floor on the count so very sparse views still produce a
-                  usable mask.
-    """
-    if depth is None or c2w is None or rgb is None or not target_query:
-        return None
-    rgb_gpu = rgb.to(perception.device)
-    depth_gpu = depth.to(perception.device)
-    H_d, W_d = depth_gpu.shape[-2:]
-
-    # Per-pixel similarity to the target text. feats and text_embed are both
-    # L2-normalized inside MaskCLIPSemantics, so the dot product is cosine.
-    feats = perception.mask_clip.extract_dense_features(rgb_gpu)  # (H, W, 512)
-    text_embed = perception.mask_clip.encode_text(target_query)   # (1, 512)
-    sim_2d = (feats @ text_embed.T).squeeze(-1)                   # (H, W) in [-1, 1]
-
-    # Spatial window: expanded box around the detection, clipped to image.
-    region_mask = torch.ones((H_d, W_d), dtype=torch.bool, device=perception.device)
-    if det_box is not None and expand_factor > 0:
-        xmin, ymin, xmax, ymax = det_box
-        cx, cy = 0.5 * (xmin + xmax), 0.5 * (ymin + ymax)
-        bw, bh = (xmax - xmin), (ymax - ymin)
-        ew, eh = bw * expand_factor, bh * expand_factor
-        ex0 = int(max(0, np.floor(cx - ew / 2.0)))
-        ex1 = int(min(W_d, np.ceil(cx + ew / 2.0)))
-        ey0 = int(max(0, np.floor(cy - eh / 2.0)))
-        ey1 = int(min(H_d, np.ceil(cy + eh / 2.0)))
-        if ex1 <= ex0 or ey1 <= ey0:
-            return None
-        region_mask = torch.zeros((H_d, W_d), dtype=torch.bool, device=perception.device)
-        region_mask[ey0:ey1, ex0:ex1] = True
-
-    depth_mask = (depth_gpu > cfg.min_sensor_dist) & (depth_gpu < cfg.max_sensor_dist)
-    valid = depth_mask & region_mask
-    if not bool(valid.any()):
-        return None
-    sim_in_valid = sim_2d[valid]
-    n_valid = int(sim_in_valid.numel())
-    if n_valid == 0:
-        return None
-    k = max(min_pixels, int(top_frac * n_valid))
-    k = min(k, n_valid)
-    thresh = torch.topk(sim_in_valid, k).values.min()
-    mask = (sim_2d >= thresh) & valid
-    if not bool(mask.any()):
-        return None
-
-    world_points = unprojection(
-        depth_gpu, intrinsics, c2w.to(perception.device), perception.device, mask=mask,
-    )
-    if world_points.shape[0] == 0:
-        return None
-
-    sg = perception.similarity_grid
-    z_idx = ((world_points[:, 2] - sg.min_z) / cfg.voxel_resolution).long().clamp(0, sg.num_z - 1)
-    x_idx = ((world_points[:, 0] - sg.min_x) / cfg.voxel_resolution).long().clamp(0, sg.num_x - 1)
-    cell_mask = torch.zeros((sg.num_z, sg.num_x), dtype=torch.bool, device=perception.device)
-    cell_mask[z_idx, x_idx] = True
-    return cell_mask.cpu().numpy()
-
-
-def bev_cells_from_det_box(perception, cfg, intrinsics, det_box, depth, c2w):
-    """BEV (z_idx, x_idx) cells that the pixels inside `det_box` project to.
-
-    Returns a boolean numpy array of shape (num_z, num_x), or None if the box
-    is missing / yields no valid depth pixels. Used to constrain goal
-    selection in EXPLOIT mode: instead of the global argmax of bev_sim, we
-    take the argmax only over cells that actually correspond to the detected
-    object in the current frame.
-    """
-    if det_box is None or depth is None or c2w is None:
-        return None
-    xmin, ymin, xmax, ymax = det_box
-    depth_gpu = depth.to(perception.device)
-    H_d, W_d = depth_gpu.shape[-2:]
-    yy, xx = torch.meshgrid(
-        torch.arange(H_d, device=perception.device),
-        torch.arange(W_d, device=perception.device),
-        indexing='ij',
-    )
-    box_mask = (xx >= int(xmin)) & (xx <= int(xmax)) & (yy >= int(ymin)) & (yy <= int(ymax))
-    depth_mask = (depth_gpu > cfg.min_sensor_dist) & (depth_gpu < cfg.max_sensor_dist)
-    mask = box_mask & depth_mask
-    if not bool(mask.any()):
-        return None
-    world_points = unprojection(depth_gpu, intrinsics, c2w.to(perception.device), perception.device, mask=mask)
-    if world_points.shape[0] == 0:
-        return None
-    sg = perception.similarity_grid
-    z_idx = ((world_points[:, 2] - sg.min_z) / cfg.voxel_resolution).long().clamp(0, sg.num_z - 1)
-    x_idx = ((world_points[:, 0] - sg.min_x) / cfg.voxel_resolution).long().clamp(0, sg.num_x - 1)
-    cell_mask = torch.zeros((sg.num_z, sg.num_x), dtype=torch.bool, device=perception.device)
-    cell_mask[z_idx, x_idx] = True
-    return cell_mask.cpu().numpy()
 
 
 def box_center_world_xz(perception, cfg, intrinsics, det_box, depth, c2w):
@@ -228,11 +111,10 @@ def box_center_world_xz(perception, cfg, intrinsics, det_box, depth, c2w):
 def bev_cell_from_box_center(perception, cfg, intrinsics, det_box, depth, c2w):
     """Single BEV (z_idx, x_idx) cell the *center* of `det_box` projects to.
 
-    Unlike `bev_cells_from_det_box` (which returns every cell the box covers),
-    this projects only the box-center patch to one world point and returns its
-    lone BEV cell. Used as the goal verbatim — no SAM re-localization, no
-    similarity argmax, no snap-to-free. Best paired with a detector that emits
-    tight, accurate boxes (e.g. LocateAnything). Returns (z_idx, x_idx) or None.
+    Projects only the box-center patch to one world point and returns its lone
+    BEV cell, used as the goal verbatim — no similarity argmax, no snap-to-free.
+    Best paired with a detector that emits tight, accurate boxes (e.g. LLMDet /
+    LocateAnything). Returns (z_idx, x_idx) or None.
     """
     wxz = box_center_world_xz(perception, cfg, intrinsics, det_box, depth, c2w)
     if wxz is None:
@@ -285,183 +167,19 @@ def classify_detection(perception, cfg, intrinsics, det_box, depth, c2w,
     return (True, True)         # usable band
 
 
-def bev_cells_from_sam(perception, cfg, intrinsics, rgb, depth, c2w,
-                       target_query, segmenter,
-                       min_mask_pixels: int = 200,
-                       min_clip_sim: float = 0.18):
-    """Whole-image SAM → CLIP-scored best mask → BEV cells.
-
-    Run MobileSAM's automatic mask generator over the full RGB frame, score
-    every proposal by softmax over its mean CLIP cosine to ``target_query``
-    plus the distractor vocabulary (``cfg.det_negative_classes``), pick the
-    mask with the highest target probability, and project its pixels (gated
-    by valid depth) into BEV. The relative "more pillow than wall" score is
-    used because raw CLIP cosines cluster in a narrow ~0.2–0.3 band where
-    distractor masks score nearly as high as the target. The detector box is
-    only used as a *trigger* upstream — it does NOT constrain SAM.
-    Rationale: at distance the box is often a full box-width off, so
-    box-prompted SAM inherits that error; auto-gen lets SAM find object
-    boundaries from scratch and CLIP picks the right one.
-
-    Returns a (num_z, num_x) bool numpy array, or None if the best mask's
-    target probability missed ``cfg.sam_min_target_prob``, its raw cosine
-    missed ``min_clip_sim``, or no valid depth pixels remained.
-    """
-    if rgb is None or depth is None or c2w is None or not target_query or segmenter is None:
-        return None
-    # Reset the segmenter's side-channel state — the main loop reads these
-    # after the call to persist the chosen mask for offline visualization.
-    segmenter.last_mask = None
-    segmenter.last_box = None
-    segmenter.last_score = 0.0
-    segmenter.last_prob = 0.0
-
-    rgb_gpu = rgb.to(perception.device)
-    depth_gpu = depth.to(perception.device)
-    H_d, W_d = depth_gpu.shape[-2:]
-
-    masks = segmenter.segment_all(rgb)
-    if not masks:
-        return None
-
-    feats = perception.mask_clip.extract_dense_features(rgb_gpu)      # (H, W, 512)
-    text_bank = encode_query_with_negatives(
-        perception.mask_clip, target_query,
-        getattr(cfg, 'det_negative_classes', None))                   # (K, 512)
-    sim_maps = (feats @ text_bank.T).permute(2, 0, 1)                 # (K, H, W) in [-1, 1]
-    if sim_maps.shape[1:] != (H_d, W_d):
-        sim_maps = torch.nn.functional.interpolate(
-            sim_maps[None].float(), size=(H_d, W_d),
-            mode='bilinear', align_corners=False,
-        )[0]
-
-    depth_mask = (depth_gpu > cfg.min_sensor_dist) & (depth_gpu < cfg.max_sensor_dist)
-
-    softmax_temp = float(getattr(cfg, 'sam_softmax_temp', 100.0))
-    min_target_prob = float(getattr(cfg, 'sam_min_target_prob', 0.5))
-
-    best_prob = -float('inf')
-    best_raw = -float('inf')
-    best_seg = None
-    for m in masks:
-        seg = m['segmentation']  # numpy bool (H_rgb, W_rgb)
-        if seg.sum() < min_mask_pixels:
-            continue
-        seg_t = torch.from_numpy(seg).to(perception.device)
-        if seg_t.shape != (H_d, W_d):
-            seg_t = torch.nn.functional.interpolate(
-                seg_t[None, None].float(), size=(H_d, W_d),
-                mode='nearest',
-            )[0, 0].bool()
-        valid = seg_t & depth_mask
-        if not bool(valid.any()):
-            continue
-        sims = sim_maps[:, valid].mean(dim=1)                         # (K,)
-        prob, raw = target_prob_from_sims(sims, softmax_temp)
-        if prob > best_prob:
-            best_prob = prob
-            best_raw = raw
-            best_seg = seg_t
-
-    if best_seg is None or best_prob < min_target_prob or best_raw < min_clip_sim:
-        return None
-    best_score = best_raw  # raw target cosine — keeps sam_score's scale stable
-
-    final_mask = best_seg & depth_mask
-    if not bool(final_mask.any()):
-        return None
-
-    # Stash the chosen 2D mask + its bbox + score on the segmenter as a
-    # side channel for the main loop / visualizer. We use the raw best_seg
-    # (not depth-gated) for the visualization overlay since it shows the
-    # full SAM contour the user expects to see.
-    seg_np = best_seg.detach().cpu().numpy().astype(bool)
-    ys, xs = np.where(seg_np)
-    if xs.size > 0 and ys.size > 0:
-        segmenter.last_mask = seg_np
-        segmenter.last_box = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
-        segmenter.last_score = float(best_score)
-        segmenter.last_prob = float(best_prob)
-
-    world_points = unprojection(
-        depth_gpu, intrinsics, c2w.to(perception.device), perception.device, mask=final_mask,
-    )
-    if world_points.shape[0] == 0:
-        return None
-
-    sg = perception.similarity_grid
-    z_idx = ((world_points[:, 2] - sg.min_z) / cfg.voxel_resolution).long().clamp(0, sg.num_z - 1)
-    x_idx = ((world_points[:, 0] - sg.min_x) / cfg.voxel_resolution).long().clamp(0, sg.num_x - 1)
-    cell_mask = torch.zeros((sg.num_z, sg.num_x), dtype=torch.bool, device=perception.device)
-    cell_mask[z_idx, x_idx] = True
-    return cell_mask.cpu().numpy()
-
-
-def closest_cell_in_mask(cell_mask, start_grid):
-    """Nearest True cell in a (num_z, num_x) bool grid to `start_grid` (z, x).
-
-    Returns (z_idx, x_idx) of the mask cell closest to the agent — i.e. the
-    near face of the projected object footprint — or None if the mask is empty.
-    """
-    zs, xs = np.where(cell_mask)
-    if zs.size == 0:
-        return None
-    sz, sx = start_grid
-    d2 = (zs - sz) ** 2 + (xs - sx) ** 2
-    i = int(np.argmin(d2))
-    return (int(zs[i]), int(xs[i]))
-
-
-def snap_to_free(cell, bev_occ, free_val=1):
-    """Return `cell` if it is observed-free, else the nearest observed-free cell.
-
-    The near face of the object footprint is usually marked occupied (the
-    object is a solid surface in the occupancy grid), so we snap the goal to
-    the closest navigable cell — typically the free space directly in front of
-    the object on the agent's side. Falls back to `cell` if no free cell exists.
-    """
-    z, x = int(cell[0]), int(cell[1])
-    H, W = bev_occ.shape
-    if 0 <= z < H and 0 <= x < W and bev_occ[z, x] == free_val:
-        return (z, x)
-    fz, fx = np.where(bev_occ == free_val)
-    if fz.size == 0:
-        return (z, x)
-    d2 = (fz - z) ** 2 + (fx - x) ** 2
-    i = int(np.argmin(d2))
-    return (int(fz[i]), int(fx[i]))
-
-
-def project_box_goal(perception, sim_iface, cfg, det_box, rgb, depth, c2w,
-                     segmenter=None, start_grid=None, bev_occ=None):
-    """Project a detection box to a BEV goal cell — the Layer-1 goal logic
-    used by `plan_one_action`.
-
-    `box_center` needs only depth + camera pose, so it works before any BEV map
-    is meaningful (e.g. on the untrained field at startup). The `sam` path needs
-    `bev_occ` + `start_grid` to snap the chosen mask cell to free space; it is
-    skipped when those aren't available. Returns a (z, x) cell, or None.
+def project_box_goal(perception, sim_iface, cfg, det_box, depth, c2w):
+    """Project a detection box to a BEV goal cell (the box-center world point) —
+    the Layer-1 goal logic used by `plan_one_action`. Needs only depth + camera
+    pose, so it works before any BEV map is meaningful (e.g. on the untrained
+    field at startup). Returns a (z, x) cell, or None.
     """
     if det_box is None:
         return None
-    if cfg.goal_projection == "box_center":
-        return bev_cell_from_box_center(
-            perception, cfg, sim_iface.intrinsics, det_box, depth, c2w)
-    if segmenter is not None and bev_occ is not None and start_grid is not None:
-        det_cells = bev_cells_from_sam(
-            perception, cfg, sim_iface.intrinsics,
-            rgb, depth, c2w, perception.target_query, segmenter,
-            min_mask_pixels=int(getattr(cfg, 'sam_min_mask_pixels', 200)),
-            min_clip_sim=float(getattr(cfg, 'sam_min_clip_sim', 0.18)),
-        )
-        if det_cells is not None and det_cells.any():
-            cand = closest_cell_in_mask(det_cells, start_grid)
-            if cand is not None:
-                return snap_to_free(cand, bev_occ)
-    return None
+    return bev_cell_from_box_center(
+        perception, cfg, sim_iface.intrinsics, det_box, depth, c2w)
 
 
-def detect_classify_latch(detector, perception, sim_iface, cfg, segmenter,
+def detect_classify_latch(detector, perception, sim_iface, cfg,
                           rgb, depth, c2w, pos, detected, detected_streak,
                           run_detector=True, tag=""):
     """Run the detector, classify the detection, and advance the latch state.
@@ -480,13 +198,6 @@ def detect_classify_latch(detector, perception, sim_iface, cfg, segmenter,
         det_score, det_box = detector.detect(rgb, perception.target_query)
     else:
         det_score, det_box = 0.0, None
-
-    # Reset the SAM side-channel so a mask is only persisted on the frame SAM
-    # actually ran (bev_cells_from_sam refills it on a qualifying detection).
-    if segmenter is not None:
-        segmenter.last_mask = None
-        segmenter.last_box = None
-        segmenter.last_score = 0.0
 
     det_persistent, det_investigate = classify_detection(
         perception, cfg, sim_iface.intrinsics, det_box, depth, c2w, pos)
@@ -511,7 +222,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
                     det_score: float = 0.0,
                     detected: bool = False, det_box=None, rgb=None, depth=None, c2w=None,
                     last_box_goal=None,
-                    segmenter=None, det_investigate: bool = False):
+                    det_investigate: bool = False):
     """Run MPPI from current pose and return (action, ref_traj, opt_traj).
 
     action is [v_mps, w_rad_per_s] or None if idling.
@@ -572,16 +283,13 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     # Every such detection re-projects, so in SEARCH mode the caller's cache
     # tracks the most recent bounding box. Until a detection is worth
     # investigating the agent explores via the global similarity argmax
-    # (Layer 3). SAM runs on the *whole image* (not box-prompted) because the
-    # box is often offset by ~one box-width at distance; CLIP picks the mask.
+    # (Layer 3).
     if det_box is not None and det_investigate:
-        # box_center: project the box center straight to one BEV cell, used
-        # verbatim (MPPI carves a free disk around the goal and forgives arrival
-        # collisions, so a cell on the target surface is fine). sam: pick the
-        # near-face mask cell and snap to free space. See project_box_goal.
+        # Project the box center straight to one BEV cell, used verbatim (MPPI
+        # carves a free disk around the goal and forgives arrival collisions, so
+        # a cell on the target surface is fine). See project_box_goal.
         cand = project_box_goal(
-            perception, sim_iface, cfg, det_box, rgb, depth, c2w,
-            segmenter=segmenter, start_grid=start_grid, bev_occ=bev_occ)
+            perception, sim_iface, cfg, det_box, depth, c2w)
         if cand is not None:
             goal = cand
             box_goal = goal
@@ -656,7 +364,6 @@ def run(cfg: Config, save_enabled: bool = True,
         agent_radius=cfg.agent_radius,
         agent_height=cfg.agent_height,
     )
-    # spawn_agent_at_random_navpoint(sim, agent)
     start_nav = spawn_agent_at_pos(sim, agent, start_pos)  # snapped navmesh start
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
@@ -681,38 +388,6 @@ def run(cfg: Config, save_enabled: bool = True,
         negative_classes=getattr(cfg, 'det_negative_classes', None),
         **det_kwargs,
     )
-    # Neutral attention-sink false-positive gate (Ruis et al., ICLR 2026):
-    # wrap the base detector so each fired box is verified against the target
-    # query vs. a semantically-neutral sink in CLIP space and dropped if the
-    # sink wins. Reuses the perception stack's MaskCLIP (no second CLIP load).
-    if cfg.sink_gate:
-        detector = SinkGatedDetector(
-            detector, perception.mask_clip, device=cfg.device,
-            sink_init=cfg.sink_init, sink_num=cfg.sink_num,
-            sink_special_str=cfg.sink_special_str,
-            softmax_temp=cfg.sink_softmax_temp,
-            min_target_prob=cfg.sink_min_target_prob,
-            crop_pad=cfg.sink_crop_pad,
-            pool=cfg.sink_pool, top_pct=cfg.sink_top_pct,
-            seed=cfg.sink_seed,
-        )
-    # MobileSAM is only consulted when the detector fires (Layer-1 goal
-    # update), so a load failure shouldn't kill the run — fall back to the
-    # box-based path with a warning. The path is None-guarded downstream.
-    segmenter = None
-    if bool(getattr(cfg, 'use_mobile_sam', True)):
-        try:
-            segmenter = MobileSAMSegmenter(
-                checkpoint=getattr(cfg, 'sam_checkpoint', 'SAM_models/mobile_sam.pt'),
-                device=cfg.device,
-                points_per_side=int(getattr(cfg, 'sam_points_per_side', 16)),
-                pred_iou_thresh=float(getattr(cfg, 'sam_pred_iou_thresh', 0.86)),
-                stability_score_thresh=float(getattr(cfg, 'sam_stability_score_thresh', 0.90)),
-                min_mask_region_area=int(getattr(cfg, 'sam_min_mask_region_area', 200)),
-            )
-            print(f"[init] MobileSAM loaded from {getattr(cfg, 'sam_checkpoint', 'SAM_models/mobile_sam.pt')}")
-        except Exception as e:
-            print(f"[init] MobileSAM unavailable ({e}); EXPLOIT goals will skip SAM refinement")
     action_queue: deque = deque()
 
     # Planner state. `detected` latches True (and never releases) once
@@ -732,7 +407,7 @@ def run(cfg: Config, save_enabled: bool = True,
     # then interleaved into the new navigation history. Wipe them so only the
     # current run's maps exist.
     if save_enabled:
-        for sub in ("umaps", "occ_maps", "sim_maps", "sam_masks", "rgbs"):
+        for sub in ("umaps", "occ_maps", "sim_maps", "rgbs"):
             shutil.rmtree(os.path.join(cfg.output_dir, sub), ignore_errors=True)
 
     # 2. Startup: a single observation seeds the replay buffer + occupancy, then
@@ -853,7 +528,7 @@ def run(cfg: Config, save_enabled: bool = True,
             # the usable band.
             (det_score, det_box, det_persistent, det_investigate, conf_score,
              detected, detected_streak) = detect_classify_latch(
-                detector, perception, sim_iface, cfg, segmenter,
+                detector, perception, sim_iface, cfg,
                 rgb_cur, depth_cur, c2w_cur, pos, detected, detected_streak,
                 run_detector=run_detector, tag=f"step {step}")
 
@@ -877,7 +552,7 @@ def run(cfg: Config, save_enabled: bool = True,
                 det_score=conf_score, detected=detected,
                 det_box=det_box, rgb=rgb_cur, depth=depth_cur, c2w=c2w_cur,
                 last_box_goal=last_box_goal,
-                segmenter=segmenter, det_investigate=det_investigate,
+                det_investigate=det_investigate,
             )
             # Cache the goal of the most recent investigated detection.
             # `box_goal` is non-None only for an investigated box (Layer 1 gates
@@ -889,35 +564,9 @@ def run(cfg: Config, save_enabled: bool = True,
             if box_goal is not None:
                 last_box_goal = box_goal
                 print(f"  cached new goal {box_goal} (det_score={det_score:.3f})")
-            # If SAM produced a fresh mask this replan, persist it for the
-            # offline visualizer. The mask file is named by step so
-            # visualize.py can look up the most recent SAM result at or
-            # before each viz frame and overlay it on the saved RGB.
-            sam_box_log = None
-            sam_score_log = None
-            if save_enabled and segmenter is not None and getattr(segmenter, 'last_mask', None) is not None:
-                sam_dir = os.path.join(cfg.output_dir, "sam_masks")
-                os.makedirs(sam_dir, exist_ok=True)
-                # packbits cuts the on-disk size ~8x; unpacked at load time.
-                packed = np.packbits(segmenter.last_mask.astype(np.uint8))
-                np.savez_compressed(
-                    os.path.join(sam_dir, f"sam_mask_{step:06d}.npz"),
-                    packed=packed, shape=np.array(segmenter.last_mask.shape, dtype=np.int32),
-                )
-                sam_box_log = [float(v) for v in segmenter.last_box]
-                sam_score_log = float(segmenter.last_score)
             det_backend = detector.backend_for(perception.target_query)
             mode = 'EXPLOIT' if detected else 'SEARCH'
             w_conf = float(getattr(mppi, 'last_w_conf', 0.0))
-            # Sink-gate target probability + the box it scored, for this frame's
-            # detection (both None when the gate is off, the detector didn't
-            # fire, or the crop was tiny). Gate on `run_detector` so a throttled
-            # EXPLOIT replan doesn't log the stale side-channel from an earlier
-            # detect call. `sink_box` is logged even on rejection so the viz can
-            # draw the false positive.
-            sink_p = detector.last_target_prob if (cfg.sink_gate and run_detector) else None
-            sink_b = detector.last_box if (cfg.sink_gate and run_detector) else None
-            sink_str = f" | sink: {sink_p:.2f}" if sink_p is not None else ""
             if goal_cell is not None:
                 sg = perception.similarity_grid
                 goal_x_m = sg.min_x + goal_cell[1] * cfg.voxel_resolution
@@ -933,12 +582,12 @@ def run(cfg: Config, save_enabled: bool = True,
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | "
                       f"action [v={action[0]:+.3f} m/s, w={action[1]:+.3f} rad/s] | "
                       f"position: {pos[0]:.2f}, {pos[2]:.2f} | "
-                      f"det[{det_backend}]: {det_score:.3f}{sink_str} | "
+                      f"det[{det_backend}]: {det_score:.3f} | "
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
                       f"mode: {mode}")
             else:
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | no action | "
-                      f"det[{det_backend}]: {det_score:.3f}{sink_str} | "
+                      f"det[{det_backend}]: {det_score:.3f} | "
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
                       f"mode: {mode}")
 
@@ -971,13 +620,9 @@ def run(cfg: Config, save_enabled: bool = True,
                     'mppi_cost': cost,
                     'det_conf': float(det_score),
                     'det_box': [float(v) for v in det_box] if det_box is not None else None,
-                    'sam_box': sam_box_log,
-                    'sam_score': sam_score_log,
                     'goal': [int(goal_cell[0]), int(goal_cell[1])] if goal_cell is not None else None,
                     'mode': mode,
                     'w_conf': w_conf,
-                    'sink_prob': float(sink_p) if sink_p is not None else None,
-                    'sink_box': [float(v) for v in sink_b] if sink_b is not None else None,
                 }) + '\n')
 
             if stop_now:
@@ -1094,12 +739,12 @@ if __name__ == "__main__":
     parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic", "coverage"], default="epistemic",
                         help="Information gain source for MPPI (unseen or epistemic)")
     parser.add_argument("--detector", type=str,
-                        choices=["yolo", "coco_yolo", "hybrid", "grounding_dino",
+                        choices=["yolo", "coco_yolo", "hybrid",
                                  "locate_anything", "llmdet"],
                         default="hybrid",
                         help="Detector backend: yolo (YOLO-Worldv2), coco_yolo "
                              "(closed-set YOLOv8), hybrid (COCO→YOLOv8 else "
-                             "YOLO-Worldv2), grounding_dino, locate_anything, or "
+                             "YOLO-Worldv2), locate_anything, or "
                              "llmdet (LLMDet + attention sinks)")
     parser.add_argument("--no-visualize", action="store_true", default=False,
                         help="Skip rendering nav_history video after the run")

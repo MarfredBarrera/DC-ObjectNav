@@ -11,8 +11,6 @@ habitat:
   img_height: 512
   fov: 90
   sensor_height: 1.0
-  data_queue_size: 30
-  training_queue_size: 20
   # Navmesh agent radius (m): walls are inset by this much, so smaller =
   # agent squeezes through narrower gaps. Recomputed on load (the prebaked
   # Gibson navmesh is baked at 0.1). <=0 keeps the prebaked navmesh.
@@ -79,17 +77,10 @@ hashgrid:
   
   # Training
   lr: 0.001
-  per_image_batch_size: 518400
   train_batch_size: 8192
   inference_batch_size: 16384
-  replay_buffer_size: 10
   buffer_refresh_interval: 500
-  train_every_n_steps: 1
-  warmup_steps: 0
 
-ensemble:
-  num_models: 3
- 
 grid:
   voxel_resolution: 0.10
   max_height: 2.0
@@ -127,12 +118,8 @@ detection:
   detected_conf_threshold: 0.30  # det_score required to latch DETECTED
   detected_persistence: 2       # consecutive replans above threshold to latch
   stop_distance_m: 0.75          # terminate within this distance of sim peak
-  # Distractor vocabulary: competing YOLO-World classes + CLIP softmax
-  # negatives for SAM mask scoring (bare nouns; "a " is prepended for CLIP).
+  # Distractor vocabulary: competing classes registered alongside the query on
+  # the YOLO-World branch (bare nouns), so salient non-target regions get
+  # claimed by their own class instead of the query.
   det_negative_classes: ["wall", "door", "window", "floor", "ceiling",
                          "curtain", "cabinet", "shelf", "picture", "refrigerator"]
-  sink_pool: "top_pct_pertext"
-
-sam:
-  sam_softmax_temp: 100.0       # CLIP logit scale before the mask softmax
-  sam_min_target_prob: 0.5      # min softmax prob of the target for the best mask

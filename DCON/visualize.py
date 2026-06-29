@@ -57,72 +57,6 @@ def annotate_detection(rgb_uint8: np.ndarray, box, color=(255, 64, 64),
     return np.asarray(img)
 
 
-def annotate_sam(rgb_uint8: np.ndarray, mask: Optional[np.ndarray],
-                 box, score: Optional[float] = None) -> np.ndarray:
-    """Tint the SAM mask region green and draw its bbox on a uint8 RGB image.
-
-    The mask shape is the segmenter's native resolution (typically the
-    saved RGB size); we resize via PIL nearest if it doesn't match.
-    Box is xyxy in the mask's pixel coordinates. Both can be None.
-    """
-    if mask is None and box is None:
-        return rgb_uint8
-    img = Image.fromarray(rgb_uint8).convert("RGB")
-    H, W = rgb_uint8.shape[:2]
-
-    if mask is not None:
-        if mask.shape != (H, W):
-            mask_img = Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
-            mask_img = mask_img.resize((W, H), Image.NEAREST)
-            mask = np.asarray(mask_img) > 0
-        # 40% green tint over the mask region.
-        arr = np.asarray(img).astype(np.float32)
-        green = np.array([64, 220, 64], dtype=np.float32)
-        arr[mask] = 0.6 * arr[mask] + 0.4 * green
-        img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-
-    box = _norm_box(box)
-    if box is not None:
-        draw = ImageDraw.Draw(img)
-        xmin, ymin, xmax, ymax = box
-        draw.rectangle([xmin, ymin, xmax, ymax], outline=(64, 220, 64), width=3)
-        if score is not None:
-            label_y = max(0, int(ymin) - 14)
-            draw.text((int(xmin) + 2, label_y), f"sam {score:.2f}", fill=(64, 220, 64))
-    return np.asarray(img)
-
-
-def load_sam_mask(sam_dir: str, step: int) -> Optional[np.ndarray]:
-    """Load the packed SAM mask for `step` (or None if missing)."""
-    path = os.path.join(sam_dir, f"sam_mask_{step:06d}.npz")
-    if not os.path.exists(path):
-        return None
-    with np.load(path) as data:
-        packed = data["packed"]
-        shape = tuple(int(v) for v in data["shape"])
-    flat = np.unpackbits(packed)[: int(np.prod(shape))]
-    return flat.reshape(shape).astype(bool)
-
-
-def find_recent_sam_step(traj_log, current_step: int, lookback: int) -> Optional[int]:
-    """Most recent traj_log step <= current_step whose entry has a sam_box.
-
-    `lookback` caps how far back we accept a SAM result — older masks
-    were computed from a different viewpoint and would mis-align with
-    the current RGB. Returns None if no entry within the window.
-    """
-    best = None
-    for e in traj_log:
-        s = int(e["step"])
-        if s > current_step:
-            break
-        if e.get("sam_box") is None:
-            continue
-        if current_step - s > lookback:
-            continue
-        best = s
-    return best
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -271,41 +205,12 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         current_pos     = tuple(current_entry['pos'])     if current_entry else None
         current_heading = float(current_entry['heading']) if current_entry else 0.0
 
-        # Recorded detection from the most-recent plan step. When the sink gate
-        # ran (a sink_prob exists), draw the box it scored — green if the target
-        # beat the neutral sink (kept) or red if a sink won (false positive) —
-        # so rejected detections stay visible. Otherwise draw the accepted box.
+        # Recorded detection from the most-recent plan step — draw the accepted
+        # detector box on the RGB panel.
         det_conf = float(current_entry.get('det_conf', 0.0) or 0.0) if current_entry else 0.0
         det_box = current_entry.get('det_box') if current_entry else None
-        sink_prob = current_entry.get('sink_prob') if current_entry else None
-        if sink_prob is not None:
-            sink_prob = float(sink_prob)
-        sink_box = current_entry.get('sink_box') if current_entry else None
-        sink_thresh = float(getattr(cfg, 'sink_min_target_prob', 0.5))
         if rgb is not None:
-            if sink_prob is not None and sink_box is not None:
-                kept = sink_prob >= sink_thresh
-                color = (26, 138, 26) if kept else (200, 40, 40)
-                rgb = annotate_detection(rgb, sink_box, color=color,
-                                         label=f"{sink_prob:.2f}")
-            else:
-                rgb = annotate_detection(rgb, det_box)
-
-        # SAM overlay: most recent saved mask at or before this frame,
-        # capped at `sam_lookback_steps` so we don't paint a stale mask
-        # from a totally different viewpoint onto the current RGB.
-        if rgb is not None:
-            sam_dir = os.path.join(output_dir, "sam_masks")
-            sam_step = find_recent_sam_step(
-                traj_log, map_step,
-                lookback=int(getattr(cfg, 'sam_lookback_steps', cfg.viz_interval)),
-            )
-            if sam_step is not None:
-                sam_mask = load_sam_mask(sam_dir, sam_step)
-                sam_entry = next((e for e in traj_log if int(e['step']) == sam_step), None)
-                sam_box = sam_entry.get('sam_box') if sam_entry else None
-                sam_score = sam_entry.get('sam_score') if sam_entry else None
-                rgb = annotate_sam(rgb, sam_mask, sam_box, sam_score)
+            rgb = annotate_detection(rgb, det_box)
 
         # Goal cell (z, x) chosen by the planner this step. Convert to world.
         goal_cell = current_entry.get('goal') if current_entry else None
@@ -333,8 +238,6 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
             det_conf=det_conf,
             goal_world=goal_world, goal_cell=goal_cell,
             mode=mode, w_conf=w_conf,
-            sink_prob=sink_prob,
-            sink_thresh=float(getattr(cfg, 'sink_min_target_prob', 0.5)),
         )
         frames.append(viz.fig_to_numpy(fig))
         plt.close(fig)

@@ -24,8 +24,6 @@ class Config:
         self.img_width = 720
         self.img_height = 720
         self.fov = 90
-        self.data_queue_size = 30
-        self.training_queue_size = 10
         self.sensor_height = 1.0
         self.min_sensor_dist = 0.00
         self.max_sensor_dist = 10.0
@@ -92,20 +90,13 @@ class Config:
         
         # HashGrid Training
         self.hash_lr = 1e-3
-        self.hash_per_image_batch_size = 4096
         self.hash_train_batch_size = 8192
         self.hash_inference_batch_size = 16384
-        self.hash_replay_buffer_size = 10  # legacy: still used by offline.py's own buffer
         self.hash_buffer_refresh_interval = 200
         self.hash_per_frame_cache_size = 8192*4
         # Flat history buffer: bounded ring of (pt, feat) rows. Memory cost is
         # capacity * (3 + hash_feature_dim) * 4 bytes (~412MB at 200k & 512-dim).
         self.history_buffer_capacity = 500_000
-        self.hash_train_every_n_steps = 1
-        self.hash_warmup_steps = 0
-
-        # Ensemble
-        self.ensemble_num_models = 3
 
         # Grid
         self.voxel_resolution = 0.05
@@ -243,87 +234,13 @@ class Config:
         # the box gets more accurate. SEARCH mode always detects every replan.
         self.exploit_redetect_interval = 0
 
-        # How a fresh detection box is turned into the MPPI goal cell:
-        #   "box_center" — project the *center pixel* of the detector's box
-        #     straight to one BEV cell and use it as the goal verbatim (no SAM,
-        #     no similarity argmax, no free-cell snapping). Suited to detectors
-        #     that already emit tight, accurate boxes (e.g. LocateAnything).
-        #   "sam" — re-localize with MobileSAM whole-image auto-gen + MaskCLIP
-        #     best-mask scoring, then take the mask cell closest to the agent
-        #     (the legacy path; see the MobileSAM block below).
-        self.goal_projection = "box_center"
-
-        # MobileSAM goal refinement. When the detector fires AND the new
-        # det_score beats the cached one, we re-localize the target by:
-        #   1) running MobileSAM auto-mask-gen on the whole image,
-        #   2) picking the mask with highest mean CLIP-similarity to the
-        #      target query,
-        #   3) projecting that mask's pixels to BEV cells.
-        # Set use_mobile_sam=False to fall back to the old box-based path.
-        # min_clip_sim is a floor on the best mask's CLIP score; below this
-        # we discard the segmentation as not actually the target.
-        self.use_mobile_sam = True
-        self.sam_checkpoint = "SAM_models/mobile_sam.pt"
-        self.sam_points_per_side = 16
-        self.sam_pred_iou_thresh = 0.86
-        self.sam_stability_score_thresh = 0.90
-        self.sam_min_mask_region_area = 200
-        self.sam_min_mask_pixels = 200
-        self.sam_min_clip_sim = 0.18
-        # Softmax-over-distractors acceptance for the chosen mask (see
-        # det_negative_classes). `sam_softmax_temp` is the CLIP-style logit
-        # scale applied to the cosine vector before softmax; the best mask
-        # is accepted only if its target probability clears
-        # `sam_min_target_prob` AND its raw target cosine clears
-        # `sam_min_clip_sim` (absolute floor — a mask can win the softmax
-        # while matching nothing at all).
-        self.sam_softmax_temp = 100.0
-        self.sam_min_target_prob = 0.5
-
-        # Neutral attention-sink false-positive gate (Ruis et al., "Fantastic
-        # Tractor-Dogs...", ICLR 2026), realized as a post-hoc CLIP check on the
-        # detector's box (see SinkGatedDetector). When enabled, every box the
-        # base detector emits is cropped, mean-CLIP-encoded, and compared
-        # against the target query and a semantically-NEUTRAL sink via a sharp
-        # softmax; if the sink out-scores the query (target prob <
-        # sink_min_target_prob) the box is dropped as "none of the above". This
-        # is the faithful adaptation of the paper's mechanism to a generative
-        # grounding detector (LocateAnything), which has no class-prompt softmax
-        # to redirect internally. The sink is NOT a semantic negative — the
-        # paper shows real negatives ("wall", "door") don't suppress false
-        # positives; det_negative_classes is unused by this gate.
-        #   sink_init: "mean" (mean CLIP encoding over a generic category-spread
-        #     vocab — output-space analog of the paper's mean-of-vocabulary
-        #     init; best default for CLIP), "special" (encode sink_special_str,
-        #     the paper's best for LLM-trained detectors), or "random".
-        #   sink_min_target_prob: target must win at least this softmax mass
-        #     over [query, sinks] to survive (0.5 with one sink ≈ "query beats
-        #     sink"); raise to gate harder.
-        # Cost: one CLIP forward per *fired* detection — negligible against
-        # LocateAnything (~1 s/call), ~3x overhead on a ~15 ms YOLO-World.
-        self.sink_gate = True
-        self.sink_init = "mean"
-        self.sink_num = 1
+        # Neutral special-character string the LLMDet attention sinks encode for
+        # the "special" init (see llmdet_sink_init below). Reused by the llmdet
+        # detector wiring; not a standalone feature.
         self.sink_special_str = "[()]"
-        self.sink_softmax_temp = 100.0
-        self.sink_min_target_prob = 0.4
-        self.sink_crop_pad = 1.0
-        # Crop pooling for the gate: "mean" pools the whole crop into one CLIP
-        # feature; "top_pct" ranks crop patches by query similarity and pools the
-        # top `sink_top_pct` fraction of those embeddings into one feature scored
-        # against the whole bank, rescuing small/partial-object boxes the mean-pool
-        # gate over-rejects (the object's patches no longer get averaged away) — but
-        # only the query selects patches, so it over-fires on background/walls.
-        # "top_pct_pertext" is the symmetric middle ground: query AND each sink
-        # average their own best `sink_top_pct` patches, so the neutral sink can
-        # reject walls while small objects still survive.
-        self.sink_pool = "top_pct"
-        self.sink_top_pct = 0.05
-        self.sink_seed = 0
         # LLMDet detector (detector="llmdet") with the paper's training-free
-        # attention sinks built into its own vision-language fusion layers — the
-        # faithful Ruis et al. (ICLR 2026) method, unlike the post-hoc cropped-
-        # CLIP sink_gate above. MUST use the `iSEE-Laboratory/llmdet_*` weights
+        # attention sinks built into its own vision-language fusion layers (the
+        # faithful Ruis et al., ICLR 2026 method). MUST use the `iSEE-Laboratory/llmdet_*` weights
         # (model_type "mm-grounding-dino", loads natively as MMGroundingDino); the
         # `fushh7/*_hf` weights declare plain "grounding-dino" and load with a
         # broken (non-discriminative) contrastive head — do NOT use them.
@@ -347,11 +264,6 @@ class Config:
         self.llmdet_use_sinks = True
         self.llmdet_num_sinks = 48
         self.llmdet_sink_init = "special"
-        # Visualization-only: when rendering nav_history.mp4, overlay the
-        # most recent saved SAM mask whose step is within this many ticks
-        # of the current viz frame. Larger = more frames get an overlay
-        # but the mask may be stale (from an older viewpoint).
-        self.sam_lookback_steps = 200
 
         # Load from YAML if path provided
         if yaml_path is not None:
@@ -380,8 +292,6 @@ class Config:
                 self.img_height = habitat['img_height']
             if 'fov' in habitat:
                 self.fov = habitat['fov']
-            if 'data_queue_size' in habitat:
-                self.data_queue_size = habitat['data_queue_size']
             if 'sensor_height' in habitat:
                 self.sensor_height = habitat['sensor_height']
             if 'min_sensor_dist' in habitat:
@@ -392,9 +302,7 @@ class Config:
                 self.agent_radius = habitat['agent_radius']
             if 'agent_height' in habitat:
                 self.agent_height = habitat['agent_height']
-            if 'training_queue_size' in habitat:
-                self.training_queue_size = habitat['training_queue_size']
-        
+
         # Semantics (MaskCLIP)
         if 'semantics' in yaml_data:
             sem = yaml_data['semantics']
@@ -492,30 +400,16 @@ class Config:
                 self.hash_feature_dim = hg['feature_dim']
             if 'lr' in hg:
                 self.hash_lr = hg['lr']
-            if 'per_image_batch_size' in hg:
-                self.hash_per_image_batch_size = hg['per_image_batch_size']
             if 'train_batch_size' in hg:
                 self.hash_train_batch_size = hg['train_batch_size']
             if 'inference_batch_size' in hg:
                 self.hash_inference_batch_size = hg['inference_batch_size']
-            if 'replay_buffer_size' in hg:
-                self.hash_replay_buffer_size = hg['replay_buffer_size']
             if 'buffer_refresh_interval' in hg:
                 self.hash_buffer_refresh_interval = hg['buffer_refresh_interval']
             if 'per_frame_cache_size' in hg:
                 self.hash_per_frame_cache_size = hg['per_frame_cache_size']
             if 'history_buffer_capacity' in hg:
                 self.history_buffer_capacity = hg['history_buffer_capacity']
-            if 'train_every_n_steps' in hg:
-                self.hash_train_every_n_steps = hg['train_every_n_steps']
-            if 'warmup_steps' in hg:
-                self.hash_warmup_steps = hg['warmup_steps']
-        
-        # Ensemble
-        if 'ensemble' in yaml_data:
-            ensemble = yaml_data['ensemble']
-            if 'num_models' in ensemble:
-                self.ensemble_num_models = ensemble['num_models']
 
         # Grid
         if 'grid' in yaml_data:
@@ -554,29 +448,12 @@ class Config:
         if 'detection' in yaml_data:
             det = yaml_data['detection']
             for key in ('detector', 'detected_conf_threshold', 'detected_persistence',
-                        'stop_distance_m', 'det_negative_classes', 'goal_projection',
+                        'stop_distance_m', 'det_negative_classes',
                         'exploit_redetect_interval',
                         'detected_min_box_frac', 'detected_max_box_frac',
                         'detected_min_dist_m', 'detected_max_dist_m',
-                        'sink_gate', 'sink_init', 'sink_num', 'sink_special_str',
-                        'sink_softmax_temp', 'sink_min_target_prob',
-                        'sink_crop_pad', 'sink_pool', 'sink_top_pct',
-                        'sink_seed',
+                        'sink_special_str',
                         'llmdet_model_name', 'llmdet_threshold',
                         'llmdet_use_sinks', 'llmdet_num_sinks', 'llmdet_sink_init'):
                 if key in det:
                     setattr(self, key, det[key])
-
-        # MobileSAM goal refinement
-        if 'sam' in yaml_data:
-            sam = yaml_data['sam']
-            for key in (
-                'use_mobile_sam', 'sam_checkpoint',
-                'sam_points_per_side', 'sam_pred_iou_thresh',
-                'sam_stability_score_thresh', 'sam_min_mask_region_area',
-                'sam_min_mask_pixels', 'sam_min_clip_sim',
-                'sam_softmax_temp', 'sam_min_target_prob',
-                'sam_lookback_steps',
-            ):
-                if key in sam:
-                    setattr(self, key, sam[key])
