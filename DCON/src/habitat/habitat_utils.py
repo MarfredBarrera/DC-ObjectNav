@@ -11,6 +11,27 @@ def get_scene_bounds_from_pathfinder(sim) -> list:
     return [np.array(bounds[0]).tolist(), np.array(bounds[1]).tolist()]
 
 
+def geodesic_distance(pathfinder, a, b) -> float:
+    """Shortest navigable-path (geodesic) distance between two world points.
+
+    Both endpoints are snapped to the nearest navmesh point first (hand-annotated
+    goal positions often sit inside furniture / off the navmesh). Returns
+    float('inf') when the pathfinder isn't loaded, a snap fails, or the two
+    points are disconnected on the navmesh (different islands)."""
+    if not pathfinder.is_loaded:
+        return float('inf')
+    sa = pathfinder.snap_point(np.asarray(a, dtype=np.float32))
+    sb = pathfinder.snap_point(np.asarray(b, dtype=np.float32))
+    if np.isnan(sa).any() or np.isnan(sb).any():
+        return float('inf')
+    path = habitat_sim.ShortestPath()
+    path.requested_start = sa
+    path.requested_end = sb
+    if not pathfinder.find_path(path):
+        return float('inf')
+    return float(path.geodesic_distance)
+
+
 def spawn_agent_at_random_navpoint(sim, agent) -> np.ndarray:
     if sim.pathfinder.is_loaded:
         nav_point = sim.pathfinder.get_random_navigable_point()

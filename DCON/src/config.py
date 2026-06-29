@@ -309,12 +309,44 @@ class Config:
         self.sink_min_target_prob = 0.4
         self.sink_crop_pad = 1.0
         # Crop pooling for the gate: "mean" pools the whole crop into one CLIP
-        # feature; "top_pct" scores each text on its best `sink_top_pct` fraction
-        # of patch cosines, rescuing small/partial-object boxes the mean-pool
-        # gate over-rejects (the object's patches no longer get averaged away).
+        # feature; "top_pct" ranks crop patches by query similarity and pools the
+        # top `sink_top_pct` fraction of those embeddings into one feature scored
+        # against the whole bank, rescuing small/partial-object boxes the mean-pool
+        # gate over-rejects (the object's patches no longer get averaged away) — but
+        # only the query selects patches, so it over-fires on background/walls.
+        # "top_pct_pertext" is the symmetric middle ground: query AND each sink
+        # average their own best `sink_top_pct` patches, so the neutral sink can
+        # reject walls while small objects still survive.
         self.sink_pool = "top_pct"
         self.sink_top_pct = 0.05
         self.sink_seed = 0
+        # LLMDet detector (detector="llmdet") with the paper's training-free
+        # attention sinks built into its own vision-language fusion layers — the
+        # faithful Ruis et al. (ICLR 2026) method, unlike the post-hoc cropped-
+        # CLIP sink_gate above. MUST use the `iSEE-Laboratory/llmdet_*` weights
+        # (model_type "mm-grounding-dino", loads natively as MMGroundingDino); the
+        # `fushh7/*_hf` weights declare plain "grounding-dino" and load with a
+        # broken (non-discriminative) contrastive head — do NOT use them.
+        # `llmdet_use_sinks` toggles the sinks for an A/B. Defaults tuned by a
+        # 60-frame sweep (87 COCO-YOLO-oracle true positives, 600 out-of-domain
+        # false positives), reported as true-positive retention at a target
+        # background FP-rejection:
+        #   * model=large: clearly best (no-sink separation 0.32 vs tiny 0.24).
+        #     An earlier 3-frame test wrongly favored tiny — noise. base/large
+        #     repos: iSEE-Laboratory/llmdet_{base,large}.
+        #   * num_sinks=48: sinks help large at every operating point, most at the
+        #     aggressive end — at 99% FP-rejection TP-retention 0.54->0.71, at 95%
+        #     0.74->0.87. (8/24 over-suppress; `sink_init` "special"=[()] vs "mean"
+        #     is INERT — the BERT text encoder recontextualizes the [unused]
+        #     tokens, washing out the word-embedding init.)
+        #   * threshold=0.42: for large+sinks48 this is the ~95% FP-rejection
+        #     point (~85-87% TP-retention). Raise to ~0.47 for ~99% FP-rejection
+        #     (~71% TP-retention) toward the paper's near-elimination.
+        self.llmdet_model_name = "iSEE-Laboratory/llmdet_large"
+        self.llmdet_threshold = 0.42
+        self.llmdet_use_sinks = True
+        self.llmdet_num_sinks = 48
+        self.llmdet_sink_init = "special"
         # Visualization-only: when rendering nav_history.mp4, overlay the
         # most recent saved SAM mask whose step is within this many ticks
         # of the current viz frame. Larger = more frames get an overlay
@@ -529,7 +561,9 @@ class Config:
                         'sink_gate', 'sink_init', 'sink_num', 'sink_special_str',
                         'sink_softmax_temp', 'sink_min_target_prob',
                         'sink_crop_pad', 'sink_pool', 'sink_top_pct',
-                        'sink_seed'):
+                        'sink_seed',
+                        'llmdet_model_name', 'llmdet_threshold',
+                        'llmdet_use_sinks', 'llmdet_num_sinks', 'llmdet_sink_init'):
                 if key in det:
                     setattr(self, key, det[key])
 

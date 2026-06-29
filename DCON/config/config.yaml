@@ -100,13 +100,13 @@ grid:
   # the floor turns the whole walkable area into "obstacle". For a multi-floor
   # scene, set the band to the target floor (floor+0.2 .. floor+1.5) so upper
   # floors don't bleed in (raise max_height if the band exceeds it).
-  bev_height_min: 0.2     # y=0 floor: 0.2 m above the surface
-  bev_height_max: 1.5
+  # bev_height_min: 0.2     # y=0 floor: 0.2 m above the surface
+  # bev_height_max: 1.5
 
   # Bottom floor (same rule: min must be ~0.2 m above that floor's surface,
   # or the floor plane bleeds in and the whole level reads as obstacle):
-  # bev_height_min: -2.8
-  # bev_height_max: -1.4
+  bev_height_min: -2.8
+  bev_height_max: -1.4
   # Soft coverage: each depth update adds min(1,(ref/d)^2) per confirmed
   # voxel; IG deficit = exp(-coverage/tau). Bigger tau = slower saturation.
   coverage_ref_dist_m: 2.0
@@ -124,14 +124,14 @@ planning:
 
 detection:
   detector: "hybrid"            # yolo / coco_yolo / hybrid / grounding_dino
-  detected_conf_threshold: 0.4  # det_score required to latch DETECTED
+  detected_conf_threshold: 0.30  # det_score required to latch DETECTED
   detected_persistence: 2       # consecutive replans above threshold to latch
   stop_distance_m: 0.75          # terminate within this distance of sim peak
   # Distractor vocabulary: competing YOLO-World classes + CLIP softmax
   # negatives for SAM mask scoring (bare nouns; "a " is prepended for CLIP).
   det_negative_classes: ["wall", "door", "window", "floor", "ceiling",
                          "curtain", "cabinet", "shelf", "picture", "refrigerator"]
-  sink_pool: "top_pct"
+  sink_pool: "top_pct_pertext"
 
 sam:
   sam_softmax_temp: 100.0       # CLIP logit scale before the mask softmax

@@ -469,6 +469,173 @@ class GroundingDinoDetector:
         return score, box
 
 
+class LLMDetDetector:
+    """Open-vocabulary detector using LLMDet (Fu et al., 2025) with the
+    training-free attention-sink false-positive mitigation of Ruis et al.
+    (ICLR 2026).
+
+    LLMDet is an early-fusion grounding detector built on MM-Grounding-DINO with
+    an LLM-supervised text backbone. Load the `iSEE-Laboratory/llmdet_*` weights,
+    which declare `model_type="mm-grounding-dino"` and load natively (transformers
+    >= 4.52) as `MMGroundingDinoForObjectDetection` through the standard
+    `AutoModelForZeroShotObjectDetection` interface. NOTE: the `fushh7/*_hf`
+    weights instead declare plain `grounding-dino`, whose contrastive head lacks
+    MM-GDINO's bias + feature normalization — they load with 0 missing keys but
+    produce non-discriminative (~0.5 everywhere) logits, so they are NOT usable.
+    Per the paper, early-fusion detectors confidently hallucinate the prompted
+    class on background images, because their vision-language fusion layers cannot
+    select "no token" when nothing matches — irrelevant class signal smears across
+    the vision tokens and the head picks the most prevalent one.
+
+    The fix (paper Appendix A.1): append N semantically-neutral *attention sink*
+    tokens to the prompt and treat them as competing classes. Excess attention
+    routes to the sinks, so a box whose strongest phrase is a sink is "none of
+    the above" and is dropped; the query box survives only if it out-scores every
+    sink. We reuse the model's `[unused*]` vocabulary slots as sinks (no
+    tokenizer resize) and re-initialise their word embeddings once at
+    construction. NOTE: a local sweep on this HF port found the embedding init
+    ("special" vs "mean") effectively INERT — the BERT text encoder
+    recontextualizes the [unused] tokens, washing out the word-embedding init —
+    and only `num_sinks=48` improves over no-sinks (8/24 over-suppress true
+    positives). The paper's ~24/special-init optima are for the native mmdet
+    LLMDet; they don't transfer to this port, so tune `num_sinks`/`threshold`
+    here rather than trusting the paper's numbers.
+
+    Unlike the cropped-CLIP `SinkGatedDetector`, the sink mechanism here lives
+    inside the detector's own fusion layers on the full image, which is exactly
+    what the paper validated.
+    """
+
+    name = "llmdet"
+
+    def backend_for(self, query: str) -> str:
+        return self.name
+
+    def __init__(
+        self,
+        device: str = "cuda",
+        model_name: str = "iSEE-Laboratory/llmdet_tiny",
+        threshold: float = 0.3,
+        use_sinks: bool = True,
+        num_sinks: int = 24,
+        sink_init: str = "special",
+        sink_special_str: str = "[()]",
+    ):
+        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+
+        self.device = device
+        self.threshold = float(threshold)
+        self.use_sinks = bool(use_sinks)
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_name).to(device)
+        self.model.eval()
+        self.tokenizer = self.processor.tokenizer
+
+        # Reuse [unused*] vocab slots as attention sinks (paper A.1): no resize,
+        # and they carry no semantic meaning. Skipped entirely when use_sinks is
+        # off (vanilla LLMDet, for A/B against the sink-gated variant).
+        self.sink_tokens: list = []
+        self.sink_ids: list = []
+        if self.use_sinks and int(num_sinks) > 0:
+            self._install_sinks(int(num_sinks), str(sink_init).lower(), sink_special_str)
+        # The sinks never change per query, so build the prompt suffix once.
+        self._sink_suffix = (
+            (" " + ". ".join(self.sink_tokens) + ".") if self.sink_ids else ""
+        )
+        self._current_query: Optional[str] = None
+        self._prompt: Optional[str] = None
+
+    def _install_sinks(self, num_sinks: int, sink_init: str, special_str: str) -> None:
+        emb = self.model.model.text_backbone.embeddings.word_embeddings.weight  # (V, D)
+        toks = [f"[unused{i}]" for i in range(num_sinks)]
+        ids = self.tokenizer.convert_tokens_to_ids(toks)
+        unk = self.tokenizer.unk_token_id
+        # Keep only sink tokens that exist as their own vocab id (not [UNK]).
+        keep = [(t, i) for t, i in zip(toks, ids) if i is not None and i != unk]
+        if not keep:
+            print("[LLMDet] no [unused*] slots in vocab; running without sinks")
+            return
+        self.sink_tokens = [t for t, _ in keep]
+        self.sink_ids = [i for _, i in keep]
+        with torch.no_grad():
+            if sink_init == "mean":
+                v = emb.mean(dim=0)
+            elif sink_init == "special":
+                sp = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(special_str))
+                v = emb[sp].mean(dim=0)
+            else:
+                raise ValueError(
+                    f"Unknown llmdet sink_init {sink_init!r} (expected 'mean' or 'special')")
+            for sid in self.sink_ids:
+                emb[sid] = v
+        print(f"[LLMDet] installed {len(self.sink_ids)} attention sinks (init={sink_init})")
+
+    @staticmethod
+    def _phrase_spans(token_strs: list) -> list:
+        """Group token indices into phrase spans separated by '.', skipping
+        special tokens. Returns [[query idxs], [sink0 idxs], ...] in prompt
+        order, so span 0 is always the query and the rest are sinks."""
+        spans: list = []
+        cur: list = []
+        for i, t in enumerate(token_strs):
+            if t in ("[CLS]", "[SEP]", "[PAD]", "<s>", "</s>", "<pad>"):
+                continue
+            if t == ".":
+                if cur:
+                    spans.append(cur)
+                    cur = []
+            else:
+                cur.append(i)
+        if cur:
+            spans.append(cur)
+        return spans
+
+    @torch.no_grad()
+    def detect(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
+        if query != self._current_query:
+            self._current_query = query
+            self._prompt = query.strip().rstrip(".") + "." + self._sink_suffix
+
+        arr = ObjectDetector._to_uint8(image)
+        pil = Image.fromarray(arr)
+        h, w = arr.shape[:2]
+
+        inputs = self.processor(images=pil, text=self._prompt, return_tensors="pt").to(self.device)
+        outputs = self.model(**inputs)
+
+        prob = outputs.logits.sigmoid()[0]              # (num_boxes, num_tokens)
+        boxes = outputs.pred_boxes[0]                   # (num_boxes, 4) cxcywh in [0, 1]
+        token_strs = self.tokenizer.convert_ids_to_tokens(inputs.input_ids[0])
+        spans = self._phrase_spans(token_strs)
+        if not spans:
+            return 0.0, None
+
+        qscore = prob[:, spans[0]].max(dim=1).values    # (num_boxes,) per-box query score
+        if self.sink_ids and len(spans) > 1:
+            # Strongest sink phrase per box; a box only survives if the query
+            # out-scores every sink ("none of the above" → dropped).
+            sink_score = torch.stack(
+                [prob[:, s].max(dim=1).values for s in spans[1:]], dim=0
+            ).max(dim=0).values                          # (num_boxes,)
+            keep = (qscore >= sink_score) & (qscore >= self.threshold)
+        else:
+            keep = qscore >= self.threshold
+
+        if not bool(keep.any()):
+            return 0.0, None
+        kept = torch.where(keep)[0]
+        best = kept[int(torch.argmax(qscore[kept]))]
+        score = float(qscore[best])
+        cx, cy, bw, bh = boxes[best].tolist()
+        x0, y0 = (cx - bw / 2.0) * w, (cy - bh / 2.0) * h
+        x1, y1 = (cx + bw / 2.0) * w, (cy + bh / 2.0) * h
+        return score, (float(x0), float(y0), float(x1), float(y1))
+
+
 class SamRefinedDetector:
     """Detector → MobileSAM (whole-image) → CLIP-scored best mask.
 
@@ -631,7 +798,7 @@ class SinkGatedDetector:
         crop_pad: float = 0.0,
         min_crop_px: int = 8,
         pool: str = "mean",
-        top_pct: float = 0.05,
+        top_pct: float = 0.15,
         seed: int = 0,
     ):
         self.base = base_detector
@@ -641,10 +808,18 @@ class SinkGatedDetector:
         self.min_target_prob = float(min_target_prob)
         self.crop_pad = float(crop_pad)
         self.min_crop_px = int(min_crop_px)
-        # Crop pooling for the gate: "mean" pools the whole crop into one CLIP
-        # feature (diluted by background on small/partial boxes); "top_pct" keeps
-        # only each text's best `top_pct` fraction of patch cosines, so a small
-        # object that fills part of the crop isn't averaged away.
+        # Crop pooling for the gate:
+        #  - "mean": pools the whole crop into one CLIP feature (high precision —
+        #    a wall's mean is wall-like and loses to the neutral sink — but small
+        #    objects get diluted by background and missed).
+        #  - "top_pct": ranks crop patches by query similarity and pools only the
+        #    top `top_pct` fraction of those embeddings (best small-object recall,
+        #    but only the query selects patches, so it manufactures a query-
+        #    favorable feature from any crop → background/wall false positives).
+        #  - "top_pct_pertext": symmetric top-k — query AND each sink average
+        #    their own best `top_pct` fraction of patch cosines, so the neutral
+        #    sink can defend against walls while the query still isolates small
+        #    objects. Middle ground; best when "top_pct" over-fires on background.
         self.pool = str(pool).lower()
         self.top_pct = float(top_pct)
         self.sinks = build_sink_bank(
@@ -700,9 +875,32 @@ class SinkGatedDetector:
         rgb = torch.from_numpy(crop).to(self.device).float() / 255.0   # (h, w, 3)
         feats = self.mask_clip.extract_dense_features(rgb)             # (h, w, 512)
 
-        bank = torch.cat([self._query_emb(query), self.sinks], dim=0)  # (1+S, 512)
+        q_emb = self._query_emb(query)                                 # (1, 512)
+        bank = torch.cat([q_emb, self.sinks], dim=0)                   # (1+S, 512)
         P = feats.reshape(-1, feats.shape[-1])                         # (N, 512), L2-normed
         if self.pool == "top_pct":
+            # Rank crop patches by query similarity, keep the top-k% most
+            # query-like embeddings, pool them into one crop feature, then score
+            # that single feature against the whole bank. Only the query selects
+            # the patches, so the pooled feature is — by construction — the most
+            # query-favorable sub-region of the crop. Best small-object recall,
+            # but it manufactures a query-favorable feature from any crop (even a
+            # blank wall), so the neutral sink can't defend → background false
+            # positives. Use "top_pct_pertext" to restore the sink's defense.
+            q_sim = (P @ q_emb.T).squeeze(1)                           # (N,) per-patch query cosine
+            k = max(1, int(round(self.top_pct * P.shape[0])))
+            idx = q_sim.topk(k, dim=0).indices                         # (k,) most query-like patches
+            crop_emb = P[idx].mean(dim=0, keepdim=True)                # (1, 512)
+            crop_emb = crop_emb / (crop_emb.norm(dim=-1, keepdim=True) + 1e-8)
+            sims = (crop_emb @ bank.T).squeeze(0)                      # (1+S,)
+        elif self.pool == "top_pct_pertext":
+            # Symmetric top-k: EACH text (query and every sink) averages its OWN
+            # best top-k% of patch cosines — different patches per column. The
+            # query still cherry-picks the object's patches (small-object recall,
+            # like "top_pct"), but the neutral sink also cherry-picks its most
+            # neutral/background patches, so a blank wall — which matches the sink
+            # well — can win and be rejected. Trades a little of "top_pct"'s recall
+            # for much better precision on background regions.
             per_patch = P @ bank.T                                     # (N, 1+S) per-patch cosine
             k = max(1, int(round(self.top_pct * per_patch.shape[0])))
             sims = per_patch.topk(k, dim=0).values.mean(dim=0)        # (1+S,) top-k% mean per text
@@ -845,6 +1043,7 @@ def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
     - "hybrid": COCO classes → YOLOv8, everything else → YOLO-Worldv2.
     - "grounding_dino": Grounding DINO Tiny via HuggingFace.
     - "locate_anything": NVIDIA LocateAnything-3B via HuggingFace pipeline.
+    - "llmdet": LLMDet via HuggingFace with training-free attention sinks.
     """
     key = name.lower().strip()
     # Only the YOLO-World branch (directly or inside hybrid) uses the
@@ -863,6 +1062,8 @@ def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
         return HybridDetector(device=device, negative_classes=negative_classes, **kwargs)
     if key in ("grounding_dino", "gdino", "groundingdino"):
         return GroundingDinoDetector(device=device, **kwargs)
+    if key in ("llmdet", "llm_det"):
+        return LLMDetDetector(device=device, **kwargs)
     if key in ("sam_refined", "sam"):
         # Composite: base detector triggers, MobileSAM proposes whole-image
         # masks, MaskCLIP scores them, best mask wins. Heavy deps imported

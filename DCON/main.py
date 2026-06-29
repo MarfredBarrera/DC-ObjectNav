@@ -35,7 +35,8 @@ from src.habitat.habitat_utils import (
     get_scene_bounds_from_pathfinder,
     init_simulator,
     spawn_agent_at_random_navpoint,
-    spawn_agent_at_pos
+    spawn_agent_at_pos,
+    geodesic_distance,
 )
 from src.habitat.sim_interface import SimInterface
 from src.perception.obj_detection import (
@@ -637,7 +638,18 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
 
 def run(cfg: Config, save_enabled: bool = True,
         visualize: bool = True, viz_output: str = "./figs/nav_history.mp4",
-        viz_fps: int = 5) -> None:
+        viz_fps: int = 5,
+        start_pos=None, goals=None, success_radius_m: float = 1.0) -> dict:
+    """Run one navigation episode.
+
+    `start_pos` is the spawn point (snapped to the navmesh); defaults to the
+    historical [0, -3, 2.5]. `goals`, if given, is a list of ground-truth target
+    world positions (xyz) used to score the episode — success requires the agent
+    to self-stop within `success_radius_m` geodesic of the nearest goal, and SPL
+    weights that success by start→nearest-goal geodesic over distance traveled.
+    Returns a metrics dict (see bottom of the function)."""
+    if start_pos is None:
+        start_pos = [0.0, -3.0, 2.5]
     # 1. Init simulator
     sim, agent = init_simulator(
         cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov, sensor_height=cfg.sensor_height,
@@ -645,16 +657,29 @@ def run(cfg: Config, save_enabled: bool = True,
         agent_height=cfg.agent_height,
     )
     # spawn_agent_at_random_navpoint(sim, agent)
-    spawn_agent_at_pos(sim, agent, [0.0, 0.0, 4.0])
+    start_nav = spawn_agent_at_pos(sim, agent, start_pos)  # snapped navmesh start
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)
     perception = PerceptionStack(cfg, scene_bounds)  # owns target_query; initialised from cfg
 
     mppi = MPPIPlanner(cfg, device=cfg.device)
+    # LLMDet carries its own knobs (model, attention-sink config); other
+    # backends ignore them, so only forward them for "llmdet".
+    det_kwargs = {}
+    if cfg.detector == 'llmdet':
+        det_kwargs = dict(
+            model_name=cfg.llmdet_model_name,
+            threshold=cfg.llmdet_threshold,
+            use_sinks=cfg.llmdet_use_sinks,
+            num_sinks=cfg.llmdet_num_sinks,
+            sink_init=cfg.llmdet_sink_init,
+            sink_special_str=cfg.sink_special_str,
+        )
     detector = make_detector(
         cfg.detector, device=cfg.device,
         negative_classes=getattr(cfg, 'det_negative_classes', None),
+        **det_kwargs,
     )
     # Neutral attention-sink false-positive gate (Ruis et al., ICLR 2026):
     # wrap the base detector so each fired box is verified against the target
@@ -758,6 +783,13 @@ def run(cfg: Config, save_enabled: bool = True,
     # over from a previous, longer run (traj_log.jsonl is truncated each run,
     # but the umaps/occ_maps/sim_maps directories are not).
     last_step = 0
+
+    # Episode metrics: accumulate the actual distance the agent travels (sum of
+    # per-action displacements) for SPL, and remember whether the agent itself
+    # decided to stop (vs. running out the step budget = timeout = failure).
+    path_length = 0.0
+    prev_pos = np.asarray(start_nav, dtype=np.float64).copy()
+    agent_stopped = False
 
     # Graceful early stop. Two ways to request it; both let the loop break at
     # the next step and fall through to the final map snapshot + visualization
@@ -895,6 +927,9 @@ def run(cfg: Config, save_enabled: bool = True,
                 goal_str = "—"
             if action is not None:
                 sim_iface.step(action, dt=cfg.mppi_dt)
+                cur_pos = np.asarray(sim_iface.agent_position, dtype=np.float64)
+                path_length += float(np.linalg.norm(cur_pos - prev_pos))
+                prev_pos = cur_pos
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | "
                       f"action [v={action[0]:+.3f} m/s, w={action[1]:+.3f} rad/s] | "
                       f"position: {pos[0]:.2f}, {pos[2]:.2f} | "
@@ -946,6 +981,7 @@ def run(cfg: Config, save_enabled: bool = True,
                 }) + '\n')
 
             if stop_now:
+                agent_stopped = True
                 sim_iface.step([0.0, 0.0], dt=cfg.mppi_dt)
                 break
 
@@ -1002,6 +1038,40 @@ def run(cfg: Config, save_enabled: bool = True,
         perception.update_maps(step=last_step, save_enabled=True)
 
     perception.save_models()
+
+    # Episode scoring. Compute geodesics while the pathfinder is still alive
+    # (before sim.close()). Without ground-truth `goals` we can only report the
+    # self-reported subset (the agent's own stop decision + distance traveled).
+    final_pos = np.asarray(sim_iface.agent_position, dtype=np.float64)
+    if goals:
+        l_geo = min(geodesic_distance(sim.pathfinder, start_nav, g) for g in goals)
+        d_final = min(geodesic_distance(sim.pathfinder, final_pos, g) for g in goals)
+        success = bool(agent_stopped and d_final <= success_radius_m)
+        if not success:
+            spl = 0.0
+        elif l_geo > 0.0 and np.isfinite(l_geo):
+            spl = float(l_geo / max(path_length, l_geo))
+        else:
+            # Spawned already on the goal (l == 0) or goal unreachable on the
+            # navmesh but the agent reported success — credit a perfect path.
+            spl = 1.0
+        print(f"[eval] success={success} spl={spl:.3f} | "
+              f"l_geo={l_geo:.2f}m path={path_length:.2f}m "
+              f"final_geo={d_final:.2f}m stopped={agent_stopped}")
+        metrics = {
+            'success': success, 'spl': spl,
+            'l_geodesic': float(l_geo), 'final_geodesic': float(d_final),
+            'path_length': float(path_length), 'agent_stopped': bool(agent_stopped),
+            'steps': int(last_step), 'scene': cfg.scene_path, 'query': cfg.target_query,
+        }
+    else:
+        metrics = {
+            'success': None, 'spl': None,
+            'l_geodesic': None, 'final_geodesic': None,
+            'path_length': float(path_length), 'agent_stopped': bool(agent_stopped),
+            'steps': int(last_step), 'scene': cfg.scene_path, 'query': cfg.target_query,
+        }
+
     sim.close()
     print("[main] done.")
 
@@ -1011,6 +1081,8 @@ def run(cfg: Config, save_enabled: bool = True,
             render_navigation(cfg, viz_output, fps=viz_fps, max_step=last_step)
         except Exception as e:
             print(f"[viz] visualization failed: {e}")
+
+    return metrics
 
 
 if __name__ == "__main__":
@@ -1022,11 +1094,13 @@ if __name__ == "__main__":
     parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic", "coverage"], default="epistemic",
                         help="Information gain source for MPPI (unseen or epistemic)")
     parser.add_argument("--detector", type=str,
-                        choices=["yolo", "coco_yolo", "hybrid", "grounding_dino", "locate_anything"],
+                        choices=["yolo", "coco_yolo", "hybrid", "grounding_dino",
+                                 "locate_anything", "llmdet"],
                         default="hybrid",
                         help="Detector backend: yolo (YOLO-Worldv2), coco_yolo "
                              "(closed-set YOLOv8), hybrid (COCO→YOLOv8 else "
-                             "YOLO-Worldv2), grounding_dino, or locate_anything")
+                             "YOLO-Worldv2), grounding_dino, locate_anything, or "
+                             "llmdet (LLMDet + attention sinks)")
     parser.add_argument("--no-visualize", action="store_true", default=False,
                         help="Skip rendering nav_history video after the run")
     parser.add_argument("--viz-output", type=str, default="./figs/nav_history.mp4",

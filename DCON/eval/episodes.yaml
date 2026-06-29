@@ -1,0 +1,30 @@
+# Hand-annotated ObjectNav evaluation episodes.
+#
+# Each episode: a scene, a target query, an agent spawn point, and >= 1 real
+# target-instance world position (xyz). Scores come from main.run():
+#   success = agent self-stops within `success_radius_m` geodesic of a goal
+#   SPL     = success * (start->nearest-goal geodesic) / max(geodesic, traveled)
+#
+# `scene` may be repo-relative (resolved against the DCON dir) or absolute.
+# `goals` lists every known instance of the target in the scene; a stop near
+# ANY instance counts, and the NEAREST is used for the geodesic.
+#
+# TODO: the start/goals below are PLACEHOLDERS — replace with real coordinates
+# measured in each scene (e.g. read agent/object positions from a manual run or
+# the habitat viewer). Run `python evaluate.py --episodes eval/episodes.yaml`.
+
+success_radius_m: 1.0
+
+episodes:
+  - scene: gibson_scenes/Goffs.glb
+    query: "a pillow"
+    start: [0.0, -3.0, 2.5]
+    goals:
+      - [3.2, -3.0, -1.1]
+
+  - scene: gibson_scenes/Goffs.glb
+    query: "a chair"
+    start: [0.0, -3.0, 2.5]
+    goals:
+      - [-2.0, -3.0, 1.5]
+      - [1.0, -3.0, -2.0]
