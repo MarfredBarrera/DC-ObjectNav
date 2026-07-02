@@ -56,6 +56,41 @@ def get_agent_heading(agent) -> float:
     return float(np.arctan2(forward_world[2], forward_world[0]))
 
 
+def discrete_action_from_plan(opt_path, heading, cfg):
+    """Convert an MPPI optimized path into one Habitat ObjectNav primitive.
+
+    Pure-pursuit tracking controller (the continuous→discrete transformation):
+    pick the first waypoint on `opt_path` at least `cfg.discrete_lookahead_m`
+    ahead of the agent, take the bearing to it in the grid frame (same
+    convention as get_agent_heading: atan2(Δz, Δx)), and emit the nearest
+    primitive — TURN toward the bearing when the heading error exceeds half a
+    turn, otherwise MOVE_FORWARD. Returns one of "move_forward" / "turn_left" /
+    "turn_right", or None if the path is degenerate (idle this replan). The
+    receding-horizon replan corrects any tracking drift each cycle.
+    """
+    if not opt_path or len(opt_path) < 2:
+        return None
+    sz, sx = float(opt_path[0][0]), float(opt_path[0][1])
+    lookahead_cells = max(1.0, cfg.discrete_lookahead_m / cfg.voxel_resolution)
+    target = None
+    for cz, cx in opt_path[1:]:
+        if np.hypot(cz - sz, cx - sx) >= lookahead_cells:
+            target = (float(cz), float(cx))
+            break
+    if target is None:
+        target = (float(opt_path[-1][0]), float(opt_path[-1][1]))
+    tz, tx = target
+    if tz == sz and tx == sx:
+        return None
+    desired = float(np.arctan2(tz - sz, tx - sx))
+    dtheta = (desired - heading + np.pi) % (2 * np.pi) - np.pi
+    turn_thresh = np.radians(cfg.discrete_turn_deg / 2.0)
+    if abs(dtheta) > turn_thresh:
+        # grid θ increases for "turn_left" (matches SimInterface.step_discrete).
+        return "turn_left" if dtheta > 0 else "turn_right"
+    return "move_forward"
+
+
 def world_to_grid(x_world: float, z_world: float, ref_grid, res: float):
     z_idx = int((z_world - ref_grid.min_z) / res)
     x_idx = int((x_world - ref_grid.min_x) / res)
@@ -246,23 +281,19 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
         print("  plan: missing map(s); idling")
         return (action_queue.popleft() if action_queue else None), None, None, None, None, None
 
-    # IG map by source: 'coverage' = soft observation-count deficit
-    # (continuous, keeps a gradient after binary unseen is locally
-    # exhausted); 'epistemic' = masked field uncertainty; 'unseen' ignores
-    # the map (MPPI builds a binary mask from occupancy internally).
-    if cfg.ig_source == 'coverage':
-        bev_ig = _to_numpy(perception.occupancy_grid.get_2d_coverage_deficit_map())
-    else:
-        bev_ig = bev_epi
+    # IG map by source: 'epistemic' = masked field uncertainty; 'unseen'
+    # ignores the map (MPPI builds a binary mask from occupancy internally).
+    bev_ig = bev_epi
 
     pos = sim_iface.agent_position
     heading = get_agent_heading(sim_iface.agent)
     start_grid = world_to_grid(pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution)
 
     # Drive straight at the highest-similarity cell, even if it's on an
-    # obstacle (the target object itself). MPPI carves a small free disk
-    # around the goal and forgives collisions once the rollout has arrived,
-    # so the planner can commit instead of orbiting.
+    # obstacle (the target object itself). In EXPLOIT, MPPI forgives collisions
+    # once the rollout has arrived (within the goal-arrival radius) and freezes
+    # it there, so the planner commits to "stop inside the goal" instead of
+    # orbiting.
     sim_for_goal = bev_sim.copy().astype(np.float32)
     sim_for_goal[bev_occ == 0] = -np.inf  # exclude unseen
     # Goal selection priority:
@@ -285,9 +316,9 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     # investigating the agent explores via the global similarity argmax
     # (Layer 3).
     if det_box is not None and det_investigate:
-        # Project the box center straight to one BEV cell, used verbatim (MPPI
-        # carves a free disk around the goal and forgives arrival collisions, so
-        # a cell on the target surface is fine). See project_box_goal.
+        # Project the box center straight to one BEV cell, used verbatim (in
+        # EXPLOIT, MPPI forgives arrival collisions within the goal-arrival
+        # radius, so a cell on the target surface is fine). See project_box_goal.
         cand = project_box_goal(
             perception, sim_iface, cfg, det_box, depth, c2w)
         if cand is not None:
@@ -332,6 +363,14 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
         action_queue.clear()
         return None, None, None, None, goal, box_goal
 
+    # Discrete mode: hand the optimized path to the tracking controller, which
+    # emits a single Habitat ObjectNav primitive. The continuous control queue
+    # is unused (the agent re-plans before every primitive).
+    if cfg.discrete_actions:
+        action_queue.clear()
+        act = discrete_action_from_plan(opt_path, heading, cfg)
+        return act, None, opt_path, mppi_score, goal, box_goal
+
     # Successful plan: replace queue with full MPPI control sequence.
     # MPPI U units: v in [grid cells / mppi_step], w in [rad / mppi_step].
     # sim_iface.step expects [m/s, rad/s].
@@ -342,6 +381,32 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
         action_queue.append([v_mps, w_rps])
 
     return action_queue.popleft(), None, opt_path, mppi_score, goal, box_goal
+
+
+def nearest_goal_point(goal, p):
+    """World xyz of the point of `goal` closest (in the x-z plane) to point `p`.
+
+    A goal is either a point ([x, y, z]) — returned as-is — or an axis-aligned
+    rectangular footprint, given as {"rect": [x_min, z_min, x_max, z_max],
+    "y": <height>}. For a rect, `p`'s (x, z) is clamped into the rectangle, so a
+    `p` outside maps to the nearest edge/corner and a `p` over the footprint maps
+    to itself (distance 0). This is what lets the agent stop anywhere along a
+    large table's perimeter and still be scored against the closest part of it.
+    """
+    if isinstance(goal, dict):
+        x_min, z_min, x_max, z_max = goal["rect"]
+        y = goal.get("y", float(p[1]))
+        cx = min(max(float(p[0]), x_min), x_max)
+        cz = min(max(float(p[2]), z_min), z_max)
+        return [cx, y, cz]
+    return [float(goal[0]), float(goal[1]), float(goal[2])]
+
+
+def goal_geodesic(pathfinder, p, goal):
+    """Geodesic distance from world point `p` to the nearest part of `goal`
+    (point or rectangle). Both endpoints are navmesh-snapped inside
+    `geodesic_distance`."""
+    return geodesic_distance(pathfinder, p, nearest_goal_point(goal, p))
 
 
 def run(cfg: Config, save_enabled: bool = True,
@@ -357,7 +422,7 @@ def run(cfg: Config, save_enabled: bool = True,
     weights that success by start→nearest-goal geodesic over distance traveled.
     Returns a metrics dict (see bottom of the function)."""
     if start_pos is None:
-        start_pos = [0.0, -3.0, 2.5]
+        start_pos = [-2.0, -3.0, 6.0]
     # 1. Init simulator
     sim, agent = init_simulator(
         cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov, sensor_height=cfg.sensor_height,
@@ -465,6 +530,10 @@ def run(cfg: Config, save_enabled: bool = True,
     path_length = 0.0
     prev_pos = np.asarray(start_nav, dtype=np.float64).copy()
     agent_stopped = False
+    # Discrete-mode primitive budget: every MOVE_FORWARD / TURN counts as one
+    # ObjectNav step; exhausting `cfg.max_agent_steps` without self-stopping is a
+    # timeout (failure), matching VLFM / SemExp / the Habitat challenge.
+    agent_steps = 0
 
     # Graceful early stop. Two ways to request it; both let the loop break at
     # the next step and fall through to the final map snapshot + visualization
@@ -575,12 +644,19 @@ def run(cfg: Config, save_enabled: bool = True,
             else:
                 goal_str = "—"
             if action is not None:
-                sim_iface.step(action, dt=cfg.mppi_dt)
+                if cfg.discrete_actions:
+                    sim_iface.step_discrete(action)
+                    agent_steps += 1
+                    action_str = f"{action} ({agent_steps}/{cfg.max_agent_steps})"
+                else:
+                    sim_iface.step(action, dt=cfg.mppi_dt)
+                    action_str = (f"[v={action[0]:+.3f} m/s, "
+                                  f"w={action[1]:+.3f} rad/s]")
                 cur_pos = np.asarray(sim_iface.agent_position, dtype=np.float64)
                 path_length += float(np.linalg.norm(cur_pos - prev_pos))
                 prev_pos = cur_pos
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | "
-                      f"action [v={action[0]:+.3f} m/s, w={action[1]:+.3f} rad/s] | "
+                      f"action {action_str} | "
                       f"position: {pos[0]:.2f}, {pos[2]:.2f} | "
                       f"det[{det_backend}]: {det_score:.3f} | "
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
@@ -614,7 +690,9 @@ def run(cfg: Config, save_enabled: bool = True,
                     'step': step,
                     'pos': [float(pos[0]), float(pos[2])],
                     'heading': float(heading),
-                    'action': [float(action[0]), float(action[1])] if action is not None else [0.0, 0.0],
+                    'action': (action if cfg.discrete_actions
+                               else ([float(action[0]), float(action[1])]
+                                     if action is not None else [0.0, 0.0])),
                     'ref_traj': [[int(p[0]), int(p[1])] for p in ref_traj] if ref_traj else [],
                     'opt_traj': [[int(p[0]), int(p[1])] for p in opt_traj] if opt_traj else [],
                     'mppi_cost': cost,
@@ -627,7 +705,18 @@ def run(cfg: Config, save_enabled: bool = True,
 
             if stop_now:
                 agent_stopped = True
-                sim_iface.step([0.0, 0.0], dt=cfg.mppi_dt)
+                if cfg.discrete_actions:
+                    agent_steps += 1  # the STOP primitive counts too
+                else:
+                    sim_iface.step([0.0, 0.0], dt=cfg.mppi_dt)
+                break
+
+            # Discrete-mode primitive budget: exhausting it without self-stopping
+            # is a timeout (failure), so the agent never runs past the challenge's
+            # action budget even though training continues for `cfg.iterations`.
+            if cfg.discrete_actions and agent_steps >= cfg.max_agent_steps:
+                print(f"step {step}: STEP BUDGET EXHAUSTED "
+                      f"({agent_steps}/{cfg.max_agent_steps}) — timeout (failure)")
                 break
 
         # C. refresh buffer + maps (slowest cadence — bottleneck)
@@ -688,9 +777,15 @@ def run(cfg: Config, save_enabled: bool = True,
     # (before sim.close()). Without ground-truth `goals` we can only report the
     # self-reported subset (the agent's own stop decision + distance traveled).
     final_pos = np.asarray(sim_iface.agent_position, dtype=np.float64)
+    # Recorded so the episode can be re-scored offline (e.g. against a
+    # rectangular table footprint or a different radius) without re-running.
+    final_pos_xyz = [float(v) for v in final_pos]
+    start_nav_xyz = [float(v) for v in np.asarray(start_nav, dtype=np.float64)]
     if goals:
-        l_geo = min(geodesic_distance(sim.pathfinder, start_nav, g) for g in goals)
-        d_final = min(geodesic_distance(sim.pathfinder, final_pos, g) for g in goals)
+        # Goals may be points or rectangular footprints (see nearest_goal_point);
+        # each is scored against its closest part to the query point.
+        l_geo = min(goal_geodesic(sim.pathfinder, start_nav, g) for g in goals)
+        d_final = min(goal_geodesic(sim.pathfinder, final_pos, g) for g in goals)
         success = bool(agent_stopped and d_final <= success_radius_m)
         if not success:
             spl = 0.0
@@ -707,6 +802,8 @@ def run(cfg: Config, save_enabled: bool = True,
             'success': success, 'spl': spl,
             'l_geodesic': float(l_geo), 'final_geodesic': float(d_final),
             'path_length': float(path_length), 'agent_stopped': bool(agent_stopped),
+            'final_pos': final_pos_xyz, 'start_nav': start_nav_xyz,
+            'success_radius_m': float(success_radius_m),
             'steps': int(last_step), 'scene': cfg.scene_path, 'query': cfg.target_query,
         }
     else:
@@ -714,6 +811,8 @@ def run(cfg: Config, save_enabled: bool = True,
             'success': None, 'spl': None,
             'l_geodesic': None, 'final_geodesic': None,
             'path_length': float(path_length), 'agent_stopped': bool(agent_stopped),
+            'final_pos': final_pos_xyz, 'start_nav': start_nav_xyz,
+            'success_radius_m': float(success_radius_m),
             'steps': int(last_step), 'scene': cfg.scene_path, 'query': cfg.target_query,
         }
 
@@ -736,7 +835,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=str, default="0", help="GPU device index")
     parser.add_argument("--no-save", action="store_true", default=False,
                         help="Skip saving BEV maps to disk during the live loop")
-    parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic", "coverage"], default="epistemic",
+    parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic"], default="epistemic",
                         help="Information gain source for MPPI (unseen or epistemic)")
     parser.add_argument("--detector", type=str,
                         choices=["yolo", "coco_yolo", "hybrid",

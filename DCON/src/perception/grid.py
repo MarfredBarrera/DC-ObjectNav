@@ -157,23 +157,11 @@ class SimilarityGrid(VoxelGrid):
             np.save(path, sim_2d.detach().cpu().numpy())
 
 class OccupancyGrid(VoxelGrid):
-    """3D Occupancy Voxel Grid + soft coverage accumulator.
-
-    `coverage` accumulates a quality-weighted observation count per voxel:
-    each frame, every voxel the depth update confirms (free or occupied)
-    gains `min(1, (coverage_ref_dist_m / d)^2)` — close views count fully,
-    distant ones fractionally. Unlike the trinary occupancy state (binary
-    and static once seen), coverage is continuous and keeps growing, so
-    "seen once from across the room" and "thoroughly scanned" are
-    distinguishable. Consumed as a coverage *deficit* `exp(-coverage/tau)`
-    — a graded exploration signal that decays smoothly instead of
-    vanishing the first time a cell is glimpsed.
-    """
+    """3D Occupancy Voxel Grid (trinary unseen / free / occupied)."""
     def __init__(self, config, scene_bounds):
         super().__init__(config, scene_bounds, device=config.device)
         self.unseen_val, self.free_val, self.occupied_val = 0, 1, 2
         self.voxels = torch.full((self.num_y, self.num_z, self.num_x), self.unseen_val, device=self.device, dtype=torch.uint8)
-        self.coverage = torch.zeros((self.num_y, self.num_z, self.num_x), device=self.device, dtype=torch.float32)
 
     def update_from_observation(self, depth, c2w, intrinsics, max_dist=None):
         if max_dist is None:
@@ -234,12 +222,6 @@ class OccupancyGrid(VoxelGrid):
         x_sel = X_idx.flatten()[update_global_mask]
         self.voxels[y_sel, z_sel, x_sel] = new_states
 
-        # Coverage: quality-weighted observation count. Each voxel appears
-        # once in the meshgrid, so plain += is safe (no duplicate indices).
-        ref = float(self.cfg.coverage_ref_dist_m)
-        w = torch.clamp((ref / v_dist[update_mask].clamp(min=1e-3)) ** 2, max=1.0)
-        self.coverage[y_sel, z_sel, x_sel] += w
-
     def get_2d_map(self, min_y=None, max_y=None):
         if min_y is None: min_y = self.cfg.bev_height_min
         if max_y is None: max_y = self.cfg.bev_height_max
@@ -271,30 +253,11 @@ class OccupancyGrid(VoxelGrid):
         out[promote] = self.occupied_val
         return out
 
-    def get_2d_coverage_deficit_map(self, min_y=None, max_y=None, tau=None):
-        """BEV coverage deficit in [0, 1]: mean over the Y band of
-        exp(-coverage / tau). 1 = never observed, →0 with accumulating
-        (quality-weighted) views. Continuous, monotonically decaying —
-        the graded replacement for the binary unseen mask as an IG source.
-        """
-        if min_y is None: min_y = self.cfg.bev_height_min
-        if max_y is None: max_y = self.cfg.bev_height_max
-        if tau is None:
-            tau = float(self.cfg.coverage_tau)
-        y_start, y_end = self.get_y_indices(min_y, max_y)
-        if y_start >= y_end:
-            return torch.ones((self.num_z, self.num_x), device=self.device)
-        deficit = torch.exp(-self.coverage[y_start:y_end] / tau)
-        return deficit.mean(dim=0)
-
     def save(self, step):
         occ_2d = self.get_2d_map()
         path = os.path.join(self.cfg.output_dir, f"occ_maps/bev_occupancy_{step}.npy")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         np.save(path, occ_2d.cpu().numpy())
-        cov_2d = self.get_2d_coverage_deficit_map()
-        np.save(os.path.join(self.cfg.output_dir, f"occ_maps/bev_coverage_deficit_{step}.npy"),
-                cov_2d.cpu().numpy())
 
 class UncertaintyGrid(VoxelGrid):
     """3D Uncertainty Voxel Grid backed by an evidential feature field.

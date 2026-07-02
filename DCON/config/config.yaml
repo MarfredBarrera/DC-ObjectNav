@@ -85,7 +85,7 @@ grid:
   voxel_resolution: 0.10
   max_height: 2.0
   # Height band (world-Y meters, absolute) collapsed into every 2D BEV map
-  # (similarity, occupancy, coverage, epistemic). min MUST sit ~0.2 m ABOVE the
+  # (similarity, occupancy, epistemic). min MUST sit ~0.2 m ABOVE the
   # floor surface: occupancy marks the floor plane itself occupied, and at
   # voxel_resolution the surface bleeds up ~one voxel row, so a min flush with
   # the floor turns the whole walkable area into "obstacle". For a multi-floor
@@ -98,10 +98,6 @@ grid:
   # or the floor plane bleeds in and the whole level reads as obstacle):
   bev_height_min: -2.8
   bev_height_max: -1.4
-  # Soft coverage: each depth update adds min(1,(ref/d)^2) per confirmed
-  # voxel; IG deficit = exp(-coverage/tau). Bigger tau = slower saturation.
-  coverage_ref_dist_m: 2.0
-  coverage_tau: 3.0
   # Zero uncertainty at observed-free voxels (kills phantom epistemic
   # traces over traversed empty rooms; field never trains on air).
   mask_free_epistemic: true
@@ -113,9 +109,19 @@ planning:
   # through thin walls between waypoints). 0 = waypoints only.
   mppi_collision_substeps: 4
 
+  # Continuous→discrete action transformation. Set discrete_actions: true to
+  # execute Habitat ObjectNav primitives (MOVE_FORWARD / TURN_LEFT / TURN_RIGHT /
+  # STOP) via a tracking controller over the MPPI plan, for apples-to-apples
+  # SR/SPL comparison with VLFM and Goal-Oriented Semantic Exploration.
+  discrete_actions: false
+  discrete_forward_m: 0.25       # MOVE_FORWARD displacement (challenge default)
+  discrete_turn_deg: 30.0        # TURN_LEFT/RIGHT magnitude (challenge default)
+  discrete_lookahead_m: 0.5      # pure-pursuit lookahead along the MPPI path
+  max_agent_steps: 500           # per-episode primitive budget (timeout = failure)
+
 detection:
-  detector: "hybrid"            # yolo / coco_yolo / hybrid / grounding_dino
-  detected_conf_threshold: 0.30  # det_score required to latch DETECTED
+  detector: "llmdet"            # yolo / coco_yolo / hybrid / grounding_dino
+  detected_conf_threshold: 0.47  # det_score required to latch DETECTED
   detected_persistence: 2       # consecutive replans above threshold to latch
   stop_distance_m: 0.75          # terminate within this distance of sim peak
   # Distractor vocabulary: competing classes registered alongside the query on

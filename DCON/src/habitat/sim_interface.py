@@ -79,6 +79,39 @@ class SimInterface:
         agent_state.rotation = utils.quat_from_magnum(new_rot)
         self.agent.set_state(agent_state)
 
+    def step_discrete(self, action: str) -> None:
+        """Execute one Habitat ObjectNav discrete primitive kinematically.
+
+        action ∈ {"move_forward", "turn_left", "turn_right"}. Magnitudes come
+        from cfg.discrete_forward_m / cfg.discrete_turn_deg. Turn names are in
+        the MPPI grid-heading convention — "turn_left" increases grid θ — and
+        are mapped onto Habitat's yaw via cfg.mppi_w_sign (the same sign the
+        continuous `step` applies to ω), so a turn rotates the agent the same
+        physical way the planner intended. Forward translation reuses the
+        NavMesh `try_step` so collisions slide exactly as in continuous mode.
+        """
+        forward_m = float(self.cfg.discrete_forward_m)
+        turn_rad = math.radians(float(self.cfg.discrete_turn_deg))
+        w_sign = float(self.cfg.mppi_w_sign)
+
+        agent_state = self.agent.get_state()
+        pos = mn.Vector3(agent_state.position)
+        rot = utils.quat_to_magnum(agent_state.rotation)
+
+        if action == "move_forward":
+            forward_world = rot.transform_vector(mn.Vector3(0.0, 0.0, -1.0))
+            new_pos = self.sim.pathfinder.try_step(pos, pos + forward_world * forward_m)
+            agent_state.position = np.array(new_pos)
+        elif action in ("turn_left", "turn_right"):
+            # grid θ increases for "turn_left"; w_sign maps that onto Habitat yaw.
+            yaw = w_sign * (turn_rad if action == "turn_left" else -turn_rad)
+            dq = mn.Quaternion.rotation(mn.Rad(yaw), mn.Vector3(0.0, 1.0, 0.0))
+            agent_state.rotation = utils.quat_from_magnum(rot * dq)
+        else:
+            raise ValueError(f"unknown discrete action: {action!r}")
+
+        self.agent.set_state(agent_state)
+
     def get_observations(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (rgb [H,W,3] float32 0-1, depth [H,W] float32 metres, c2w [4,4] OpenCV frame)."""
         obs = self.sim.get_sensor_observations()

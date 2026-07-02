@@ -155,8 +155,8 @@ class MPPIPlanner:
 
         occ_torch = torch.from_numpy(occ_map).to(self.device).long()
         # IG signal: a binary mask of unseen cells ("unseen"), or the supplied
-        # map ("epistemic" = masked field uncertainty, "coverage" = soft
-        # observation-count deficit). The unseen branch ignores ig_map.
+        # map ("epistemic" = masked field uncertainty). The unseen branch
+        # ignores ig_map.
         if ig_source == "unseen":
             ig_torch = (occ_torch == 0).float()
         else:
@@ -177,7 +177,6 @@ class MPPIPlanner:
             w_max=cfg.mppi_max_w_rps * dt,
             intrinsics=intrinsics, sensor_height=sensor_height,
             occ_torch=occ_torch, ig_torch=ig_torch,
-            occ_collision=self._carved_occupancy(occ_torch, float(goal[0]), float(goal[1])),
         )
         # Heading: real pose if given, else aim straight at the goal.
         p.theta_start = (float(initial_heading) if initial_heading is not None
@@ -219,26 +218,6 @@ class MPPIPlanner:
             w_conf, w_ig_conf = cfg.mppi_conf_weight_scale * norm, 1.0 - norm
         self.last_w_conf = float(w_conf)
         return w_conf, w_ig_conf, incoming >= self.EXPLOIT_CONF
-
-    def _carved_occupancy(self, occ_torch, goal_z, goal_x):
-        """Collision-map clone with a small free disk (`mppi_goal_carve_radius`)
-        carved around the goal cell, so the target — often itself an obstacle
-        (a bed, a pillow) — is reachable. IG raycasts keep the un-carved map."""
-        r = self.cfg.mppi_goal_carve_radius
-        occ = occ_torch.clone()
-        if r <= 0:
-            return occ
-        gz, gx = int(round(goal_z)), int(round(goal_x))
-        z0, z1 = max(0, gz - r), min(occ.shape[0], gz + r + 1)
-        x0, x1 = max(0, gx - r), min(occ.shape[1], gx + r + 1)
-        zz, xx = torch.meshgrid(
-            torch.arange(z0, z1, device=self.device),
-            torch.arange(x0, x1, device=self.device), indexing='ij')
-        disk = ((zz - gz) ** 2 + (xx - gx) ** 2) <= r ** 2
-        patch = occ[z0:z1, x0:x1]
-        patch[disk] = 1  # treat as free for collision
-        occ[z0:z1, x0:x1] = patch
-        return occ
 
     def _warm_start(self, horizon):
         """Nominal seed: the previous control sequence shifted left by one (the
@@ -319,12 +298,15 @@ class MPPIPlanner:
         #
         # Arrival forgiveness is EXPLOIT-only: there the goal is a confirmed
         # detection and itself an obstacle, so the final approach must be
-        # allowed to touch it. In SEARCH the goal is just a similarity peak —
-        # often ON or BEHIND a wall — and `sq_dist` knows nothing about
-        # geometry, so forgiving near-goal contact licenses rollouts to
-        # tunnel through the wall for the last `arrival_radius` cells.
-        # (SEARCH still gets the small `mppi_goal_carve_radius` disk carved
-        # in `occ_collision`, which is the intended, much tighter escape.)
+        # allowed to touch it (the rollout reaches the target cell, then the
+        # freeze + arrival reward below make "stop inside the goal" the
+        # highest-scoring behavior — this is the stopping condition). In SEARCH
+        # the goal is just a similarity peak — often ON or BEHIND a wall — and
+        # `sq_dist` knows nothing about geometry, so forgiving near-goal contact
+        # would license rollouts to tunnel through the wall for the last
+        # `arrival_radius` cells; SEARCH therefore gets no forgiveness and an
+        # on-surface peak is approached but not entered (the EXPLOIT latch drives
+        # the final approach to the real target).
         start_z_idx = min(max(int(round(p.start_z)), 0), p.Z_dim - 1)
         start_x_idx = min(max(int(round(p.start_x)), 0), p.X_dim - 1)
         at_start = (Z_idx == start_z_idx) & (X_idx == start_x_idx)
@@ -333,7 +315,7 @@ class MPPIPlanner:
             (sq_dist <= p.arrival_radius ** 2).long(), dim=1).values.bool()
         forgive_arrival = (reached_goal if p.in_exploit
                            else torch.zeros_like(reached_goal))
-        collide = (p.occ_collision[Z_idx, X_idx] >= 2) & ~at_start & ~forgive_arrival
+        collide = (p.occ_torch[Z_idx, X_idx] >= 2) & ~at_start & ~forgive_arrival
 
         # Subsample each waypoint→waypoint segment. The agent can travel >1
         # cell per horizon step, so a waypoint-only check tunnels through thin
@@ -349,7 +331,7 @@ class MPPIPlanner:
             X_mid = X[:, :-1, None] + (X[:, 1:] - X[:, :-1])[..., None] * fracs
             Zi = torch.clamp(Z_mid.round().long(), 0, p.Z_dim - 1)  # [K, H-1, S]
             Xi = torch.clamp(X_mid.round().long(), 0, p.X_dim - 1)
-            mid_occ = p.occ_collision[Zi, Xi] >= 2
+            mid_occ = p.occ_torch[Zi, Xi] >= 2
             mid_at_start = (Zi == start_z_idx) & (Xi == start_x_idx)
             # EXPLOIT-only, same as the waypoint check above.
             seg_forgive = forgive_arrival[:, 1:, None]  # arrived by segment end (monotone)

@@ -102,8 +102,8 @@ class Config:
         self.voxel_resolution = 0.05
         self.grid_max_height = 2.0
         # Height band (world-Y meters, ABSOLUTE coordinates) collapsed into the
-        # 2D BEV maps — similarity, occupancy, coverage deficit, and the
-        # epistemic uncertainty volume all reduce over this slice. Defaults
+        # 2D BEV maps — similarity, occupancy, and the epistemic uncertainty
+        # volume all reduce over this slice. Defaults
         # assume the floor sits near Y=0. min must sit ~0.2 m ABOVE the floor
         # surface: the occupancy grid marks the floor plane itself occupied and
         # it bleeds up ~one voxel row, so a min flush with the floor makes the
@@ -114,14 +114,6 @@ class Config:
         # scene's min_y; max is clipped by grid_max_height.
         self.bev_height_min = 0.2
         self.bev_height_max = 1.5
-        # Soft coverage accumulator (OccupancyGrid.coverage). Each depth
-        # update adds min(1, (ref_dist/d)^2) to every voxel it confirms —
-        # close views count fully, distant ones fractionally. The IG-facing
-        # deficit is exp(-coverage/tau): tau = how many full-quality views a
-        # voxel needs before it stops attracting exploration (~63% drained
-        # after tau views, ~95% after 3*tau).
-        self.coverage_ref_dist_m = 2.0
-        self.coverage_tau = 3.0
         # Zero epistemic/aleatoric uncertainty at observed-FREE voxels when
         # building maps. The field only trains on surface points, so free-air
         # uncertainty is init noise ("phantom traces" over traversed rooms),
@@ -136,7 +128,6 @@ class Config:
         self.mppi_min_v_mps = 0.0
         self.mppi_max_v_mps = 1.0
         self.mppi_horizon = 150           # rollout length (steps)
-        self.mppi_goal_carve_radius = 1   # free disk carved around the goal cell for collision
         # Collision-check subsampling: number of intermediate points checked
         # along each waypoint-to-waypoint segment (in addition to the
         # waypoints). The agent can move >1 cell per horizon step, so a
@@ -174,6 +165,24 @@ class Config:
         self.mppi_num_iters = 5
         self.mppi_anneal_beta_traj = 3.0
         self.mppi_anneal_beta_action = 1.5
+
+        # Continuous→discrete action transformation. When `discrete_actions` is
+        # True the agent no longer executes MPPI's continuous [v, w] command;
+        # instead a low-level tracking controller converts each replan's plan
+        # into ONE Habitat ObjectNav primitive — MOVE_FORWARD (`discrete_forward_m`),
+        # TURN_LEFT/RIGHT (`discrete_turn_deg`), or STOP — so SR/SPL are directly
+        # comparable to VLFM / Goal-Oriented Semantic Exploration baselines.
+        # The controller looks `discrete_lookahead_m` ahead along the MPPI
+        # optimized path, and turns toward that bearing whenever the heading
+        # error exceeds half a turn (nearest-primitive rounding), else steps
+        # forward. `max_agent_steps` is the per-episode primitive budget
+        # (exhausting it without self-stopping = timeout = failure); turns and
+        # forwards both count, matching the Habitat ObjectNav challenge.
+        self.discrete_actions = False
+        self.discrete_forward_m = 0.25
+        self.discrete_turn_deg = 30.0
+        self.discrete_lookahead_m = 0.5
+        self.max_agent_steps = 500
 
         # Visualization
         self.viz_interval = 500
@@ -418,7 +427,7 @@ class Config:
                 self.voxel_resolution = grid['voxel_resolution']
             if 'max_height' in grid:
                 self.grid_max_height = grid['max_height']
-            for key in ('coverage_ref_dist_m', 'coverage_tau', 'mask_free_epistemic',
+            for key in ('mask_free_epistemic',
                         'bev_height_min', 'bev_height_max'):
                 if key in grid:
                     setattr(self, key, grid[key])
@@ -440,6 +449,8 @@ class Config:
                 'mppi_num_iters',
                 'mppi_anneal_beta_traj', 'mppi_anneal_beta_action',
                 'mppi_collision_substeps',
+                'discrete_actions', 'discrete_forward_m', 'discrete_turn_deg',
+                'discrete_lookahead_m', 'max_agent_steps',
             ):
                 if key in planning:
                     setattr(self, key, planning[key])

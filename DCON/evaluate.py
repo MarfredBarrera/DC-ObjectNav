@@ -69,7 +69,7 @@ def main():
                                  "locate_anything"], default=None,
                         help="Override detector backend for all episodes")
     parser.add_argument("--ig-source", type=str,
-                        choices=["unseen", "epistemic", "coverage"], default="epistemic",
+                        choices=["unseen", "epistemic"], default="epistemic",
                         help="Information-gain source for MPPI")
     parser.add_argument("--save", action="store_true", default=False,
                         help="Save per-episode BEV maps/RGB (slow; off by default)")
