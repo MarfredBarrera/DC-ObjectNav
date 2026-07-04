@@ -148,8 +148,8 @@ def bev_cell_from_box_center(perception, cfg, intrinsics, det_box, depth, c2w):
 
     Projects only the box-center patch to one world point and returns its lone
     BEV cell, used as the goal verbatim — no similarity argmax, no snap-to-free.
-    Best paired with a detector that emits tight, accurate boxes (e.g. LLMDet /
-    LocateAnything). Returns (z_idx, x_idx) or None.
+    Relies on LLMDet emitting tight, accurate boxes. Returns (z_idx, x_idx)
+    or None.
     """
     wxz = box_center_world_xz(perception, cfg, intrinsics, det_box, depth, c2w)
     if wxz is None:
@@ -172,8 +172,8 @@ def classify_detection(perception, cfg, intrinsics, det_box, depth, c2w,
         (no goal, no confidence weight, no latch).
       - TOO FAR — object distance > cfg.detected_max_dist_m OR box smaller than
         cfg.detected_min_box_frac of the frame. A distant, uncertain sighting →
-        (False, True): may pull the confidence weight but doesn't latch and
-        isn't cached as a goal.
+        (False, True): investigated (projected + cached as the goal, pulls the
+        confidence weight) but not persistent — it never counts toward the latch.
       - USABLE BAND (anything else) → (True, True): a persistent detection that
         latches and is cached as the goal, and contributes the confidence weight.
 
@@ -202,18 +202,6 @@ def classify_detection(perception, cfg, intrinsics, det_box, depth, c2w,
     return (True, True)         # usable band
 
 
-def project_box_goal(perception, sim_iface, cfg, det_box, depth, c2w):
-    """Project a detection box to a BEV goal cell (the box-center world point) —
-    the Layer-1 goal logic used by `plan_one_action`. Needs only depth + camera
-    pose, so it works before any BEV map is meaningful (e.g. on the untrained
-    field at startup). Returns a (z, x) cell, or None.
-    """
-    if det_box is None:
-        return None
-    return bev_cell_from_box_center(
-        perception, cfg, sim_iface.intrinsics, det_box, depth, c2w)
-
-
 def detect_classify_latch(detector, perception, sim_iface, cfg,
                           rgb, depth, c2w, pos, detected, detected_streak,
                           run_detector=True, tag=""):
@@ -236,7 +224,9 @@ def detect_classify_latch(detector, perception, sim_iface, cfg,
 
     det_persistent, det_investigate = classify_detection(
         perception, cfg, sim_iface.intrinsics, det_box, depth, c2w, pos)
-    det_persistent = det_persistent and det_score >= cfg.detected_conf_threshold
+    # No separate score gate here: the detector's own floor (llmdet_threshold)
+    # already bounds the score of any surviving box, so every usable-band
+    # detection counts toward the latch.
     conf_score = det_score if det_investigate else 0.0
 
     if not detected:
@@ -253,20 +243,18 @@ def detect_classify_latch(detector, perception, sim_iface, cfg,
 
 
 def plan_one_action(perception, sim_iface, mppi, cfg,
-                    action_queue: deque, k_max: int = 5,
+                    action_queue: deque,
                     det_score: float = 0.0,
-                    detected: bool = False, det_box=None, rgb=None, depth=None, c2w=None,
+                    detected: bool = False, det_box=None, depth=None, c2w=None,
                     last_box_goal=None,
                     det_investigate: bool = False):
-    """Run MPPI from current pose and return (action, ref_traj, opt_traj).
+    """Run MPPI from current pose and return (action, opt_traj, goal, box_goal).
 
-    action is [v_mps, w_rad_per_s] or None if idling.
-    ref_traj / opt_traj are grid-coord lists [(z_idx, x_idx), ...]; None when
+    action is [v_mps, w_rad_per_s] (or a discrete primitive name) or None if
+    idling. opt_traj is a grid-coord list [(z_idx, x_idx), ...]; None when
     falling back to the queue or idling (no new plan was computed).
 
     On a successful plan the full MPPI control sequence replaces the queue.
-    If every A* goal is unreachable the queue is consumed so the agent keeps
-    moving.
 
     `det_score` is the raw detector confidence for the current frame, used as
     `goal_confidence` in SEARCH mode (MPPI's threshold + hysteresis filter
@@ -279,26 +267,22 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
 
     if bev_sim is None or bev_epi is None or bev_occ is None:
         print("  plan: missing map(s); idling")
-        return (action_queue.popleft() if action_queue else None), None, None, None, None, None
-
-    # IG map by source: 'epistemic' = masked field uncertainty; 'unseen'
-    # ignores the map (MPPI builds a binary mask from occupancy internally).
-    bev_ig = bev_epi
+        return (action_queue.popleft() if action_queue else None), None, None, None
 
     pos = sim_iface.agent_position
     heading = get_agent_heading(sim_iface.agent)
     start_grid = world_to_grid(pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution)
 
     # Drive straight at the highest-similarity cell, even if it's on an
-    # obstacle (the target object itself). In EXPLOIT, MPPI forgives collisions
-    # once the rollout has arrived (within the goal-arrival radius) and freezes
-    # it there, so the planner commits to "stop inside the goal" instead of
-    # orbiting.
+    # obstacle (the target object itself). In EXPLOIT, MPPI freezes each
+    # rollout at its first waypoint within the goal-arrival radius (with an
+    # arrival bonus), so the planner commits to "stop next to the goal"
+    # instead of orbiting; the frozen cell itself must be collision-free.
     sim_for_goal = bev_sim.copy().astype(np.float32)
     sim_for_goal[bev_occ == 0] = -np.inf  # exclude unseen
     # Goal selection priority:
-    #   1. Detection box this frame → argmax of bev_sim restricted to BEV cells
-    #      the box projects to.
+    #   1. Detection box this frame → the BEV cell its center projects to,
+    #      used verbatim.
     #   2. No box this frame, but a previous box-derived goal is cached →
     #      reuse that fixed world cell so the agent commits to the last
     #      sighting instead of chasing a far-away similarity peak.
@@ -316,11 +300,12 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     # investigating the agent explores via the global similarity argmax
     # (Layer 3).
     if det_box is not None and det_investigate:
-        # Project the box center straight to one BEV cell, used verbatim (in
-        # EXPLOIT, MPPI forgives arrival collisions within the goal-arrival
-        # radius, so a cell on the target surface is fine). See project_box_goal.
-        cand = project_box_goal(
-            perception, sim_iface, cfg, det_box, depth, c2w)
+        # Project the box center straight to one BEV cell, used verbatim (a
+        # cell on the target surface is fine: in EXPLOIT, MPPI freezes rollouts
+        # at their first waypoint within the goal-arrival radius and drops any
+        # frozen on an occupied cell, so winners stop on free cells nearby).
+        cand = bev_cell_from_box_center(
+            perception, cfg, sim_iface.intrinsics, det_box, depth, c2w)
         if cand is not None:
             goal = cand
             box_goal = goal
@@ -331,7 +316,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     if goal is None:
         if not np.any(np.isfinite(sim_for_goal)):
             print("  plan: no observed cells, can't pick a goal")
-            return (action_queue.popleft() if action_queue else None), None, None, None, None, None
+            return (action_queue.popleft() if action_queue else None), None, None, None
         flat_idx = int(np.argmax(sim_for_goal))
         goal = (flat_idx // W, flat_idx % W)
     # Goal weight (`w_conf` inside MPPI):
@@ -346,22 +331,26 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     goal_confidence = 1.0 if detected else float(det_score)
 
     opt_path, U_opt = mppi.optimize_trajectory(
-        start_grid, goal, bev_ig, bev_occ,
+        start_grid, goal, bev_epi, bev_occ,
         initial_heading=heading,
         intrinsics=sim_iface.intrinsics,
         sensor_height=cfg.sensor_height,
-        ig_source=cfg.ig_source,
         goal_confidence=goal_confidence,
     )
-    mppi_score = None
     if U_opt is None or U_opt.shape[0] == 0:
-        # No safe MPPI plan this replan — idle and let the next replan retry.
-        # Goal disconfirmation and freshly observed geometry usually open a new
-        # option within a few replans, so we wait rather than commit a forced
-        # maneuver.
-        print("  plan: MPPI returned no safe control sequence, idling this replan")
+        # No safe MPPI plan this replan — every rollout collides (wedged in a
+        # tight pocket). Instead of idling, rotate clockwise in place to sweep
+        # the heading: the next replan starts from a new orientation, which
+        # usually exposes a collision-free rollout out of the pocket. "turn_right"
+        # (grid θ decreasing) is clockwise viewed top-down; the continuous form
+        # produces the same physical Habitat yaw as the discrete primitive (both
+        # go through mppi_w_sign, so they rotate the same way).
+        print("  plan: MPPI returned no safe control sequence, rotating clockwise")
         action_queue.clear()
-        return None, None, None, None, goal, box_goal
+        if cfg.discrete_actions:
+            return "turn_right", None, goal, box_goal
+        w_rps = -cfg.mppi_w_sign * cfg.mppi_max_w_rps
+        return [0.0, w_rps], None, goal, box_goal
 
     # Discrete mode: hand the optimized path to the tracking controller, which
     # emits a single Habitat ObjectNav primitive. The continuous control queue
@@ -369,7 +358,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     if cfg.discrete_actions:
         action_queue.clear()
         act = discrete_action_from_plan(opt_path, heading, cfg)
-        return act, None, opt_path, mppi_score, goal, box_goal
+        return act, opt_path, goal, box_goal
 
     # Successful plan: replace queue with full MPPI control sequence.
     # MPPI U units: v in [grid cells / mppi_step], w in [rad / mppi_step].
@@ -380,7 +369,7 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
         w_rps = cfg.mppi_w_sign * float(U_opt[i, 1]) / cfg.mppi_dt
         action_queue.append([v_mps, w_rps])
 
-    return action_queue.popleft(), None, opt_path, mppi_score, goal, box_goal
+    return action_queue.popleft(), opt_path, goal, box_goal
 
 
 def nearest_goal_point(goal, p):
@@ -410,17 +399,29 @@ def goal_geodesic(pathfinder, p, goal):
 
 
 def run(cfg: Config, save_enabled: bool = True,
-        visualize: bool = True, viz_output: str = "./figs/nav_history.mp4",
+        save_video: bool = True, viz_output: str = "./figs/nav_history.mp4",
         viz_fps: int = 5,
-        start_pos=None, goals=None, success_radius_m: float = 1.0) -> dict:
+        start_pos=None, start_rotation=None, goals=None,
+        success_radius_m: float = 1.0) -> dict:
     """Run one navigation episode.
 
     `start_pos` is the spawn point (snapped to the navmesh); defaults to the
-    historical [0, -3, 2.5]. `goals`, if given, is a list of ground-truth target
+    historical [0, -3, 2.5]. `start_rotation`, if given, is the spawn
+    orientation as an [x, y, z, w] quaternion (the habitat episode-dataset
+    convention). `goals`, if given, is a list of ground-truth target
     world positions (xyz) used to score the episode — success requires the agent
     to self-stop within `success_radius_m` geodesic of the nearest goal, and SPL
     weights that success by start→nearest-goal geodesic over distance traveled.
-    Returns a metrics dict (see bottom of the function)."""
+    Returns a metrics dict (see bottom of the function).
+
+    Evidence saved to `cfg.output_dir` (all tiny except the video path):
+      - always: `traj_log.jsonl` (the trajectory) + `grid_extent.json`.
+      - `save_enabled` (default): additionally the FINAL BEV occupancy map
+        (`occ_maps/bev_occupancy_<last_step>.npy`).
+      - `save_video`: additionally the full per-step BEV map + RGB history
+        (epistemic/occupancy/similarity `.npy` + `rgbs/*.png` at every refresh
+        tick) and the rendered `nav_history.mp4`. This is the only heavy path.
+    The feature-field checkpoint is never written (nothing consumes it)."""
     if start_pos is None:
         start_pos = [-2.0, -3.0, 6.0]
     # 1. Init simulator
@@ -429,30 +430,15 @@ def run(cfg: Config, save_enabled: bool = True,
         agent_radius=cfg.agent_radius,
         agent_height=cfg.agent_height,
     )
-    start_nav = spawn_agent_at_pos(sim, agent, start_pos)  # snapped navmesh start
+    start_nav = spawn_agent_at_pos(sim, agent, start_pos,
+                                   rotation=start_rotation)  # snapped navmesh start
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)
     perception = PerceptionStack(cfg, scene_bounds)  # owns target_query; initialised from cfg
 
     mppi = MPPIPlanner(cfg, device=cfg.device)
-    # LLMDet carries its own knobs (model, attention-sink config); other
-    # backends ignore them, so only forward them for "llmdet".
-    det_kwargs = {}
-    if cfg.detector == 'llmdet':
-        det_kwargs = dict(
-            model_name=cfg.llmdet_model_name,
-            threshold=cfg.llmdet_threshold,
-            use_sinks=cfg.llmdet_use_sinks,
-            num_sinks=cfg.llmdet_num_sinks,
-            sink_init=cfg.llmdet_sink_init,
-            sink_special_str=cfg.sink_special_str,
-        )
-    detector = make_detector(
-        cfg.detector, device=cfg.device,
-        negative_classes=getattr(cfg, 'det_negative_classes', None),
-        **det_kwargs,
-    )
+    detector = make_detector(cfg)
     action_queue: deque = deque()
 
     # Planner state. `detected` latches True (and never releases) once
@@ -471,8 +457,10 @@ def run(cfg: Config, save_enabled: bool = True,
     # longer run (often a different scene) left stale snapshots that visualize.py
     # then interleaved into the new navigation history. Wipe them so only the
     # current run's maps exist.
-    if save_enabled:
-        for sub in ("umaps", "occ_maps", "sim_maps", "rgbs"):
+    if save_enabled or save_video:
+        # `featurefield` is legacy — earlier runs wrote a checkpoint there that
+        # nothing consumes; clear it too so re-runs reclaim the disk.
+        for sub in ("umaps", "occ_maps", "sim_maps", "rgbs", "featurefield"):
             shutil.rmtree(os.path.join(cfg.output_dir, sub), ignore_errors=True)
 
     # 2. Startup: a single observation seeds the replay buffer + occupancy, then
@@ -486,9 +474,11 @@ def run(cfg: Config, save_enabled: bool = True,
     super_pts, super_feats = perception.make_super_batch()
     torch.cuda.empty_cache()
 
-    # First maps + grid extent for visualize.py
-    perception.update_maps(step=0, save_enabled=save_enabled)
-    if save_enabled:
+    # First maps (needed for the first plan) + grid extent. The per-step map +
+    # RGB history is only saved for the video; the minimal path saves just the
+    # final occupancy map at the end.
+    perception.update_maps(step=0, save_enabled=save_video)
+    if save_video:
         # Save RGB
         step = 0
         rgb_dir = os.path.join(cfg.output_dir, "rgbs")
@@ -601,25 +591,25 @@ def run(cfg: Config, save_enabled: bool = True,
                 rgb_cur, depth_cur, c2w_cur, pos, detected, detected_streak,
                 run_detector=run_detector, tag=f"step {step}")
 
-            # SEARCH-mode goal disconfirmation: if the agent has reached its
-            # cached box-goal but nothing is detected there now, the earlier
-            # sighting was a false positive (a transient detector spike or a
-            # similarity blip). Drop the cache so the planner resumes exploration
-            # instead of dwelling next to the spike. EXPLOIT never reaches here
-            # (it has latched on a confirmed target), and a fresh investigated
-            # detection this frame leaves `det_investigate` True so we keep it.
-            if not detected and last_box_goal is not None and not det_investigate:
-                agz, agx = world_to_grid(pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution)
-                reach_cells = cfg.stop_distance_m / cfg.voxel_resolution
-                if float(np.hypot(agz - last_box_goal[0], agx - last_box_goal[1])) <= reach_cells:
-                    print(f"  goal disconfirmed at {last_box_goal} "
-                          f"(reached, no detection) — clearing cache")
-                    last_box_goal = None
+            # # SEARCH-mode goal disconfirmation: if the agent has reached its
+            # # cached box-goal but nothing is detected there now, the earlier
+            # # sighting was a false positive (a transient detector spike or a
+            # # similarity blip). Drop the cache so the planner resumes exploration
+            # # instead of dwelling next to the spike. EXPLOIT never reaches here
+            # # (it has latched on a confirmed target), and a fresh investigated
+            # # detection this frame leaves `det_investigate` True so we keep it.
+            # if not detected and last_box_goal is not None and not det_investigate:
+            #     agz, agx = world_to_grid(pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution)
+            #     reach_cells = cfg.stop_distance_m / cfg.voxel_resolution
+            #     if float(np.hypot(agz - last_box_goal[0], agx - last_box_goal[1])) <= reach_cells:
+            #         print(f"  goal disconfirmed at {last_box_goal} "
+            #               f"(reached, no detection) — clearing cache")
+            #         last_box_goal = None
 
-            action, ref_traj, opt_traj, score, goal_cell, box_goal = plan_one_action(
+            action, opt_traj, goal_cell, box_goal = plan_one_action(
                 perception, sim_iface, mppi, cfg, action_queue,
                 det_score=conf_score, detected=detected,
-                det_box=det_box, rgb=rgb_cur, depth=depth_cur, c2w=c2w_cur,
+                det_box=det_box, depth=depth_cur, c2w=c2w_cur,
                 last_box_goal=last_box_goal,
                 det_investigate=det_investigate,
             )
@@ -633,7 +623,6 @@ def run(cfg: Config, save_enabled: bool = True,
             if box_goal is not None:
                 last_box_goal = box_goal
                 print(f"  cached new goal {box_goal} (det_score={det_score:.3f})")
-            det_backend = detector.backend_for(perception.target_query)
             mode = 'EXPLOIT' if detected else 'SEARCH'
             w_conf = float(getattr(mppi, 'last_w_conf', 0.0))
             if goal_cell is not None:
@@ -658,12 +647,12 @@ def run(cfg: Config, save_enabled: bool = True,
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | "
                       f"action {action_str} | "
                       f"position: {pos[0]:.2f}, {pos[2]:.2f} | "
-                      f"det[{det_backend}]: {det_score:.3f} | "
+                      f"det: {det_score:.3f} | "
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
                       f"mode: {mode}")
             else:
                 print(f"step {step}: plan {time.time()-t_plan:.2f}s | no action | "
-                      f"det[{det_backend}]: {det_score:.3f} | "
+                      f"det: {det_score:.3f} | "
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
                       f"mode: {mode}")
 
@@ -673,19 +662,23 @@ def run(cfg: Config, save_enabled: bool = True,
             # below so the final replan is captured for visualization.
             stop_now = False
             if detected and goal_cell is not None:
-                gz, gx = int(goal_cell[0]), int(goal_cell[1])
-                sz, sx = world_to_grid(
-                    pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution,
-                )
-                dist_m = float(np.hypot(gz - sz, gx - sx)) * cfg.voxel_resolution
+                # Obstacle-aware distance from the planner's goal distance
+                # field (matches the geodesic success metric: can't fire
+                # through a wall). Straight-line fallback only if the planner
+                # didn't run this replan.
+                dist_m = mppi.last_goal_dist_m
+                if dist_m is None:
+                    gz, gx = int(goal_cell[0]), int(goal_cell[1])
+                    sz, sx = world_to_grid(
+                        pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution,
+                    )
+                    dist_m = float(np.hypot(gz - sz, gx - sx)) * cfg.voxel_resolution
                 if dist_m <= cfg.stop_distance_m:
                     print(f"step {step}: TARGET REACHED "
                           f"(dist={dist_m:.2f}m <= {cfg.stop_distance_m:.2f}m)")
                     stop_now = True
 
             with open(traj_log_path, 'a') as _f:
-                # Convert score to cost: higher score is better, so cost is -score.
-                cost = -float(score) if score is not None else None
                 _f.write(json.dumps({
                     'step': step,
                     'pos': [float(pos[0]), float(pos[2])],
@@ -693,9 +686,7 @@ def run(cfg: Config, save_enabled: bool = True,
                     'action': (action if cfg.discrete_actions
                                else ([float(action[0]), float(action[1])]
                                      if action is not None else [0.0, 0.0])),
-                    'ref_traj': [[int(p[0]), int(p[1])] for p in ref_traj] if ref_traj else [],
                     'opt_traj': [[int(p[0]), int(p[1])] for p in opt_traj] if opt_traj else [],
-                    'mppi_cost': cost,
                     'det_conf': float(det_score),
                     'det_box': [float(v) for v in det_box] if det_box is not None else None,
                     'goal': [int(goal_cell[0]), int(goal_cell[1])] if goal_cell is not None else None,
@@ -726,7 +717,7 @@ def run(cfg: Config, save_enabled: bool = True,
             perception.update_replay_buffer(rgb, depth, c2w, sim_iface.intrinsics)
             perception.update_occupancy(depth, c2w, sim_iface.intrinsics)
 
-            if save_enabled:
+            if save_video:
                 # Save RGB
                 rgb_dir = os.path.join(cfg.output_dir, "rgbs")
                 os.makedirs(rgb_dir, exist_ok=True)
@@ -741,7 +732,7 @@ def run(cfg: Config, save_enabled: bool = True,
                 torch.cuda.empty_cache()
             super_pts, super_feats = perception.make_super_batch()
 
-            perception.update_maps(step=step, save_enabled=save_enabled)
+            perception.update_maps(step=step, save_enabled=save_video)
             gc.collect()
             torch.cuda.empty_cache()
             print(f"step {step}: refresh+maps {time.time()-t_refresh:.2f}s | "
@@ -754,12 +745,13 @@ def run(cfg: Config, save_enabled: bool = True,
     # + visualization below can be aborted normally.
     signal.signal(signal.SIGINT, prev_sigint)
 
-    # Snapshot maps + RGB + 2D-sim aligned to last_step so the visualizer's
-    # final frame is up-to-date. The C cadence only fires every refresh
-    # interval, and early termination via `stop_now` or Ctrl-C can leave it
-    # 100+ steps behind the actual last action. Skipped when last_step already
-    # matches the most recent refresh tick — same files would just be overwritten.
-    if save_enabled and last_step % cfg.hash_buffer_refresh_interval != 0:
+    # Final evidence snapshot aligned to last_step. The C cadence only fires
+    # every refresh interval, and early termination via `stop_now` or Ctrl-C can
+    # leave it 100+ steps behind the actual last action, so refresh once here.
+    if save_video and last_step % cfg.hash_buffer_refresh_interval != 0:
+        # Video: the full map + RGB history so the visualizer's final frame is
+        # up-to-date. Skipped when last_step already matches the most recent
+        # refresh tick — the same files would just be overwritten.
         print(f"[main] saving final maps at step {last_step}...")
         rgb_f, depth_f, c2w_f = perception.observe(sim_iface)
         perception.update_replay_buffer(rgb_f, depth_f, c2w_f, sim_iface.intrinsics)
@@ -770,8 +762,15 @@ def run(cfg: Config, save_enabled: bool = True,
         imageio.imwrite(os.path.join(rgb_dir, f"rgb_{last_step:03d}.png"), rgb_img)
         perception.save_2d_similarity(last_step, depth_f, c2w_f, sim_iface.intrinsics)
         perception.update_maps(step=last_step, save_enabled=True)
-
-    perception.save_models()
+    elif save_enabled and not save_video:
+        # Minimal: just the final occupancy map (traj_log + grid_extent are
+        # already on disk). Refresh occupancy from a final observation first so
+        # it reflects the end pose, then save that one .npy — no feature field,
+        # no per-step maps, no RGB.
+        print(f"[main] saving final occupancy map at step {last_step}...")
+        _, depth_f, c2w_f = perception.observe(sim_iface)
+        perception.update_occupancy(depth_f, c2w_f, sim_iface.intrinsics)
+        perception.occupancy_grid.save(last_step)
 
     # Episode scoring. Compute geodesics while the pathfinder is still alive
     # (before sim.close()). Without ground-truth `goals` we can only report the
@@ -819,7 +818,7 @@ def run(cfg: Config, save_enabled: bool = True,
     sim.close()
     print("[main] done.")
 
-    if visualize:
+    if save_video:
         print(f"[viz] rendering navigation video up to step {last_step}...")
         try:
             render_navigation(cfg, viz_output, fps=viz_fps, max_step=last_step)
@@ -834,19 +833,12 @@ if __name__ == "__main__":
     parser.add_argument("--query", type=str, default=None, help="Override target query")
     parser.add_argument("--gpu", type=str, default="0", help="GPU device index")
     parser.add_argument("--no-save", action="store_true", default=False,
-                        help="Skip saving BEV maps to disk during the live loop")
-    parser.add_argument("--ig-source", type=str, choices=["unseen", "epistemic"], default="epistemic",
-                        help="Information gain source for MPPI (unseen or epistemic)")
-    parser.add_argument("--detector", type=str,
-                        choices=["yolo", "coco_yolo", "hybrid",
-                                 "locate_anything", "llmdet"],
-                        default="hybrid",
-                        help="Detector backend: yolo (YOLO-Worldv2), coco_yolo "
-                             "(closed-set YOLOv8), hybrid (COCO→YOLOv8 else "
-                             "YOLO-Worldv2), locate_anything, or "
-                             "llmdet (LLMDet + attention sinks)")
+                        help="Save nothing but traj_log.jsonl + grid_extent.json "
+                             "(skip the final occupancy map too)")
     parser.add_argument("--no-visualize", action="store_true", default=False,
-                        help="Skip rendering nav_history video after the run")
+                        help="Skip the full per-step map + RGB history and the "
+                             "nav_history video render (keeps just the final "
+                             "occupancy map)")
     parser.add_argument("--viz-output", type=str, default="./figs/nav_history.mp4",
                         help="Output path for the post-run navigation video")
     parser.add_argument("--viz-fps", type=int, default=5,
@@ -858,10 +850,8 @@ if __name__ == "__main__":
     cfg = Config("config/config.yaml")
     if args.query is not None:
         cfg.target_query = args.query
-    cfg.ig_source = args.ig_source
-    cfg.detector = args.detector
 
     run(cfg, save_enabled=not args.no_save,
-        visualize=not args.no_visualize,
+        save_video=not args.no_visualize,
         viz_output=args.viz_output,
         viz_fps=args.viz_fps)

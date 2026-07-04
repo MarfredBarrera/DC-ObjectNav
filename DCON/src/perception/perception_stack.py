@@ -73,7 +73,11 @@ class PerceptionStack:
         self.device = cfg.device
         self.scene_bounds = scene_bounds
 
-        self.mask_clip = MaskCLIPSemantics(device=self.device)
+        self.mask_clip = MaskCLIPSemantics(
+            device=self.device,
+            model_name=cfg.maskclip_model_name,
+            input_size=cfg.maskclip_input_size,
+        )
         # Single evidential field: aleatoric + epistemic uncertainty in one
         # forward pass via the Normal-Inverse-Gamma marginal (replaces the
         # ensemble whose only role was empirical epistemic from prediction var).

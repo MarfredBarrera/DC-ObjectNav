@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **DC-ObjectNav** is a robotics navigation system for direction-cognizant object navigation. It combines:
 - **3D Scene Understanding**: Learned feature fields with uncertainty quantification
-- **Semantic Grounding**: Vision-language models (MaskCLIP) for target object recognition
-- **Motion Planning**: A* graph-based and MPPI stochastic planning (with DIAL-MPC-style annealing)
+- **Semantic Grounding**: MaskCLIP for dense similarity maps + LLMDet (attention-sink-gated) for target detection
+- **Motion Planning**: MPPI stochastic planning (with DIAL-MPC-style annealing)
 - **Simulation Environment**: Habitat-sim integration for indoor scene simulation
 
 The system processes RGB-D observations from a robot, builds world-space 3D maps online, and plans trajectories to reach a text-queried target object — all in a single live loop.
@@ -18,47 +18,39 @@ The system processes RGB-D observations from a robot, builds world-space 3D maps
 DCON/
 ├── src/
 │   ├── config.py              # Global configuration (YAML-backed)
-│   ├── gaussians.py           # Gaussian splatting utilities
 │   ├── perception/            # Core perception pipeline
 │   │   ├── perception_stack.py # Main perception interface (observe, train, update maps)
-│   │   ├── featurefield.py    # Learned 3D feature field model (hash-grid + MLP)
+│   │   ├── featurefield.py    # EvidentialFeatureField: 3D feature field (hash-grid + MLP, NIG uncertainty)
 │   │   ├── grid.py            # Uncertainty, Occupancy, and Similarity grids
 │   │   ├── semantics.py       # MaskCLIP semantic feature extraction wrapper
-│   │   ├── obj_detection.py   # YOLO-World / COCO-YOLO / Grounding DINO + SamRefinedDetector
-│   │   ├── segmentation.py    # MobileSAM auto-mask-gen wrapper (whole-image segmentation)
+│   │   ├── obj_detection.py   # LLMDet detector (MM-Grounding-DINO + attention sinks)
 │   │   └── utils.py           # Unprojection and coordinate utilities
 │   ├── planning/              # Motion planning
-│   │   ├── astar.py           # A* graph-based pathfinder
 │   │   ├── mppi.py            # MPPI stochastic trajectory optimization (DIAL annealing)
-│   │   ├── pathfinder.py      # Pathfinding helpers
-│   │   └── utils.py           # Planning utilities
+│   │   └── utils.py           # FOV-raycast information-gain (compute_batch_fov_ig)
 │   ├── mask_clip/             # MaskCLIP semantic segmentation
 │   │   ├── MaskCLIP.py        # Main MaskCLIP interface
 │   │   ├── model.py           # Dense feature extraction from CLIP
 │   │   ├── clip.py            # CLIP model loading
 │   │   └── test_*.py          # Test scripts (require sample images in images/)
 │   ├── habitat/               # Habitat-sim integration
-│   │   ├── habitat_utils.py   # Scene initialization, pathfinding
+│   │   ├── habitat_utils.py   # Scene init, pathfinding, geodesic_distance
 │   │   └── sim_interface.py   # Robot control interface
 │   └── visualization/         # Plotting helpers (visualizer.py)
 │
-├── main.py                    # Primary entry: live perception + planning + execution loop
-├── perception.py              # Perception-only training loop (no planning)
-├── planner.py                 # Offline planner / map analysis class (reads pre-built maps)
-├── offline.py                 # Offline ensemble training from saved trajectories
-├── analysis.py                # Map analysis & figure generation
+├── main.py                    # Primary entry: live perception + planning + execution loop (run())
+├── evaluate.py                # Flat multi-episode SR/SPL eval over eval/episodes.yaml (calls main.run())
+├── eval_scene.py              # Per-scene sweep CLI: run / review / report stages (thin over eval_core)
+├── eval_core.py               # Eval logic (torch-free): scenarios, verdicts, aggregation, BEV evidence
 ├── visualize.py               # Renders nav_history.mp4 from traj_log.jsonl + saved maps
-├── 3dgs_trainer.py            # 3D Gaussian Splatting training
 ├── exploration_env.py         # Exploration policy definitions
-├── run.sh                     # Wrapper script (taskset + GPU selection)
 │
 ├── config/config.yaml         # Active config (YAML overrides Python defaults)
-├── output/                    # Results (scenes, maps, models, traj_log.jsonl)
+├── eval/episodes.yaml         # Hand-annotated episodes for evaluate.py (scene, query, start, goals)
+├── eval/scenarios_*.yaml      # Per-scene sweep specs for eval_scene.py (targets × starts, rect goals)
+├── output/                    # Results (scenes, maps, models, traj_log.jsonl; eval runs/, verdicts.yaml)
 ├── figs/                      # Generated figures and videos
-├── gibson_scenes/             # Scene assets (.glb)
-├── gsplat_viewers/            # Splatting viewer scripts
-├── SAM_models/                # MobileSAM weights (mobile_sam.pt, ~40 MB)
-└── test_object_detection.py   # Standalone detector + SAM smoke-test viz
+└── gibson_scenes/             # Scene assets (.glb)
 ```
 
 ## Core Architecture & Data Flow
@@ -69,16 +61,13 @@ The primary entry point. Three cadences in one process:
 
 | Cadence | Step trigger | Cost |
 |--------|--------------|------|
-| **A. Train** | every step | one gradient step on each ensemble member |
+| **A. Train** | every step | one gradient step on the evidential feature field |
 | **B. Replan + 1 agent action** | every `REPLAN_INTERVAL` (=100) steps | MPPI rollout + Habitat step |
 | **C. Refresh buffer + maps** | every `cfg.hash_buffer_refresh_interval` (=200) steps | observation, buffer insert, super-batch stage, BEV map recompute (slowest) |
 
-**Bootstrap** (before the main loop):
-1. **Spin**: rotate the agent through 36 × 10° = 360°, observing each frame.
-2. **Cold-train**: `BOOTSTRAP_TRAIN_STEPS=2000` gradient steps so the first BEV maps have signal.
-3. **First maps**: compute & save uncertainty / occupancy / similarity grids at step 0.
+**Startup** (before the main loop): a single observation seeds the replay buffer + occupancy, then the first BEV maps are built directly from the (untrained) feature field — no spin, no cold-train. The maps start as field noise / mostly-unseen and fill in online as the loop trains and cadence C recomputes them.
 
-After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, `action`, `ref_traj`, `opt_traj`, `mppi_cost` (= `-final_score`), `det_conf`, `det_box`, `sam_box`, `sam_score`, `goal`, `mode`, and `w_conf`. When MobileSAM produces a fresh mask, a bit-packed `.npz` is also written to `output/<scene>/sam_masks/sam_mask_<step:06d>.npz`. `visualize.py` consumes the log, saved BEV maps, and saved SAM masks to render `nav_history.mp4`.
+After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, `action`, `opt_traj`, `det_conf`, `det_box`, `goal`, `mode`, and `w_conf`. `visualize.py` consumes the log and saved BEV maps to render `nav_history.mp4`.
 
 ### Perception Pipeline (`src/perception/perception_stack.py`)
 
@@ -89,11 +78,11 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
 2. `update_replay_buffer()` — Unproject to world-space points, extract CLIP features via MaskCLIP, sub-sample to `hash_per_frame_cache_size`, then fold *the previous frame* into the flat `_HistoryBuffer` and hold the new frame out as `_latest_frame`.
 3. `update_occupancy()` — Voxelize depth into the occupancy grid (independent of the feature-field buffer).
 4. `make_super_batch()` — Stage one big GPU tensor for training: ~20% drawn from `_latest_frame`, ~80% sampled uniformly from `_HistoryBuffer` via one `randint` + gather (no concat over many chunks).
-5. `train_step(super_pts, super_feats)` — Sample a mini-batch from the staged super-batch and run one gradient step over every ensemble member.
-6. `update_maps()` — Forward-pass the trained ensemble through every BEV voxel; save epistemic uncertainty, aleatoric uncertainty, occupancy, and target-similarity maps.
+5. `train_step(super_pts, super_feats)` — Sample a mini-batch from the staged super-batch and run one gradient step on the feature field.
+6. `update_maps()` — Forward-pass the trained field through every BEV voxel; save epistemic uncertainty, aleatoric uncertainty, occupancy, and target-similarity maps.
 
 **Key concepts**:
-- **Feature Fields**: Hash-grid + MLP networks mapping 3D position → CLIP feature vector. Multiple are trained in parallel as an ensemble; ensemble disagreement = epistemic uncertainty.
+- **Feature Field** (`EvidentialFeatureField`): a single hash-grid + MLP mapping 3D position → CLIP feature vector, trained with an evidential (Normal-Inverse-Gamma) head. The NIG marginal yields **both** aleatoric and epistemic uncertainty in one forward pass — no ensemble (the previous multi-model ensemble, whose only role was empirical epistemic from prediction variance, was replaced by this).
 - **`_HistoryBuffer`**: Flat pre-allocated CPU ring of `(history_buffer_capacity, 3)` points and `(history_buffer_capacity, hash_feature_dim)` features. New points always enter; once full, each new point overwrites a uniformly random existing slot. Bounded memory (~412 MB CPU at 200k × 512-dim), continuous fresh-data dominance, O(batch) sampling with no `torch.cat` over many small chunks.
 - **`_latest_frame`**: The most-recent frame is held out of the history buffer so it contributes a guaranteed 20% of every super-batch (recent-frame oversample). Keeps fresh observations weighted regardless of buffer state.
 - **Query-Specific Maps**: Similarity grids are computed w.r.t. a text query (e.g., `cfg.target_query = "a pillow"`).
@@ -104,27 +93,33 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
 
 - Unicycle dynamics (turn-first integration), control vector `[v_cells_per_step, w_rad_per_step]`.
 - Cost terms (combined as a score; lower cost = higher score):
-  - **Goal-distance**: mean Euclidean from rollout waypoints to the single goal cell.
-  - **Collision (truncate-and-score)**: waypoint occupancy check; a rollout is frozen at its first collision (position, heading, controls zeroed) and scored on its surviving prefix plus a death penalty (`mppi_w_dead`) proportional to the lost horizon — so dying later scores better and a usable gradient survives even when every sample eventually collides (corners, clutter). No hard `-inf` masking: all rollouts keep softmax weight, so `U_nom` drifts toward the longer-surviving directions instead of stalling. The start cell and cells inside the goal-arrival radius are forgiven. Only rollouts that survive their *first* transition are eligible to be committed; if none do, `best_U=None` and the caller recovers (spin + horizon shrink).
-  - **Clearance**: smooth ESDF wall-proximity penalty `exp(-d/d0)` per step (`mppi_w_clearance`, `mppi_clearance_d0_m`), from a per-replan `cv2.distanceTransform` of the occupancy grid. Pulls samples away from walls before they're trapped; forgiven inside the goal-arrival radius.
-  - **Information gain**: FOV raycast against the IG map selected by `cfg.ig_source` — `"epistemic"` (masked field uncertainty), `"coverage"` (soft observation-count deficit; continuous, so the gradient survives after binary unseen is locally exhausted), or `"unseen"` (binary mask MPPI builds from occupancy, ignoring the supplied map); skipped when the IG weight is ~0 (EXPLOIT).
-- **DIAL action-level annealing** ([mppi.py:200-207](DCON/src/planning/mppi.py#L200-L207)): noise variance is *smaller* for early horizon indices (which will actually be committed) and grows toward the tail.
-- **DIAL trajectory-level annealing** ([mppi.py:216-222](DCON/src/planning/mppi.py#L216-L222)): noise variance shrinks across MPPI iterations — iter 0 is wide exploration, iter N-1 is local refinement.
-- **Exploration→exploitation schedule**: `scheduled_params(progress)` lerps `lambda_weight`, `w_ig`, `w_goal`, `cov_scale` from `*_start` to `*_end` based on `progress = step / iterations`.
+  - **Goal-distance**: mean squared *obstacle-aware* distance-to-go from rollout waypoints to the goal, scaled by the confidence-derived goal weight `w_conf`. The distance comes from a per-replan Dijkstra wavefront over the BEV seeded at the goal cell ([`goal_distance_field`](DCON/src/planning/utils.py)) — occupied cells are traversable at `mppi_occupied_cell_cost` per cell (so a goal projected onto the object surface still seeds a finite field, while crossing a wall costs ~thickness × that, losing to any indoor detour), and the field is anchored at the best cell in the agent's reachable component ([`reachable_min`](DCON/src/planning/utils.py): min over the start cell's 8-connected non-occupied region — NOT a global min, which an enclosed free pocket under/behind the goal furniture would hijack, inflating every reachable cell past the arrival radius so the agent orbits forever) so values ≈ free-space cells-to-go. In EXPLOIT, unseen cells additionally cost `mppi_unseen_cell_cost` (=3) each, so the committed approach prefers observed-free routes over optimistic shortcuts through unexplored space that may hide a wall and force an SPL-burning backtrack (SEARCH keeps unseen at cost 1 — exploration should enter unseen space). This kills the Euclidean corner local-minimum next to a wall with the goal on the far side: the gradient routes around geometry, the arrival test (`field ≤ arrival_radius`) can't leak across walls, and the caller's stop check reads the same field via `mppi.last_goal_dist_m` so TARGET REACHED can't fire through a wall either.
+  - **Collision (hard exclusion)**: waypoint occupancy check plus `mppi_collision_substeps` interpolated checks per segment (prevents tunneling through thin walls). Only the start cell is forgiven. In EXPLOIT a rollout that arrives (within the goal-arrival radius) is *frozen* at its first arrival waypoint (position pinned, controls zeroed) with an arrival bonus — so "reach the target, then sit" wins and doubles as the stopping behavior; the freeze is applied *before* the collision check, so collisions are judged on the executed trajectory (no phantom hits from the never-executed post-arrival tail) and the frozen cell itself must be free — there is no arrival-region collision forgiveness. Colliding rollouts never win the argmax; when NO rollout is safe (wedged), the softmax update instead weights by survival time (steps before first collision, goal proximity as tiebreak) so the nominal steers out of the pocket. If no safe rollout is found, `best_U=None` and the caller idles this replan.
+  - **Information gain**: FOV raycast (`compute_batch_fov_ig`) against the **epistemic-uncertainty** BEV map (masked field uncertainty); skipped when the IG weight is ~0 (EXPLOIT).
+- **DIAL action-level annealing**: noise variance is *smaller* for early horizon indices (which will actually be committed) and grows toward the tail.
+- **DIAL trajectory-level annealing**: noise variance shrinks across MPPI iterations — iter 0 is wide exploration, iter N-1 is local refinement.
 - **Warm-start**: previously committed control sequence is shifted left by one step at the start of each replan.
 - **Sample 0 pinned to zero noise** so the unmutated warm-start is always evaluated.
 
-**A\* (`src/planning/astar.py`)**: graph search over occupancy grid with Euclidean heuristic. Used for sanity-check / fallback paths; the primary planner is MPPI.
+**Continuous→discrete action mode** (`cfg.discrete_actions`, default off): MPPI stays continuous, but a low-level **tracking controller** ([`discrete_action_from_plan`](DCON/main.py)) converts each replan's optimized path into ONE Habitat ObjectNav primitive — MOVE_FORWARD (`discrete_forward_m`=0.25 m), TURN_LEFT/RIGHT (`discrete_turn_deg`=30°), or STOP — executed via [`SimInterface.step_discrete`](DCON/src/habitat/sim_interface.py). Pure-pursuit: it takes the bearing to the first waypoint ≥ `discrete_lookahead_m` ahead and turns toward it when the heading error exceeds half a turn, else steps forward; receding-horizon replans correct drift. Turn direction is mapped onto Habitat yaw via `mppi_w_sign` (same sign the continuous `step` uses). Each primitive counts against `max_agent_steps` (=500) — exhausting it without self-stopping is a timeout/failure. This makes SR/SPL directly comparable to VLFM / Goal-Oriented Semantic Exploration in the discrete ObjectNav challenge. `traj_log.jsonl` logs the primitive name as `action` in this mode (nothing downstream consumes it; `visualize.py` reads only `heading`).
 
-**Goal selection** ([main.py:plan_one_action](DCON/main.py)): three-layer priority for picking the cell MPPI aims at.
+**Goal selection** ([main.py:plan_one_action](DCON/main.py)): each replan a detection is first **classified** by distance + size, then the goal cell is chosen by a three-layer priority.
 
-1. **Fresh SAM-refined detection** — if the detector fires this replan AND its score beats the cached max, run [`bev_cells_from_sam`](DCON/main.py): MobileSAM auto-mask-gen on the WHOLE image (no box prompt), score every mask by mean MaskCLIP similarity to `cfg.target_query`, pick the best mask (if it clears `sam_min_clip_sim`), unproject its pixels to BEV cells, then `argmax(bev_sim)` restricted to those cells. The mask is cached on `segmenter.last_mask` and the goal cell is cached as `last_box_goal`/`last_box_conf`.
-2. **Cached box-goal** — no fresh detection this frame but a previous box-derived goal exists → reuse that fixed world cell so the agent commits to the strongest historical sighting instead of chasing a transient peak.
+**Detection classification** ([`classify_detection`](DCON/main.py)) sorts a detection into three bands using the agent→object distance (box-center depth) and the box's image-area fraction, returning two flags `(is_persistent, contributes_confidence)`:
+- **too close** — `dist < detected_min_dist_m` OR `box_frac > detected_max_box_frac` → ignored entirely (no goal, no confidence weight, no latch); the box fills the frame and carries no usable localization.
+- **too far** — `dist > detected_max_dist_m` OR `box_frac < detected_min_box_frac` → *investigate*: sets/caches the goal and pulls the confidence weight, but is NOT persistent (won't latch).
+- **usable band** — anything else → *persistent*: investigate + contribute confidence AND count toward the latch streak.
+
+So the agent steers toward a distant sighting and only commits to it once it has closed into the usable band. A missing box or unrangeable depth → ignored.
+
+**Goal-cell priority:**
+1. **Fresh detection goal** — if this replan's detection is worth investigating (`det_investigate`, i.e. not *too close*), project its box into a goal cell via [`bev_cell_from_box_center`](DCON/main.py): unproject a small patch around the box-center pixel to one world point and use that BEV cell **verbatim** (no argmax, no snapping); relies on LLMDet's tight boxes. A goal cell on the object surface is fine: in EXPLOIT, MPPI freezes each rollout at its first waypoint within the goal-arrival radius and excludes it if that cell is occupied, so winning rollouts stop on free cells near the surface rather than entering it. In SEARCH mode every investigated detection re-projects, so the cache (`last_box_goal`) tracks the **most recent** bounding box.
+2. **Cached box-goal** — no fresh investigated detection this frame but a cached box-goal exists → reuse that fixed world cell. In EXPLOIT the detector is throttled off, so the cache freezes on the object that triggered the latch and the agent commits to it.
 3. **Global similarity argmax** — neither: pick the global argmax of observed BEV similarity (exploration default).
 
-Rationale for layer 1: at distance the detector's box is often offset by ~one box-width, so anchoring SAM on the box propagates that error. Whole-image auto-gen lets SAM find object boundaries from scratch and CLIP picks the right one. The detector is only a trigger.
+**Detector throttle in EXPLOIT** ([main.py](DCON/main.py)): once latched the goal is pinned to the cached cell, so the detector runs only every `exploit_redetect_interval` replans (`<=0` → never re-detect after latching, reuse the cache for the rest of the run). SEARCH always detects every replan.
 
-**Goal weight (MPPI `w_conf`)** is independent of which layer fired: `EXPLOIT` (latched once `det_score >= detected_conf_threshold` for `detected_persistence` consecutive replans) pins `w_conf=1.0` so the agent commits hard; `SEARCH` passes raw `det_score` and MPPI's hysteresis (`exploit_conf = max(incoming, prev * conf_decay)`) ratchets up on sightings and decays after misses.
+**Latching / goal weight (MPPI `w_conf`)**: `detected` latches once `detected_persistence` consecutive *persistent* (usable-band) detections accrue — there is no separate latch score threshold; the detector's own floor (`llmdet_threshold`) bounds every surviving box's score — a non-persistent frame resets the streak; never unlatches. `EXPLOIT` pins `w_conf=1.0` so the agent commits hard; `SEARCH` passes the per-frame detection score (zeroed for *too-close* detections so they don't pull the goal weight) and MPPI's hysteresis (`exploit_conf = max(incoming, prev * conf_decay)`) ratchets up on sightings and decays after misses.
 
 ### Semantics (`src/mask_clip/`)
 
@@ -135,18 +130,25 @@ Rationale for layer 1: at distance the detector's box is often offset by ~one bo
 - Per-pixel similarity: `patch_features @ text_features.T`, normalized to [0, 1].
 - **Frozen**: weights never update. The feature fields learn *where* in 3D to render these embeddings.
 
-### Object Detection + Goal Refinement (`src/perception/obj_detection.py`, `segmentation.py`)
+### Object Detection (`src/perception/obj_detection.py`)
 
-**Detectors** (all share `detect(image, query) → (score, box)`; pick via `cfg.detector`):
-- `yolo` — YOLO-Worldv2 open-vocabulary (~15 ms/frame, default).
-- `coco_yolo` — closed-set YOLOv8 over the 80 COCO classes (fastest, returns 0 for non-COCO queries).
-- `hybrid` — COCO-matching queries → `coco_yolo`, everything else → `yolo` (mirrors the VLFM paper's hybrid scheme but swaps Grounding DINO for YOLO-World on the open-vocab branch).
-- `grounding_dino` — open-vocab Grounding DINO Tiny (~200 ms/frame, better on natural-language phrases).
-- `sam_refined` — composite: base detector triggers + MobileSAM whole-image auto-gen + MaskCLIP best-mask scoring. Returns the SAM mask's bbox + CLIP score. Mainly for the standalone smoke test; the live loop reaches for the same pipeline directly via `bev_cells_from_sam`.
+All detectors share `detect(image, query) → (score, box)`; `make_detector(cfg)` picks one.
 
-**MobileSAM** ([segmentation.py](DCON/src/perception/segmentation.py)): thin wrapper around MobileSAM's `SamAutomaticMaskGenerator`. Returns one mask dict per discovered object — class-agnostic. Semantic identity comes from MaskCLIP scoring downstream. Loaded once at startup from `cfg.sam_checkpoint` (default `SAM_models/mobile_sam.pt`). Failed load is non-fatal: EXPLOIT falls back to the older box-based path with a warning.
+**`LLMDetDetector`** (default) — LLMDet (MM-Grounding-DINO + LLM-supervised backbone) via HuggingFace, with the **training-free attention sinks** of Ruis et al. (ICLR 2026) for background false-positive mitigation. MUST load `iSEE-Laboratory/llmdet_{tiny,base,large}` (`model_type="mm-grounding-dino"`, native in transformers ≥4.52); the `fushh7/*_hf` weights declare plain `grounding-dino` and load with a broken, non-discriminative contrastive head — do NOT use them. Sinks reuse `[unused*]` vocab slots (init proved **inert** — the BERT text encoder recontextualizes them); a box survives only if its query phrase out-scores every sink. `detect_all` returns every sink-gated box ≥ τ (the cascade uses it); `detect` returns the top one. Config: `llmdet_model_name`, `llmdet_threshold` (= τ), `llmdet_use_sinks`, `llmdet_num_sinks` (48), `llmdet_sink_init`.
 
-**State side channel**: when `bev_cells_from_sam` picks a winning mask, it stashes the 2D bool mask, bbox, and CLIP score on `segmenter.last_mask / last_box / last_score`. The main loop reads these immediately after the plan call to persist the mask to `output/<scene>/sam_masks/sam_mask_<step:06d>.npz` (bit-packed via `np.packbits` for ~8× compression) and writes `sam_box` / `sam_score` into the traj log. `visualize.py` looks these up and overlays a green-tinted mask + bbox on the RGB panel.
+**`CascadeDetector`** (`cfg.detector_cascade=True`) — two-stage **propose→verify** to cut the geometric-look-alike false positives LLMDet's sinks are structurally blind to (a genuine look-alike produces a real high query score, so no sink out-scores it). `LocateAnythingDetector` (NVIDIA LocateAnything-3B, a generative Qwen-VL-style grounding model — architecturally unlike DINO, so its FPs are largely *uncorrelated*) **proposes** a box; LLMDet **verifies** — a frame counts as a detection only when a sink-gated LLMDet box ≥ τ overlaps the proposal with `IoU ≥ cfg.cascade_min_iou`. The returned `(score, box)` is the *verifier's*, so τ, the latch, and goal projection are unchanged — only *which frames register* changes, so `w_conf` updates only on cross-verified sightings. The proposer runs first and the verifier only when it fires, bounding cost by the proposal rate; still ~2× SEARCH detector latency and some recall loss (a TP only one model catches is dropped). `cascade_min_iou ≤ 0` drops the spatial check. LocateAnything-3B is a ~7 GB HF download (`trust_remote_code`; remote code auto-patched for Python 3.9). Config: `detector_cascade`, `locate_anything_model_name`, `locate_anything_max_new_tokens`, `cascade_min_iou`.
+
+The YOLO-Worldv2 / COCO-YOLOv8 / VLFM-hybrid backends were removed earlier — recover from git history if ever needed.
+
+**LLMDet threshold (τ) calibration** — `llmdet_threshold` is the per-box query-score floor; raising it trades true-positive recall for background-FP rejection. From a 60-frame sweep (87 COCO-YOLO-oracle TPs, 600 out-of-domain FPs) on the **large** model. TP-ret = true-positive retention at the τ that achieves the target background FP-rejection:
+
+| target FP-rejection | τ (sinks48) | TP-ret (sinks48) | τ (no-sinks) | TP-ret (no-sinks) |
+|---|---|---|---|---|
+| 90% | 0.38 | 0.94 | 0.49 | 0.89 |
+| 95% | 0.41 | 0.87 | 0.56 | 0.74 |
+| 99% | 0.47 | 0.71 | 0.68 | 0.54 |
+
+`large` beats `tiny`/`base` (no-sink separation 0.32 vs 0.24); sinks help most at the aggressive end (99% FP-rej: TP-ret 0.54→0.71). Default `llmdet_threshold=0.42` ≈ the 95% FP-rejection point; use ~0.47 for ~99% (toward the paper's near-elimination). Numbers are from rendered frames in these scenes — re-validate τ on real data.
 
 ### Grids (`src/perception/grid.py`)
 
@@ -154,8 +156,8 @@ Three complementary BEV representations:
 
 | Grid Type | Purpose | Input | Output (per voxel) |
 |-----------|---------|-------|-------------------|
-| **UncertaintyGrid** | Epistemic + aleatoric | Ensemble forward-pass disagreement | 2 scalars; observed-FREE voxels zeroed when `mask_free_epistemic` (field never trains on air → free-air uncertainty is phantom noise; BEV reduction switches to max-over-Y) |
-| **OccupancyGrid** | Free / occupied / unseen + soft coverage | Depth voxelization (incremental) | trinary value + quality-weighted observation count (`min(1,(coverage_ref_dist_m/d)²)` per confirming view); BEV deficit `exp(-coverage/coverage_tau)` is the graded exploration signal |
+| **UncertaintyGrid** | Epistemic + aleatoric | Evidential (NIG) field forward-pass | 2 scalars; observed-FREE voxels zeroed when `mask_free_epistemic` (field never trains on air → free-air uncertainty is phantom noise; BEV reduction switches to max-over-Y) |
+| **OccupancyGrid** | Free / occupied / unseen | Depth voxelization (incremental) | trinary value |
 | **SimilarityGrid** | Target relevance | Mean CLIP feature ⋅ text-query embedding | 1 scalar |
 
 **Coordinates**: World space with `scene_bounds = ((xmin,ymin,zmin),(xmax,ymax,zmax))`; BEV cells index `(z, x)`; `y` is ignored for planning.
@@ -169,44 +171,58 @@ Three complementary BEV representations:
 cd DCON
 python main.py --gpu 0 --query "a pillow"
 ```
-Runs bootstrap (spin + cold-train), then the three-cadence main loop. Outputs to `output/current_scene/`: RGB frames, BEV maps (`.npy`), `grid_extent.json`, `traj_log.jsonl`, and ensemble checkpoints.
+Seeds the maps from one observation (no spin/cold-train), then runs the three-cadence main loop. Outputs to `output/current_scene/`: always `traj_log.jsonl` + `grid_extent.json`; `save_enabled` (default) adds the final occupancy BEV `.npy`; `save_video` (the `--no-visualize` inverse) adds the full per-step BEV map + RGB history and renders `nav_history.mp4`. No feature-field checkpoint is written. `main.run(cfg, start_pos=..., start_rotation=..., goals=..., success_radius_m=..., save_enabled=..., save_video=...)` is also importable and returns a per-episode metrics dict (`success`, `spl`, `l_geodesic`, `final_geodesic`, `path_length`, `agent_stopped`, `final_pos`, `start_nav`, `success_radius_m`, `steps`; used by `evaluate.py` and `eval_scene.py`).
 
-**2. Perception-only training**
-```bash
-python perception.py --gpu 0 --query "a pillow"
-```
-Or with the wrapper:
-```bash
-./run.sh -g 0 -c 112-127 -q "a pillow"
-```
-Same perception pipeline, but the agent follows a fixed policy (default: spin) instead of MPPI plans. Useful for collecting training data without entangling planner behavior.
+**Goals** (for both evaluators) may be **points** (`[x, y, z]`) or **axis-aligned rectangles** (`{rect: [x_min, z_min, x_max, z_max], y: <height>}`, e.g. a table footprint). Success/geodesic score against the **nearest point** of the goal ([`nearest_goal_point`](DCON/main.py) clamps the agent's x,z into the rectangle). Success is **geodesic** distance (navmesh shortest path via `geodesic_distance`) — matching the Habitat ObjectNav challenge; there is no straight-line success mode. `final_pos` is recorded so runs can be re-inspected/re-scored offline.
 
-**3. Offline ensemble training**
+**2. Flat multi-episode evaluation (SR / SPL)**
 ```bash
-python offline.py
+python evaluate.py --episodes eval/episodes.yaml --gpu 0 --out output/eval_run1
 ```
-Replays a saved RGB-D trajectory and trains the ensemble from disk. Uses `hash_replay_buffer_size` for its own offline sampling logic (separate from the live `_HistoryBuffer`).
+Runs each hand-annotated episode (scene, query, start pos, goals) through `main.run()` in-process and aggregates **Success Rate** and **SPL**. Success = the agent self-stops within `success_radius_m` geodesic of a goal; SPL weights each success by `geodesic(start, nearest_goal) / max(geodesic, path_traveled)`. Writes `<out>/results.json`.
 
-**4. Map / trajectory analysis**
+**3. Sweep with human adjudication (`eval_scene.py`)**
 ```bash
-python analysis.py
+python eval_scene.py run    --scenarios eval/scenarios_Goffs.yaml --out output/goffs   # execute + save evidence
+python eval_scene.py review --scenarios eval/scenarios_Goffs.yaml --out output/goffs   # (re)build verdicts.yaml + BEV evidence
+# ...inspect output/goffs/ep/<id>/ (nav_history.mp4, bev_final.png), edit verdicts.yaml...
+python eval_scene.py report --out output/goffs                                          # aggregate SR/SPL
+```
+Episodes come from `--scenarios` (a hand-written per-scene sweep of **targets × start positions**; `runs_per_combo` repeats each; run id `{target}__{start}[__r{k}]`) **or** `--dataset` (standard benchmark episodes; below). Either way the pipeline separates **evidence** from **judgment**:
+- **`run`** executes each combo (skips completed unless `--rerun`), saving a raw record to `runs/<id>.json` + an evidence bundle in `ep/<id>/`. Evidence is **minimal by default** — `traj_log.jsonl`, `grid_extent.json`, the FINAL occupancy BEV `.npy`, and `bev_final.png` (goals/start/final marked) — a few tens of KB per run. `--video` adds the full per-step BEV map + RGB history and renders `nav_history.mp4` (megabytes/run). `--no-evidence` keeps only `traj_log` + `grid_extent`. The feature-field checkpoint is never saved (nothing consumes it). Bakes in no verdict — auto-success is only a suggestion.
+- **`review`** (re)generates a single **`verdicts.yaml`** (one entry per run, `status: auto|success|fail|exclude`, pre-filled with the auto-suggestion + evidence inline as comments). Preserves your edits on re-run. This is the authoritative human judgment (replaces the older exclude/override files).
+- **`report`** aggregates SR/SPL from records + verdicts → `results.json` (auto = use computed success; success/fail = override with SPL recomputed; exclude = drop). Per-combo rollup included.
+
+Key flags: `run` **requires `--scenarios` or `--dataset`**; **omit both for `review`/`report`** to aggregate exactly the records on disk in `<out>/runs/` (immune to a since-changed source file — passing a mismatched one warns about ignored records). `--verdicts <name|path>` chooses which verdicts file to score (bare name resolves under `<out>`; results file is named to match so curations don't clobber). `--discrete` runs in discrete-action mode. `--only <id...>` restricts the set. Scenario targets accept an optional per-target `success_radius_m`. `eval_core.py` holds the torch-free logic (importable without CUDA); only `run` imports `main.run`.
+
+**Standard ObjectNav benchmark episodes (`--dataset`)** — evaluate on the same episode datasets VLFM / Goal-Oriented Semantic Exploration report on (Gibson/SemExp, HM3D, MP3D), while the custom `--scenarios` path stays available:
+```bash
+python eval_scene.py run --dataset <path-to-split-or-json.gz> --out output/gibson_val \
+    --discrete --scenes-root gibson_scenes [--categories chair toilet] [--scenes Collierville] [--max-per-combo 5]
+```
+[`eval_core.load_objectnav_dataset`](DCON/eval_core.py) parses the habitat-lab ObjectNav-v1 schema (`content/<scene>.json.gz`; goal instances inline or in `goals_by_category`) into the same run specs the scenarios path produces — `review`/`report`/`verdicts.yaml` work unchanged. Per episode it carries: the local scene `.glb` (resolved `<scenes-root>/<scene_stem>.glb`; episodes with no local scene are skipped with a warning), the episode's `start_rotation` (honored at spawn), the query `"a {category}"`, all goal-instance positions (success = geodesic to the nearest ≤ `--radius`, default 1.0 m — the "stop within 1 m of the object" protocol), and a per-floor **BEV height band** derived from the start Y (`BEV_BAND_ABOVE_FLOOR` = floor+0.2..floor+1.5 — benchmark scenes are multi-floor, so the static config band is overridden per run). Run id `{category}__{scene}__ep{episode_id}`; the per-combo rollup then groups by (category × scene). For challenge-comparable numbers pass `--discrete` (25 cm / 30° primitives, 500-step budget). Note the datasets + scene assets themselves must be downloaded separately; only Gibson `.glb`s are in the repo (the Gibson-val benchmark scenes are Collierville, Corozal, Darden, Markleeville, Wiconisco — the first two are present).
+
+**4. Trajectory video**
+```bash
 python visualize.py --config config/config.yaml --output ./figs/nav_history.mp4 --fps 5
 ```
-`analysis.py` plots uncertainty/occupancy/similarity maps. `visualize.py` reads `traj_log.jsonl` + saved BEV maps and renders the navigation video.
+`visualize.py` reads `traj_log.jsonl` + saved BEV maps and renders the navigation video.
 
 ### Configuration
 
 All hyperparameters live in [src/config.py](DCON/src/config.py). YAML in [config/config.yaml](DCON/config/config.yaml) overrides Python defaults.
 
 Key settings:
-- **Perception**: `target_query`, `ensemble_num_models`, `iterations`, `device`.
+- **Perception**: `target_query`, `iterations`, `device`.
 - **Habitat**: `scene_path`, `img_width`, `img_height`, `fov`, `sensor_height`.
 - **MaskCLIP**: `maskclip_model_name` ("ViT-B/16"), `maskclip_input_size` (448).
 - **Hash-grid training**: `hash_train_batch_size`, `hash_buffer_refresh_interval`, `hash_per_frame_cache_size`, `history_buffer_capacity`, `hash_feature_dim`.
-- **MPPI**: `mppi_dt`, `mppi_max_v_mps`, `mppi_max_w_rps`, `mppi_num_iters`, `mppi_anneal_beta_action`, `mppi_anneal_beta_traj`, `mppi_*_start`/`mppi_*_end` for the schedule.
-- **Detection**: `detector` (`yolo` / `coco_yolo` / `hybrid` / `grounding_dino` / `sam_refined`), `detected_conf_threshold`, `detected_persistence`, `stop_distance_m`.
-- **MobileSAM**: `use_mobile_sam` (toggle the SAM goal-refinement path), `sam_checkpoint` (default `SAM_models/mobile_sam.pt`), `sam_points_per_side` (auto-gen density; 16 → ~0.5 s/call, 32 → ~2 s/call), `sam_pred_iou_thresh`, `sam_stability_score_thresh`, `sam_min_mask_region_area`, `sam_min_mask_pixels` (post-gen mask size floor), `sam_min_clip_sim` (CLIP-score floor for accepting a mask), `sam_lookback_steps` (viz-only: how far back to grab the most recent saved SAM mask when overlaying on a viz frame).
-- **Coverage / uncertainty masking** (`grid:` YAML section): `mask_free_epistemic` (zero epistemic/aleatoric at observed-FREE voxels — the field never trains on air, so free-air uncertainty is phantom noise over traversed rooms; also switches the uncertainty BEV reduction from bottom-k-mean to max-over-Y), `coverage_ref_dist_m` (observations closer than this earn a full count, farther ones `(ref/d)²`), `coverage_tau` (coverage deficit = `exp(-count/tau)`; ≈ number of full-quality views that drain a voxel's exploration pull). `--ig-source coverage` makes MPPI raycast the soft deficit instead of binary unseen or field epistemic.
+- **MPPI** (`planning:` YAML): `mppi_dt`, `mppi_max_v_mps`, `mppi_max_w_rps`, `mppi_horizon`, `mppi_num_iters`, `mppi_anneal_beta_action`, `mppi_anneal_beta_traj`, `mppi_w_goal`, `mppi_w_ig`, `mppi_lambda`, `mppi_collision_substeps`, `mppi_occupied_cell_cost` (goal-distance-field wall-crossing penalty), `mppi_unseen_cell_cost` (EXPLOIT-only unseen-cell penalty in the same field), and the confidence-hysteresis knobs (`mppi_conf_*`).
+- **Discrete actions** (`planning:` YAML): `discrete_actions` (off = continuous velocity; on = Habitat ObjectNav primitives via the tracking controller), `discrete_forward_m` (0.25), `discrete_turn_deg` (30), `discrete_lookahead_m` (0.5), `max_agent_steps` (500 primitive budget).
+- **Detection**: `detected_persistence`, `stop_distance_m`, `exploit_redetect_interval` (replans between detector runs once latched; `<=0` = never re-detect after latching). Detection-classification gates (each disables at `<=0`): `detected_min_box_frac` / `detected_max_box_frac` (box area as a fraction of the image) and `detected_min_dist_m` / `detected_max_dist_m` (agent→object distance, m) — *too close* (near OR fills the frame) is ignored, *too far* (distant OR tiny) investigates but doesn't latch, *usable band* latches.
+- **LLMDet**: `llmdet_model_name`, `llmdet_threshold`, `llmdet_use_sinks`, `llmdet_num_sinks`, `llmdet_sink_init` (see the LLMDet section above).
+- **Detection cascade**: `detector_cascade` (LocateAnything→LLMDet propose→verify; cuts look-alike FPs at ~2× SEARCH detector latency), `cascade_min_iou`, `locate_anything_model_name`, `locate_anything_max_new_tokens` (see the Object Detection section above).
+- **Uncertainty masking** (`grid:` YAML section): `mask_free_epistemic` (zero epistemic/aleatoric at observed-FREE voxels — the field never trains on air, so free-air uncertainty is phantom noise over traversed rooms; also switches the uncertainty BEV reduction from bottom-k-mean to max-over-Y).
 
 ## Testing
 
@@ -218,16 +234,6 @@ python test_mask_class.py  # MaskCLIP class API
 ```
 Both require sample images in `images/`; they generate heatmap + overlay visualizations.
 
-Detector + SAM standalone smoke test:
-```bash
-cd DCON
-# Bare detector: red bbox on the input image
-python -m src.perception.obj_detection yolo "a pillow" output/current_scene/rgbs/rgb_000.png
-# Full SAM-refined pipeline: red box = base detector, green mask + box = SAM-refined.
-python -m src.perception.obj_detection sam_refined "a pillow" output/current_scene/rgbs/rgb_000.png
-```
-Writes to `figs/det_<backend>_<query>.png`. The `sam_refined` overlay shows whether SAM correctly picked the right mask vs. the detector's (often offset) box.
-
 ## Common Development Tasks
 
 ### Adding a New Planner
@@ -236,39 +242,36 @@ Writes to `figs/det_<backend>_<query>.png`. The `sam_refined` overlay shows whet
 3. Add a config flag or argparse switch to choose between planners at runtime.
 
 ### Tweaking Perception
-- **Loss weights**: [src/config.py](DCON/src/config.py) (`ssim_weight`, `l1_weight`).
-- **Ensemble size**: `cfg.ensemble_num_models`.
 - **Buffer size / freshness**: `history_buffer_capacity` (larger = more history, slower drift; smaller = faster turnover, more recency bias).
-- **Uncertainty computation**: `src/perception/grid.py` (`UncertaintyGrid` methods).
+- **Uncertainty computation**: `src/perception/grid.py` (`UncertaintyGrid` methods) + the evidential head in `src/perception/featurefield.py` (`EvidentialFeatureField`).
 
 ### Tweaking the planner
-- **Cost weights**: `mppi_w_goal`, `mppi_w_ig`, `mppi_w_dead` (collision-truncation penalty), `mppi_w_clearance` / `mppi_clearance_d0_m` (wall-proximity penalty).
+- **Cost weights**: `mppi_w_goal`, `mppi_w_ig`; the confidence curve (`mppi_conf_weight_a`, `mppi_conf_weight_scale`, `mppi_conf_decay`, `mppi_conf_threshold`) shapes how detection confidence trades goal pull against IG.
 - **Annealing aggressiveness**: `mppi_anneal_beta_action`, `mppi_anneal_beta_traj` — smaller β = sharper annealing.
-- **Sampling envelope**: `mppi_cov_scale_start` / `_end`.
+- **Collision robustness**: `mppi_collision_substeps` (thin-wall tunneling checks).
 
 ### Debugging Semantic Grounding
 - Visualize MaskCLIP heatmaps: `src/mask_clip/test_mask_class.py`.
-- Check similarity BEV map: `analysis.py` plots `bev_similarity_*.npy`.
+- Check similarity BEV map: load saved `bev_similarity_*.npy` with `np.load()` + `plt.imshow()`.
 - Tweak query: `cfg.target_query` (favors "a [object]" phrasing for better CLIP grounding).
 
 ### Adding Visualization
 - `src/visualization/visualizer.py` (matplotlib-based).
-- Extend `analysis.py` for new plot types.
 - Saved maps are `.npy`; load with `np.load()` + `plt.imshow()`.
 
 `render_combined_grid` layout (2×3) used by `nav_history.mp4`:
 | | col 0 | col 1 | col 2 |
 |---|---|---|---|
-| **row 0** | Agent View (RGB w/ detector + SAM overlays) | _(empty)_ | BEV Similarity |
+| **row 0** | Agent View (RGB w/ detector bbox) | _(empty)_ | BEV Similarity |
 | **row 1** | Epistemic Uncertainty | Occupancy | Uncertainty + Occupancy overlay |
 
-The RGB panel composites in order: detector bbox (red) → SAM mask tint + bbox (green) → score label. SAM overlays come from the most recent saved `sam_masks/sam_mask_<step>.npz` within `cfg.sam_lookback_steps` of the current viz frame.
+The RGB panel draws the accepted detector bbox (red) from the most-recent plan step's `det_box`.
 
 ## Key Invariants & Patterns
 
 1. **Coordinate Systems**: World space (Habitat / simulator) vs. BEV voxel indices (in grids); unprojection maps camera→world via depth + camera pose.
-2. **Ensemble as Uncertainty**: Don't mock disagreement — train separate models with independent inits.
-3. **Frozen Semantics**: MaskCLIP weights are static; the feature fields learn *where* in 3D to render those embeddings.
+2. **Evidential Uncertainty**: a single `EvidentialFeatureField` yields aleatoric + epistemic uncertainty from its Normal-Inverse-Gamma head in one forward pass — no ensemble.
+3. **Frozen Semantics**: MaskCLIP weights are static; the feature field learns *where* in 3D to render those embeddings.
 4. **Streaming Data**: Perception is online. The `_HistoryBuffer` keeps a bounded-memory snapshot of past observations; the `_latest_frame` oversample guarantees fresh data participates in every gradient step.
 5. **BEV Representation**: Plans operate in top-down (z, x) space; y is ignored for planning.
 6. **Receding Horizon**: MPPI computes an H-step plan, but only the first action of `U_opt` is executed before the next replan. `last_U` carries the rest forward as a warm-start.
@@ -278,23 +281,21 @@ The RGB panel composites in order: detector bbox (red) → SAM mask tint + bbox 
 - **PyTorch** (CUDA 11.8+)
 - **Habitat-sim**: physics simulator, scene loading, agent control
 - **CLIP** (OpenAI): frozen vision-language model
-- **MobileSAM**: `pip install git+https://github.com/ChaoningZhang/MobileSAM.git`, weights at `SAM_models/mobile_sam.pt` (~40 MB)
-- **Ultralytics** (`pip install ultralytics`): YOLO-World / YOLOv8 detectors
+- **Transformers** (HuggingFace): the detectors — downloads `iSEE-Laboratory/llmdet_{tiny,base,large}` (MM-Grounding-DINO, native in transformers ≥4.52) on first use, plus `nvidia/LocateAnything-3B` (~7 GB, `trust_remote_code`) when `detector_cascade` is on.
 - **NumPy, Matplotlib, PIL, imageio, OpenCV**: data processing and visualization
 - See `requirements.txt` for pinned versions
 
-GPU memory: ~12 GB recommended for training (multi-model ensemble + super-batch staging).
+GPU memory: ~12 GB recommended for training (feature field + super-batch staging).
 CPU memory: ~500 MB for the `_HistoryBuffer` at default capacity (200k × 512-dim features).
 
 ## Debugging Tips
 
-- **Out-of-memory (GPU)**: reduce `ensemble_num_models`, `hash_train_batch_size`, or `hash_buffer_refresh_interval`.
+- **Out-of-memory (GPU)**: reduce `hash_train_batch_size` or `hash_buffer_refresh_interval`.
 - **Out-of-memory (CPU)**: reduce `history_buffer_capacity` (linear in feature-dim × capacity).
 - **NaN losses**: check input normalization (esp. CLIP embeddings); verify depth values are in `[min_sensor_dist, max_sensor_dist]`.
-- **Planner picks bad goals**: inspect `bev_sim` peak via `analysis.py`; tweak `cfg.target_query` phrasing.
-- **Agent wedged / dwelling in corners**: every sampled rollout dies early so `best_U=None` and the caller falls back to a recovery spin. Raise `mppi_w_clearance` / `mppi_clearance_d0_m` so the agent keeps more wall distance and doesn't get pinned, raise `mppi_w_dead` so the planner discriminates harder between early- and late-dying rollouts (approaches hard elimination), or check occupancy dilation (too aggressive seals narrow gaps).
+- **Planner picks bad goals**: inspect the saved `bev_similarity_*.npy` peak; tweak `cfg.target_query` phrasing.
+- **Agent wedged / dwelling in corners**: every sampled rollout collides so `best_U=None` and the loop idles that replan (the survival-time weighting steers subsequent iterations out of the pocket). Check occupancy dilation (too aggressive seals narrow gaps) and `agent_radius` (the navmesh insets walls by it, so gaps the BEV considers open can be sealed in the navmesh).
 - **Trajectory video looks wrong**: check `grid_extent.json` matches the scene bounds and that `traj_log.jsonl` was written cleanly (one JSON per line).
-- **`[init] MobileSAM unavailable`** at startup: weights missing or `mobile_sam` package not installed. Install via `pip install git+https://github.com/ChaoningZhang/MobileSAM.git` and place weights at `cfg.sam_checkpoint`. The run continues without SAM (EXPLOIT falls back to the box-based path).
-- **SAM never produces a goal** (no `sam_mask_*.npz` ever written): lower `sam_min_clip_sim` (default 0.18) — the CLIP scores on the chosen mask aren't clearing the floor. Use the `sam_refined` standalone test to inspect actual scores per frame.
-- **SAM picks the wrong mask** (e.g. couch when target is pillow): raise `sam_min_clip_sim`, or bump `sam_points_per_side` from 16 → 24/32 so SAM proposes finer-grained candidates.
-- **SAM is too slow**: `sam_points_per_side=16` is ~0.5 s/call; drop to 12 for a small cost in mask coverage. SAM only runs when the detector fires AND beats the cached score, so total per-run overhead is bounded.
+- **Never latches into EXPLOIT** (stuck exploring): the detection never reaches the *usable band*. Check the classification gates — widen `detected_max_dist_m` (object farther than the threshold only investigates, never latches), lower `detected_min_box_frac`, or raise `detected_max_box_frac`. Latching also needs `detected_persistence` consecutive usable-band frames (the score floor is the detector's own `llmdet_threshold`).
+- **Latches too eagerly / on the wrong thing**: tighten the band — lower `detected_max_dist_m` so it must get closer, raise `detected_min_box_frac` so tiny far blobs only investigate, or raise `detected_persistence`.
+- **Agent ignores an obvious nearby target** (box fills the frame): the *too-close* gate is dropping it — lower `detected_min_dist_m` or raise `detected_max_box_frac`.

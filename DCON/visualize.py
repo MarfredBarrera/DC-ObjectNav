@@ -2,7 +2,7 @@
 
 Loads saved maps (uncertainty, occupancy, similarity) and the trajectory log
 written by main.py, then renders a video showing maps evolving over time with
-agent trail, A* reference paths, and MPPI optimised paths overlaid.
+the agent trail and MPPI optimised paths overlaid.
 
 Usage:
     cd DCON
@@ -29,8 +29,8 @@ from src.visualization.visualizer import Visualizer
 def _norm_box(box):
     """Return (x0, y0, x1, y1) with x0<=x1, y0<=y1, or None if degenerate.
 
-    Some detectors (e.g. LocateAnything) occasionally emit coordinates out of
-    order; PIL's draw.rectangle raises if x1<x0, so normalize and drop empties.
+    Defensive: PIL's draw.rectangle raises if x1<x0, so normalize corner order
+    and drop empty boxes (older logs may contain out-of-order coordinates).
     """
     if box is None:
         return None
@@ -159,12 +159,6 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         return
     print(f"Using {len(map_steps)} map snapshots (step 0 to {map_steps[-1]} every {cfg.viz_interval}) and {len(traj_log)} trajectory log entries.")
 
-    # Calculate average MPPI cost
-    costs = [e['mppi_cost'] for e in traj_log if 'mppi_cost' in e and e['mppi_cost'] is not None]
-    costs = [c for c in costs if np.isfinite(c)]
-    avg_cost = np.mean(costs) if costs else 0.0
-    print(f"Average achieved MPPI cost: {avg_cost:.2f}")
-
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     frames = []
@@ -194,10 +188,6 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         # Most recent plan at or before this step
         current_entry = trail_entries[-1] if trail_entries else None
 
-        ref_traj_world = (
-            [g2w(p[0], p[1]) for p in current_entry['ref_traj']]
-            if current_entry and current_entry['ref_traj'] else []
-        )
         opt_traj_world = (
             [g2w(p[0], p[1]) for p in current_entry['opt_traj']]
             if current_entry and current_entry['opt_traj'] else []
@@ -221,20 +211,13 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         w_conf = float(current_entry.get('w_conf', 0.0) or 0.0) if current_entry else 0.0
 
         maps_dict = {'occ': occ, 'sim': sim, 'epi': epi, 'rgb': rgb}
-        
-        # Optional: compute CombinedZ if we want to match analysis.py perfectly
-        # For now, let's just pass the dict. Visualizer handles it.
-        
-        # Get cost for this specific step from traj_log
-        current_cost = next((e['mppi_cost'] for e in trail_entries[::-1] if 'mppi_cost' in e and e['mppi_cost'] is not None and np.isfinite(e['mppi_cost'])), 0.0)
 
         fig = viz.render_combined_grid(
             maps_dict, extent,
-            agent_trail=agent_trail, ref_traj_world=ref_traj_world,
+            agent_trail=agent_trail,
             opt_traj_world=opt_traj_world, current_pos=current_pos,
             current_heading=current_heading,
             step=map_step,
-            avg_cost=avg_cost, current_cost=current_cost,
             det_conf=det_conf,
             goal_world=goal_world, goal_cell=goal_cell,
             mode=mode, w_conf=w_conf,
@@ -242,7 +225,7 @@ def render_navigation(cfg, output_path: str, fps: int = 5,
         frames.append(viz.fig_to_numpy(fig))
         plt.close(fig)
         print(f"  Rendered step {map_step:6d} | trail pts: {len(agent_trail):4d} | "
-              f"ref: {len(ref_traj_world):3d} | opt: {len(opt_traj_world):3d}")
+              f"opt: {len(opt_traj_world):3d}")
 
     if not frames:
         print("No frames rendered — nothing to save.")

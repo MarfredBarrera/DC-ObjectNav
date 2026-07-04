@@ -1,300 +1,43 @@
-"""Open-vocabulary object detectors.
+"""Object detectors. All share `detect(image, query) -> (score, box)`.
 
-All backends share the same interface — `detect(image, query) -> (score, box)` —
-so the rest of the system can swap between them by config without further
-plumbing. Pick one via `make_detector(name, ...)`.
-
-- `ObjectDetector`: YOLO-Worldv2 (fast, ~15 ms/frame, class-name-style queries).
-- `CocoYoloDetector`: closed-set COCO YOLOv8 (fast, high precision on the 80
-  COCO classes, returns score=0 for queries that don't map to any COCO class).
-- `HybridDetector`: routes COCO-matching queries to `CocoYoloDetector` and
-  everything else to `ObjectDetector` (YOLO-World). Mirrors the VLFM paper's
-  split, swapping Grounding DINO for YOLO-World on the open-vocab branch
-  to stay in the ~15 ms regime.
-- `LLMDetDetector`: LLMDet (MM-Grounding-DINO) with training-free attention
-  sinks for background false-positive mitigation.
+- `LLMDetDetector`: MM-Grounding-DINO with training-free attention sinks
+  (Ruis et al., ICLR 2026) for background false-positive mitigation.
 - `LocateAnythingDetector`: NVIDIA LocateAnything-3B generative grounding.
+- `CascadeDetector`: LocateAnything proposes, LLMDet verifies — a frame counts
+  only when both agree on the same region, cutting the geometric-look-alike
+  false positives that survive LLMDet's sinks.
+
+`make_detector(cfg)` picks LLMDet alone (default) or the cascade
+(`cfg.detector_cascade`). The YOLO-World / COCO-YOLO / VLFM-hybrid backends were
+removed earlier; see git history if one needs to be resurrected.
 """
 
+import re
 from typing import Optional, Tuple, Union
-import time
 
 import numpy as np
 import torch
 from PIL import Image
 
-from ultralytics import YOLO
-import re
 
+def to_uint8_rgb(image: Union[torch.Tensor, np.ndarray, Image.Image]) -> np.ndarray:
+    """Coerce PIL / numpy / torch input to a uint8 (H, W, 3) RGB array.
 
-# Canonical distractor vocabulary (mirrors the default of
-# cfg.det_negative_classes — kept here too so the standalone smoke test and
-# direct construction get the same behavior without importing config).
-DEFAULT_NEGATIVE_CLASSES = [
-    "wall", "door", "window", "floor", "ceiling",
-    "curtain", "cabinet", "shelf", "picture",
-]
-
-
-def _normalize_query(query: str) -> str:
-    """Lower-case, strip leading article and trailing period."""
-    q = query.strip().lower().rstrip(".")
-    for art in ("a ", "an ", "the "):
-        if q.startswith(art):
-            q = q[len(art):]
-            break
-    return q
-
-
-def _dedupe_negatives(query: str, negatives) -> list:
-    """Drop negatives that normalize to the same noun as the query itself."""
-    qn = _normalize_query(query)
-    return [n for n in (negatives or []) if _normalize_query(n) != qn]
-
-
-class ObjectDetector:
-    """Open-vocabulary detector using YOLO-World (via Ultralytics).
-
-    `negative_classes` are registered as competing classes alongside the
-    query (the query is always class id 0); only boxes whose winning class
-    is the query are accepted. Without competitors, YOLO-World's contrastive
-    head matches salient non-target regions (walls, doors) to the only class
-    available — registering distractors lets those regions be claimed by
-    their own class instead.
+    Float arrays are expected in [0, 1]; uint8 in [0, 255].
     """
-
-    name = "yolo_world"
-
-    def backend_for(self, query: str) -> str:
-        return self.name
-
-
-    def __init__(
-        self,
-        device: str = "cuda",
-        model_name: str = "yolo/yolov8s-worldv2.pt",
-        threshold: float = 0.1,
-        imgsz: int = 640,
-        half: bool = True,
-        negative_classes: Optional[list] = None,
-    ):
-        self.device = device
-        self.threshold = float(threshold)
-        self.imgsz = int(imgsz)
-        # fp16 only on CUDA; Ultralytics silently no-ops it on CPU.
-        self.half = bool(half) and "cuda" in str(device)
-        self.negative_classes = (
-            list(negative_classes) if negative_classes is not None
-            else list(DEFAULT_NEGATIVE_CLASSES)
-        )
-        self.model = YOLO(model_name)
-        self.model.to(device)
-        # set_classes() re-embeds the query through CLIP, which is non-trivial.
-        # Cache the current query so back-to-back calls with the same text
-        # skip the embedding step.
-        self._current_query: Optional[str] = None
-
-    @torch.no_grad()
-    def detect(
-        self,
-        image: Union[torch.Tensor, np.ndarray, Image.Image],
-        query: str,
-    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
-        """Run detection on a single image with a single text query.
-
-        Args:
-            image: RGB image. Accepts PIL.Image, numpy uint8 (H, W, 3),
-                or torch tensor (H, W, 3) in [0, 1] or [0, 255].
-            query: Free-form text query, e.g. "a green plant".
-
-        Returns:
-            (score, box) where `score` ∈ [0, 1] and `box` is
-            (xmin, ymin, xmax, ymax) in pixel coordinates of the input image.
-            If no detection clears `self.threshold`, returns (0.0, None).
-        """
-        if query != self._current_query:
-            # Query is always class id 0; negatives compete for the boxes.
-            self.model.set_classes([query] + _dedupe_negatives(query, self.negative_classes))
-            self._current_query = query
-
-        arr = self._to_uint8(image)
-
-        results = self.model.predict(
-            arr,
-            imgsz=self.imgsz,
-            half=self.half,
-            conf=self.threshold,
-            verbose=False,
-            device=self.device,
-        )
-        r = results[0]
-        if r.boxes is None or len(r.boxes) == 0:
-            return 0.0, None
-
-        # Keep only boxes claimed by the target class — a box that matches
-        # "wall" better than the query is a suppressed false positive.
-        target_idx = (r.boxes.cls == 0).nonzero(as_tuple=True)[0]
-        if target_idx.numel() == 0:
-            return 0.0, None
-        confs = r.boxes.conf[target_idx]
-        best = target_idx[int(torch.argmax(confs))]
-        score = float(r.boxes.conf[best])
-        xyxy = r.boxes.xyxy[best].tolist()
-        box = (float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]))
-        return score, box
-
-    @staticmethod
-    def _to_uint8(image: Union[torch.Tensor, np.ndarray, Image.Image]) -> np.ndarray:
-        if isinstance(image, Image.Image):
-            return np.asarray(image.convert("RGB"))
-        if isinstance(image, torch.Tensor):
-            arr = image.detach().cpu().numpy()
-        else:
-            arr = np.asarray(image)
-        # Float arrays expected in [0, 1]; uint8 in [0, 255].
-        if arr.dtype != np.uint8:
-            if float(arr.max()) <= 1.0 + 1e-3:
-                arr = arr * 255.0
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
-        if arr.ndim != 3 or arr.shape[2] != 3:
-            raise ValueError(f"Expected (H, W, 3) RGB image, got shape {arr.shape}")
-        return arr
-
-
-class CocoYoloDetector:
-    """Closed-set COCO detector using YOLOv8 (via Ultralytics).
-
-    Restricts predictions to a single class derived from the query string.
-    `query_to_class_id` normalizes the query (lower-case, strip leading
-    article, strip trailing period) and looks it up in `self.model.names`,
-    with a small synonym table for common ObjectNav targets that don't
-    exactly match a COCO label. Returns (0.0, None) when the query can't
-    be mapped to a COCO class — the hybrid wrapper uses that to fall back.
-    """
-
-    name = "coco_yolo"
-
-    def backend_for(self, query: str) -> str:
-        return self.name
-
-
-    # Query strings that don't exactly match a COCO label but should still
-    # route through the closed-set detector.
-    _SYNONYMS = {
-        "plant": "potted plant",
-        "sofa": "couch",
-        "television": "tv",
-    }
-
-    _ARTICLES = ("a ", "an ", "the ")
-
-    def __init__(
-        self,
-        device: str = "cuda",
-        model_name: str = "yolo/yolov8s.pt",
-        threshold: float = 0.25,
-        imgsz: int = 640,
-        half: bool = True,
-    ):
-        self.device = device
-        self.threshold = float(threshold)
-        self.imgsz = int(imgsz)
-        self.half = bool(half) and "cuda" in str(device)
-        self.model = YOLO(model_name)
-        self.model.to(device)
-        # Inverse of model.names ({id: name}) so we can convert a class name
-        # straight to the integer id Ultralytics wants in `classes=`.
-        self.name_to_id = {name: idx for idx, name in self.model.names.items()}
-        self._current_query: Optional[str] = None
-        self._current_class_id: Optional[int] = None
-
-    def query_to_class_id(self, query: str) -> Optional[int]:
-        """Map a free-form query to a COCO class id, or None if no match."""
-        q = query.strip().lower().rstrip(".")
-        for art in self._ARTICLES:
-            if q.startswith(art):
-                q = q[len(art):]
-                break
-        q = self._SYNONYMS.get(q, q)
-        return self.name_to_id.get(q)
-
-    @torch.no_grad()
-    def detect(
-        self,
-        image: Union[torch.Tensor, np.ndarray, Image.Image],
-        query: str,
-    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
-        if query != self._current_query:
-            self._current_query = query
-            self._current_class_id = self.query_to_class_id(query)
-        if self._current_class_id is None:
-            return 0.0, None
-
-        arr = ObjectDetector._to_uint8(image)
-        results = self.model.predict(
-            arr,
-            imgsz=self.imgsz,
-            half=self.half,
-            conf=self.threshold,
-            classes=[self._current_class_id],
-            verbose=False,
-            device=self.device,
-        )
-        r = results[0]
-        if r.boxes is None or len(r.boxes) == 0:
-            return 0.0, None
-        confs = r.boxes.conf
-        best = int(torch.argmax(confs))
-        score = float(confs[best])
-        xyxy = r.boxes.xyxy[best].tolist()
-        box = (float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3]))
-        return score, box
-
-
-class HybridDetector:
-    """COCO-matching queries → closed-set YOLOv8; everything else → YOLO-World.
-
-    Mirrors the VLFM paper's hybrid scheme. Routing decision is cached per
-    query string, so back-to-back calls with the same query skip the
-    normalization + lookup.
-    """
-
-    name = "hybrid"
-
-    def backend_for(self, query: str) -> str:
-        backend = self._route_cache.get(query)
-        if backend is None:
-            backend = self.coco if self.coco.query_to_class_id(query) is not None else self.world
-            self._route_cache[query] = backend
-        return backend.name
-
-
-    def __init__(
-        self,
-        device: str = "cuda",
-        coco_kwargs: Optional[dict] = None,
-        world_kwargs: Optional[dict] = None,
-        negative_classes: Optional[list] = None,
-    ):
-        # Negatives only apply to the open-vocab branch — the closed-set
-        # COCO branch already has 80-class competition.
-        world_kwargs = dict(world_kwargs or {})
-        if negative_classes is not None:
-            world_kwargs.setdefault("negative_classes", negative_classes)
-        self.coco = CocoYoloDetector(device=device, **(coco_kwargs or {}))
-        self.world = ObjectDetector(device=device, **world_kwargs)
-        self._route_cache: dict = {}
-
-    def detect(
-        self,
-        image: Union[torch.Tensor, np.ndarray, Image.Image],
-        query: str,
-    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
-        backend = self._route_cache.get(query)
-        if backend is None:
-            backend = self.coco if self.coco.query_to_class_id(query) is not None else self.world
-            self._route_cache[query] = backend
-        return backend.detect(image, query)
+    if isinstance(image, Image.Image):
+        return np.asarray(image.convert("RGB"))
+    if isinstance(image, torch.Tensor):
+        arr = image.detach().cpu().numpy()
+    else:
+        arr = np.asarray(image)
+    if arr.dtype != np.uint8:
+        if float(arr.max()) <= 1.0 + 1e-3:
+            arr = arr * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"Expected (H, W, 3) RGB image, got shape {arr.shape}")
+    return arr
 
 
 class LLMDetDetector:
@@ -335,16 +78,13 @@ class LLMDetDetector:
 
     name = "llmdet"
 
-    def backend_for(self, query: str) -> str:
-        return self.name
-
     def __init__(
         self,
         device: str = "cuda",
-        model_name: str = "iSEE-Laboratory/llmdet_tiny",
-        threshold: float = 0.3,
+        model_name: str = "iSEE-Laboratory/llmdet_large",
+        threshold: float = 0.42,
         use_sinks: bool = True,
-        num_sinks: int = 24,
+        num_sinks: int = 48,
         sink_init: str = "special",
         sink_special_str: str = "[()]",
     ):
@@ -371,6 +111,19 @@ class LLMDetDetector:
         )
         self._current_query: Optional[str] = None
         self._prompt: Optional[str] = None
+
+    @classmethod
+    def from_config(cls, cfg) -> "LLMDetDetector":
+        """Construct from the global Config's llmdet_* knobs."""
+        return cls(
+            device=cfg.device,
+            model_name=cfg.llmdet_model_name,
+            threshold=cfg.llmdet_threshold,
+            use_sinks=cfg.llmdet_use_sinks,
+            num_sinks=cfg.llmdet_num_sinks,
+            sink_init=cfg.llmdet_sink_init,
+            sink_special_str=cfg.sink_special_str,
+        )
 
     def _install_sinks(self, num_sinks: int, sink_init: str, special_str: str) -> None:
         emb = self.model.model.text_backbone.embeddings.word_embeddings.weight  # (V, D)
@@ -418,16 +171,23 @@ class LLMDetDetector:
         return spans
 
     @torch.no_grad()
-    def detect(
+    def detect_all(
         self,
         image: Union[torch.Tensor, np.ndarray, Image.Image],
         query: str,
-    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
+    ) -> list:
+        """Every box that survives the sink gate + `self.threshold`, as
+        `(score, (xmin, ymin, xmax, ymax))` in input-image pixels, sorted by
+        score descending (best first). `detect` returns the top one; the
+        verification cascade scans the list for a box overlapping a proposal, so
+        a true positive isn't lost just because some look-alike elsewhere in the
+        frame out-scored it. Empty list if nothing survives.
+        """
         if query != self._current_query:
             self._current_query = query
             self._prompt = query.strip().rstrip(".") + "." + self._sink_suffix
 
-        arr = ObjectDetector._to_uint8(image)
+        arr = to_uint8_rgb(image)
         pil = Image.fromarray(arr)
         h, w = arr.shape[:2]
 
@@ -439,7 +199,7 @@ class LLMDetDetector:
         token_strs = self.tokenizer.convert_ids_to_tokens(inputs.input_ids[0])
         spans = self._phrase_spans(token_strs)
         if not spans:
-            return 0.0, None
+            return []
 
         qscore = prob[:, spans[0]].max(dim=1).values    # (num_boxes,) per-box query score
         if self.sink_ids and len(spans) > 1:
@@ -453,40 +213,60 @@ class LLMDetDetector:
             keep = qscore >= self.threshold
 
         if not bool(keep.any()):
-            return 0.0, None
-        kept = torch.where(keep)[0]
-        best = kept[int(torch.argmax(qscore[kept]))]
-        score = float(qscore[best])
-        cx, cy, bw, bh = boxes[best].tolist()
-        x0, y0 = (cx - bw / 2.0) * w, (cy - bh / 2.0) * h
-        x1, y1 = (cx + bw / 2.0) * w, (cy + bh / 2.0) * h
-        return score, (float(x0), float(y0), float(x1), float(y1))
+            return []
+        dets = []
+        for i in torch.where(keep)[0].tolist():
+            cx, cy, bw, bh = boxes[i].tolist()
+            x0, y0 = (cx - bw / 2.0) * w, (cy - bh / 2.0) * h
+            x1, y1 = (cx + bw / 2.0) * w, (cy + bh / 2.0) * h
+            dets.append((float(qscore[i]),
+                         (float(x0), float(y0), float(x1), float(y1))))
+        dets.sort(key=lambda t: t[0], reverse=True)
+        return dets
+
+    def detect(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
+        """Best single detection on `image` for text `query`.
+
+        Returns `(score, box)` where `score` ∈ [0, 1] and `box` is
+        (xmin, ymin, xmax, ymax) in pixel coordinates of the input image, or
+        `(0.0, None)` if nothing survives the sink gate + `self.threshold`.
+        """
+        dets = self.detect_all(image, query)
+        return dets[0] if dets else (0.0, None)
 
 
 class LocateAnythingDetector:
     """Open-vocabulary detector using NVIDIA LocateAnything-3B via Hugging Face.
 
-    Returns binary detection scores: 1.0 if it generates a bounding box, 0.0 otherwise.
-    Since it produces point predictions, we parse the output to construct a bounding box.
+    A generative grounding model (Qwen-VL-style): it is prompted to locate the
+    query object and emits `<box><x1><y1><x2><y2></box>` special tokens, which we
+    parse into one box with a binary 1.0/0.0 score (1.0 iff it emitted a box).
+    Architecturally very different from the DINO-based LLMDet, so its false
+    positives are largely uncorrelated — which is what makes it useful as the
+    proposer in `CascadeDetector`.
     """
-    name = "locate_anything"
 
-    def backend_for(self, query: str) -> str:
-        return self.name
+    name = "locate_anything"
 
     def __init__(
         self,
         device: str = "cuda",
         model_name: str = "nvidia/LocateAnything-3B",
-        threshold: float = 0.5, # ignored, binary signal
         max_new_tokens: int = 128,
         repetition_penalty: float = 1.3,
     ):
-        import os
         import glob
-        # Apply patch for Python 3.9 type hints inside the downloaded remote code
-        for f in glob.glob("/root/.cache/huggingface/modules/transformers_modules/nvidia/LocateAnything_hyphen_3B/*/*.py"):
-            os.system(f"grep -q 'from __future__ import annotations' {f} || sed -i '1s/^/from __future__ import annotations\\n/' {f}")
+        import os
+        # Patch the downloaded remote code for Python 3.9 (it uses PEP 604
+        # `X | None` type hints at module import time).
+        for f in glob.glob("/root/.cache/huggingface/modules/transformers_modules/"
+                           "nvidia/LocateAnything_hyphen_3B/*/*.py"):
+            os.system(f"grep -q 'from __future__ import annotations' {f} || "
+                      f"sed -i '1s/^/from __future__ import annotations\\n/' {f}")
 
         from transformers import AutoModel, AutoProcessor, AutoTokenizer
         self.device = device
@@ -503,13 +283,18 @@ class LocateAnythingDetector:
         self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.processor.tokenizer = self.tokenizer
-
         self.model = AutoModel.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=self.dtype,
+            model_name, trust_remote_code=True, torch_dtype=self.dtype,
         ).to(device)
         self.model.eval()
+
+    @classmethod
+    def from_config(cls, cfg) -> "LocateAnythingDetector":
+        return cls(
+            device=cfg.device,
+            model_name=cfg.locate_anything_model_name,
+            max_new_tokens=cfg.locate_anything_max_new_tokens,
+        )
 
     @torch.no_grad()
     def detect(
@@ -517,29 +302,22 @@ class LocateAnythingDetector:
         image: Union[torch.Tensor, np.ndarray, Image.Image],
         query: str,
     ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
-        arr = ObjectDetector._to_uint8(image)
+        arr = to_uint8_rgb(image)
         pil = Image.fromarray(arr).convert("RGB")
         w, h = pil.size
 
-        prompt = (
-            "Locate all the instances that matches the following "
-            f"description: {query}."
-        )
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": pil},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        prompt = ("Locate all the instances that matches the following "
+                  f"description: {query}.")
+        messages = [{
+            "role": "user",
+            "content": [{"type": "image", "image": pil},
+                        {"type": "text", "text": prompt}],
+        }]
 
-        # LocateAnything ships its own chat template + vision-info helpers;
-        # the generic HF ones don't emit the <image-N> placeholders it needs.
+        # LocateAnything ships its own chat template + vision-info helpers; the
+        # generic HF ones don't emit the <image-N> placeholders it needs.
         text = self.processor.py_apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
+            messages, tokenize=False, add_generation_prompt=True)
         images, videos = self.processor.process_vision_info(messages)
         inputs = self.processor(
             text=[text], images=images, videos=videos, return_tensors="pt",
@@ -561,48 +339,97 @@ class LocateAnythingDetector:
             generation_mode="hybrid",
         )
 
-        # Output boxes are emitted as <box><x1><y1><x2><y2></box> with each
-        # coordinate a 0-999 normalized integer special token (<box>None</box>
-        # when nothing matches). Take the FIRST box: the model emits its
-        # highest-priority, tightest detection first, then degenerates into
-        # repeated oversized / full-image boxes — so "largest" would pick noise.
+        # Boxes are emitted as <box><x1><y1><x2><y2></box>, each coordinate a
+        # 0-999 normalized integer special token (<box>None</box> when nothing
+        # matches). Take the FIRST box: the model emits its highest-priority,
+        # tightest detection first, then degenerates into repeated oversized /
+        # full-image boxes — "largest" would pick noise.
         m = re.search(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", response)
-        if m is not None:
-            x1, y1, x2, y2 = (int(g) / 1000.0 for g in m.groups())
-            # The model occasionally emits corners out of order; sort so the
-            # box is always (xmin, ymin, xmax, ymax) for every downstream
-            # consumer (CLIP crop, BEV projection, PIL rectangle in viz).
-            xs = sorted((x1 * w, x2 * w))
-            ys = sorted((y1 * h, y2 * h))
-            box = (xs[0], ys[0], xs[1], ys[1])
-            return 1.0, box
+        if m is None:
+            return 0.0, None
+        x1, y1, x2, y2 = (int(g) / 1000.0 for g in m.groups())
+        # Corners occasionally come out of order; sort so the box is always
+        # (xmin, ymin, xmax, ymax) for every downstream consumer (IoU, CLIP
+        # crop, BEV projection, PIL rectangle in viz).
+        xs = sorted((x1 * w, x2 * w))
+        ys = sorted((y1 * h, y2 * h))
+        return 1.0, (xs[0], ys[0], xs[1], ys[1])
+
+
+class CascadeDetector:
+    """Two-stage detector: a generative *proposer* (LocateAnything) gates a
+    sink-gated *verifier* (LLMDet). A frame counts as a detection only when both
+    fire on the same object — the proposer emits a box AND the verifier has a
+    sink-gated box, clearing its threshold τ, that spatially overlaps the
+    proposal (IoU ≥ `min_iou`). The returned `(score, box)` is the *verifier's*,
+    so τ (`llmdet_threshold`), the latch, and the
+    goal-projection logic downstream are all unchanged — this only changes
+    *which* frames register as detections and drive `w_conf`.
+
+    Rationale: LLMDet alone confidently fires on geometric look-alikes of the
+    target (couch↔bed, trashcan↔toilet); its attention sinks absorb attention
+    leaking onto featureless background but are structurally blind to a genuine
+    look-alike that produces a high query score. LocateAnything is a different
+    architecture, so its errors are less correlated — requiring both to agree on
+    the same region removes look-alike FPs that survive either detector alone.
+    Cost: ~2x detector latency in SEARCH (both models run) and some recall (a
+    true positive only one model catches is dropped). The proposer runs first
+    and the verifier only when it fires, so cost is bounded by the proposal rate.
+    """
+
+    name = "cascade"
+
+    def __init__(self, proposer, verifier, min_iou: float = 0.1):
+        self.proposer = proposer      # LocateAnythingDetector-like: detect()
+        self.verifier = verifier      # LLMDetDetector: detect_all()
+        self.min_iou = float(min_iou)
+
+    @classmethod
+    def from_config(cls, cfg) -> "CascadeDetector":
+        return cls(
+            proposer=LocateAnythingDetector.from_config(cfg),
+            verifier=LLMDetDetector.from_config(cfg),
+            min_iou=cfg.cascade_min_iou,
+        )
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+        ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+        inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+        if inter <= 0.0:
+            return 0.0
+        area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+        area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+        union = area_a + area_b - inter
+        return inter / union if union > 0.0 else 0.0
+
+    def detect(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
+        # Stage 1: proposer. Nothing proposed → no detection (verifier skipped,
+        # so the second heavy model only runs when there's a candidate).
+        _, p_box = self.proposer.detect(image, query)
+        if p_box is None:
+            return 0.0, None
+        # Stage 2: verifier over the full image (its sink gate is validated on
+        # whole images, not tight crops). detect_all is already ≥ τ + sink-gated.
+        for score, v_box in self.verifier.detect_all(image, query):
+            if self.min_iou <= 0.0 or self._iou(p_box, v_box) >= self.min_iou:
+                return score, v_box
+        # Proposal not confirmed by any verifier box → treat as a false positive.
+        print("  [cascade] proposal rejected by verifier (no sink-gated box "
+              "overlaps the LocateAnything proposal)")
         return 0.0, None
 
 
-def make_detector(name: str = "yolo", device: str = "cuda", **kwargs):
-    """Factory: pick a detector backend by short name.
-
-    - "yolo": fast YOLO-Worldv2 (open-vocab).
-    - "coco_yolo": closed-set COCO YOLOv8.
-    - "hybrid": COCO classes → YOLOv8, everything else → YOLO-Worldv2.
-    - "locate_anything": NVIDIA LocateAnything-3B via HuggingFace pipeline.
-    - "llmdet": LLMDet (MM-Grounding-DINO) via HuggingFace with attention sinks.
-    """
-    key = name.lower().strip()
-    # Only the YOLO-World branch (directly or inside hybrid) uses the
-    # negative-class competition; pop it here so the other backends don't
-    # choke on an unknown kwarg.
-    negative_classes = kwargs.pop("negative_classes", None)
-    if key in ("locate_anything", "locateanything"):
-        return LocateAnythingDetector(device=device, **kwargs)
-    if key in ("yolo", "yolo_world", "yoloworld"):
-        if negative_classes is not None:
-            kwargs.setdefault("negative_classes", negative_classes)
-        return ObjectDetector(device=device, **kwargs)
-    if key in ("coco_yolo", "yolov8", "coco"):
-        return CocoYoloDetector(device=device, **kwargs)
-    if key in ("hybrid",):
-        return HybridDetector(device=device, negative_classes=negative_classes, **kwargs)
-    if key in ("llmdet", "llm_det"):
-        return LLMDetDetector(device=device, **kwargs)
-    raise ValueError(f"Unknown detector backend: {name!r}")
+def make_detector(cfg):
+    """Build the detector from config: the LocateAnything→LLMDet verification
+    cascade when `cfg.detector_cascade`, else LLMDet alone (default)."""
+    if cfg.detector_cascade:
+        return CascadeDetector.from_config(cfg)
+    return LLMDetDetector.from_config(cfg)

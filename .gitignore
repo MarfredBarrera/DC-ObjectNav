@@ -6,8 +6,11 @@ figs/
 .ckpt
 .pth
 .pt
+.glb
+.navmesh
 
 # Ignore output directories
 output/
 outputs/
 yolo/
+gibson_scenes/

@@ -21,19 +21,14 @@ success_radius_m: 1.0
 # >1 the run id gets a `__r{k}` suffix (e.g. chair__hallway__r0). Default 1.
 runs_per_combo: 3
 
-# Object detector backend for every run. Overridden by the CLI --detector flag;
-# omit this line to fall back to the config default. One of:
-#   yolo / coco_yolo / hybrid / grounding_dino / locate_anything / llmdet
-detector: llmdet
-
 # Named agent spawn points (world xyz, snapped to the navmesh on spawn).
 # Naming them keeps run ids and exclusions human-readable. A bare list also
 # works (auto-named start0, start1, ...).
 starts:
+  dining_room: [-8.0, -3.0, 0.0]
   office:      [0.0, -3.0, 0.0]
   hallway:     [-2.0, -3.0, 6.0]
   kitchen:     [0.0, -3.0, -9.0]
-  living_room: [-8.0, -3.0, -6.0]
   bathroom:    [-1.0, -3.0, 2.2]
 
 # Each target: the CLIP query string + every known instance of the object. A

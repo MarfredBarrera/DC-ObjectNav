@@ -64,13 +64,6 @@ def main():
                         help="Directory for results.json (and per-episode maps if --save)")
     parser.add_argument("--config", type=str, default="config/config.yaml",
                         help="Base config YAML (overridden per-episode)")
-    parser.add_argument("--detector", type=str,
-                        choices=["yolo", "coco_yolo", "hybrid", "grounding_dino",
-                                 "locate_anything"], default=None,
-                        help="Override detector backend for all episodes")
-    parser.add_argument("--ig-source", type=str,
-                        choices=["unseen", "epistemic"], default="epistemic",
-                        help="Information-gain source for MPPI")
     parser.add_argument("--save", action="store_true", default=False,
                         help="Save per-episode BEV maps/RGB (slow; off by default)")
     args = parser.parse_args()
@@ -81,8 +74,7 @@ def main():
 
     success_radius_m, episodes = load_episodes(args.episodes)
     os.makedirs(args.out, exist_ok=True)
-    print(f"[eval] {len(episodes)} episode(s) | success_radius={success_radius_m}m | "
-          f"ig={args.ig_source} | detector={args.detector or 'config default'}")
+    print(f"[eval] {len(episodes)} episode(s) | success_radius={success_radius_m}m")
 
     results = []
     for i, ep in enumerate(episodes):
@@ -96,14 +88,11 @@ def main():
         cfg = Config(args.config)
         cfg.scene_path = scene
         cfg.target_query = query
-        cfg.ig_source = args.ig_source
-        if args.detector is not None:
-            cfg.detector = args.detector
         if args.save:
             cfg.output_dir = os.path.join(args.out, f"ep_{i:03d}")
 
         metrics = run(
-            cfg, save_enabled=args.save, visualize=False,
+            cfg, save_enabled=args.save, save_video=False,
             start_pos=start, goals=goals, success_radius_m=success_radius_m,
         )
         metrics["episode"] = i
@@ -123,8 +112,6 @@ def main():
         "success_rate": sr,
         "spl": spl,
         "success_radius_m": success_radius_m,
-        "ig_source": args.ig_source,
-        "detector": args.detector,
         "episodes": results,
     }
     out_path = os.path.join(args.out, "results.json")

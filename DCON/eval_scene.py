@@ -1,8 +1,14 @@
-"""Per-scene ObjectNav evaluation — three transparent stages.
+"""ObjectNav evaluation — three transparent stages.
 
-A single scene is swept over a cross product of target objects x agent start
-positions (optionally repeated). The pipeline separates *evidence* from
-*judgment*:
+Episodes come from one of two sources:
+  --scenarios  a hand-written per-scene sweep (custom targets × starts with
+               ground-truth goals; see eval/scenarios_*.yaml), or
+  --dataset    a standard Habitat ObjectNav episode dataset (.json[.gz] — the
+               Gibson/SemExp, HM3D, or MP3D benchmark episodes VLFM and
+               Goal-Oriented Semantic Exploration report on). Pass --discrete
+               for the challenge action space (25 cm / 30°, 500-step budget).
+
+Either way the pipeline separates *evidence* from *judgment*:
 
     run     execute episodes; save a raw record + evidence bundle per run
             (final pose, geodesics, BEV maps, trajectory video). Bakes in NO
@@ -74,11 +80,10 @@ def cmd_run(args, scn, runs):
     from main import run as run_episode  # imports torch/habitat; after CUDA env
     from src.config import Config
 
-    detector = args.detector or scn["detector"]
+    evidence = "off" if args.no_evidence else ("minimal + video" if args.video else "minimal")
     print(f"[run] scene={os.path.basename(scn['scene'])} | {len(runs)} run(s) "
-          f"({scn['runs_per_combo']}x per combo) | ig={args.ig_source} | "
-          f"detector={detector or 'config default'} | discrete={args.discrete} | "
-          f"evidence={'off' if args.no_evidence else 'on'}")
+          f"({scn['runs_per_combo']}x per combo) | discrete={args.discrete} | "
+          f"evidence={evidence}")
 
     for i, r in enumerate(runs):
         rid = r["id"]
@@ -92,16 +97,22 @@ def cmd_run(args, scn, runs):
               f"'{r['query']}' @ {r['start_name']} ===")
 
         cfg = Config(args.config)
-        cfg.scene_path = scn["scene"]
+        # Dataset runs carry their own scene (episodes span scenes) and the BEV
+        # height band for their floor; scenarios runs use the file-level scene
+        # and the config's band.
+        cfg.scene_path = r.get("scene") or scn["scene"]
         cfg.target_query = r["query"]
-        cfg.ig_source = args.ig_source
-        if detector is not None:
-            cfg.detector = detector
+        if r.get("bev_band"):
+            cfg.bev_height_min, cfg.bev_height_max = r["bev_band"]
         if args.discrete:
             cfg.discrete_actions = True
 
-        # Evidence: save BEV maps + render the trajectory video into ep/<id>/.
+        # Evidence into ep/<id>/. Default is minimal (traj_log + final occupancy
+        # map + the review bev_final.png); `--video` adds the full per-step map
+        # history + the nav_history.mp4 (large). `--no-evidence` saves nothing
+        # but traj_log + grid_extent.
         save = not args.no_evidence
+        video = save and args.video
         run_dir = core.ep_dir(args.out, rid)
         if save:
             cfg.output_dir = run_dir
@@ -113,10 +124,13 @@ def cmd_run(args, scn, runs):
             "start": r["start"], "query": r["query"],
             "goals": r["goals"], "requested_radius_m": r["success_radius_m"],
         }
+        if r.get("episode_id") is not None:
+            record["episode_id"] = r["episode_id"]
         try:
             metrics = run_episode(
-                cfg, save_enabled=save, visualize=save, viz_output=viz_out,
-                start_pos=r["start"], goals=r["goals"],
+                cfg, save_enabled=save, save_video=video, viz_output=viz_out,
+                start_pos=r["start"], start_rotation=r.get("start_rotation"),
+                goals=r["goals"],
                 success_radius_m=r["success_radius_m"],
             )
             record.update(metrics)
@@ -193,10 +207,8 @@ def cmd_report(args, scn, runs):
     verdicts = core.load_verdicts(verdicts_path)
     summary = core.aggregate(runs, records, verdicts)
 
-    detector = args.detector or scn["detector"]
     summary = {
-        "scene": scn["scene"], "detector": detector,
-        "ig_source": args.ig_source, "discrete_actions": args.discrete,
+        "scene": scn["scene"], "discrete_actions": args.discrete,
         "runs_per_combo": scn["runs_per_combo"],
         "verdicts_file": verdicts_path, **summary,
     }
@@ -252,16 +264,28 @@ def main():
 
     def common(p):
         p.add_argument("--scenarios", default=None,
-                       help="Per-scene scenarios YAML/JSON. Required for `run`. "
-                            "For `review`/`report`, omit it to aggregate exactly the "
-                            "records in <out>/runs/ (independent of any scenarios file).")
+                       help="Per-scene scenarios YAML/JSON (custom targets/starts/goals). "
+                            "`run` needs this or --dataset. For `review`/`report`, omit "
+                            "both to aggregate exactly the records in <out>/runs/.")
+        p.add_argument("--dataset", default=None,
+                       help="Standard Habitat ObjectNav episode dataset (.json[.gz] "
+                            "file, or a split dir with content/*.json.gz) — the "
+                            "benchmark episodes VLFM / SemExp evaluate on. "
+                            "Mutually exclusive with --scenarios.")
+        p.add_argument("--scenes-root", default="gibson_scenes",
+                       help="--dataset: directory with local scene .glb files "
+                            "(episodes whose scene is missing are skipped)")
+        p.add_argument("--categories", nargs="*", default=None,
+                       help="--dataset: keep only these object categories")
+        p.add_argument("--scenes", nargs="*", default=None,
+                       help="--dataset: keep only these scene stems (e.g. Collierville)")
+        p.add_argument("--max-per-combo", type=int, default=None,
+                       help="--dataset: cap episodes per (category x scene) for "
+                            "balanced subsets")
+        p.add_argument("--radius", type=float, default=1.0,
+                       help="--dataset: success radius (m, geodesic; the "
+                            "benchmark protocol is 1.0)")
         p.add_argument("--out", default="output/scene_eval", help="Output directory")
-        p.add_argument("--ig-source", choices=["unseen", "epistemic"], default="epistemic",
-                       help="Information-gain source for MPPI (recorded in results)")
-        p.add_argument("--detector", default=None,
-                       choices=["yolo", "coco_yolo", "hybrid", "grounding_dino",
-                                "locate_anything", "llmdet"],
-                       help="Override the detector (else scenarios `detector:` / config)")
         p.add_argument("--discrete", action="store_true", default=False,
                        help="Discrete Habitat ObjectNav action mode")
         p.add_argument("--only", nargs="*", default=None, help="Restrict to these run ids")
@@ -277,7 +301,12 @@ def main():
     p_run.add_argument("--rerun", action="store_true", default=False,
                        help="Re-simulate runs even if a saved result exists")
     p_run.add_argument("--no-evidence", action="store_true", default=False,
-                       help="Skip BEV-map saving + video render (faster, no inspection bundle)")
+                       help="Save nothing but traj_log + grid_extent (no final "
+                            "occupancy map, no inspection bundle)")
+    p_run.add_argument("--video", action="store_true", default=False,
+                       help="Also save the full per-step BEV map + RGB history and "
+                            "render nav_history.mp4 (large; default keeps only the "
+                            "final occupancy map + bev_final.png)")
     p_run.add_argument("--refresh-bev", action="store_true", default=False,
                        help="Re-render bev_final.png even if it exists")
 
@@ -295,31 +324,44 @@ def main():
 
     args = parser.parse_args()
 
-    # `run` must know what to execute, so it needs a scenarios file. `review`
-    # and `report` operate on data already on disk: with --scenarios they use
-    # that run set (and warn about records it doesn't cover); without it they
+    # `run` must know what to execute: either a scenarios file (custom
+    # targets/starts/goals) or a standard ObjectNav episode dataset. `review`
+    # and `report` operate on data already on disk: with a source they use
+    # that run set (and warn about records it doesn't cover); without one they
     # aggregate exactly the records present in <out>/runs/ — immune to the
-    # scenarios file having since changed (renamed combos, restricted targets).
-    if args.command == "run" and not args.scenarios:
-        parser.error("run requires --scenarios")
+    # source having since changed (renamed combos, restricted targets).
+    if args.scenarios and args.dataset:
+        parser.error("--scenarios and --dataset are mutually exclusive")
+    if args.command == "run" and not (args.scenarios or args.dataset):
+        parser.error("run requires --scenarios or --dataset")
 
     if args.scenarios:
         scn = core.load_scenarios(args.scenarios)
         scn["scene"] = core.resolve_scene(scn["scene"])
         runs = core.build_runs(scn)
-        if args.command != "run":
-            orphans = core.orphan_record_ids(args.out, runs)
-            if orphans:
-                shown = ", ".join(orphans[:8]) + (" ..." if len(orphans) > 8 else "")
-                print(f"[warn] {len(orphans)} record(s) in {args.out}/runs/ are NOT "
-                      f"covered by --scenarios and will be IGNORED: {shown}")
-                print("[warn] omit --scenarios to report everything on disk instead.")
+    elif args.dataset:
+        scn, runs = core.load_objectnav_dataset(
+            args.dataset, scenes_root=args.scenes_root,
+            categories=args.categories, scenes=args.scenes,
+            max_per_combo=args.max_per_combo, success_radius_m=args.radius)
+        print(f"[dataset] {len(runs)} runnable episode(s) from {args.dataset}")
+        if not runs:
+            raise SystemExit("no runnable episodes (scene/category filters, or "
+                             "scene .glb files missing under --scenes-root).")
     else:
         scn, runs = core.from_records(args.out)
-        print(f"[info] no --scenarios: using {len(runs)} record(s) found in "
-              f"{args.out}/runs/")
+        print(f"[info] no --scenarios/--dataset: using {len(runs)} record(s) "
+              f"found in {args.out}/runs/")
         if not runs:
             raise SystemExit(f"no run records in {args.out}/runs/ — nothing to do.")
+
+    if (args.scenarios or args.dataset) and args.command != "run":
+        orphans = core.orphan_record_ids(args.out, runs)
+        if orphans:
+            shown = ", ".join(orphans[:8]) + (" ..." if len(orphans) > 8 else "")
+            print(f"[warn] {len(orphans)} record(s) in {args.out}/runs/ are NOT "
+                  f"covered by the given source and will be IGNORED: {shown}")
+            print("[warn] omit --scenarios/--dataset to report everything on disk.")
 
     if args.only:
         keep = set(args.only)

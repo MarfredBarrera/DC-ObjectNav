@@ -3,7 +3,6 @@
 # Paths
 paths:
   output_dir: "/workspace/DCON/output/current_scene"
-  output_name: "model.pt"
 
 habitat:
   scene_path: "/workspace/DCON/gibson_scenes/Goffs.glb"
@@ -27,39 +26,6 @@ semantics:
 training:
   iterations: 100000
   device: "cuda"
-  gpu_indices: "6"
-  near_plane: 0.01
-
-# Hyperparameters
-hyperparameters:
-  ssim_weight: 0.2
-  l1_weight: 0.8
-  scale_reg: 0.01
-  uncertainty_weight: 0.1
-  uncertainty_dim: 16
-
-# Learning Rates
-learning_rates:
-  means: 0.00016
-  scales: 0.005
-  quats: 0.001
-  opacities: 0.05
-  sh0: 0.0025
-  shN: 0.000125
-  uncertainty: 0.001
-
-# Strategy Settings
-strategy:
-  refine_start_iter: 100
-  refine_stop_iter: 9500
-  refine_every: 100
-  reset_every: 1000
-  grow_grad2d: 0.0002
-  prune_opa: 0.005
-
-# Toggles
-toggles:
-  train_uncertainty: true
 
 # HashGrid Configuration
 hashgrid:
@@ -69,12 +35,12 @@ hashgrid:
   log2_hashmap_size: 19
   base_resolution: 16
   per_level_scale: 1.5
-  
+
   # MLP Architecture
   n_neurons: 128
   n_hidden_layers: 3
   feature_dim: 512
-  
+
   # Training
   lr: 0.001
   train_batch_size: 8192
@@ -120,12 +86,12 @@ planning:
   max_agent_steps: 500           # per-episode primitive budget (timeout = failure)
 
 detection:
-  detector: "llmdet"            # yolo / coco_yolo / hybrid / grounding_dino
-  detected_conf_threshold: 0.47  # det_score required to latch DETECTED
-  detected_persistence: 2       # consecutive replans above threshold to latch
+  detected_persistence: 1       # consecutive usable-band detections to latch
   stop_distance_m: 0.75          # terminate within this distance of sim peak
-  # Distractor vocabulary: competing classes registered alongside the query on
-  # the YOLO-World branch (bare nouns), so salient non-target regions get
-  # claimed by their own class instead of the query.
-  det_negative_classes: ["wall", "door", "window", "floor", "ceiling",
-                         "curtain", "cabinet", "shelf", "picture", "refrigerator"]
+  llmdet_threshold: 0.47         # LLMDet per-box score floor (tau); ~99% background-FP rejection w/ sinks
+
+  # Two-stage detection: LocateAnything-3B proposes, LLMDet (sink-gated) verifies.
+  # A frame counts only when both fire on the same region (IoU >= cascade_min_iou),
+  # cutting geometric-look-alike false positives at ~2x SEARCH detector latency.
+  detector_cascade: true
+  cascade_min_iou: 0.1

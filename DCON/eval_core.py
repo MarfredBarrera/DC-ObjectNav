@@ -25,7 +25,7 @@ import os
 
 def load_scenarios(path):
     """Parse the per-scene scenarios file (YAML or JSON). Returns a dict with
-    scene, success_radius_m, detector, runs_per_combo, starts (name->xyz),
+    scene, success_radius_m, runs_per_combo, starts (name->xyz),
     targets (name->{query, goals, success_radius_m}), combos (or None)."""
     with open(path, "r") as f:
         text = f.read()
@@ -65,7 +65,6 @@ def load_scenarios(path):
     return {
         "scene": data["scene"],
         "success_radius_m": float(data.get("success_radius_m", 1.0)),
-        "detector": data.get("detector"),
         "runs_per_combo": runs_per_combo,
         "starts": starts,
         "targets": targets,
@@ -110,6 +109,229 @@ def build_runs(scn):
 
 def resolve_scene(scene):
     return scene if os.path.isabs(scene) else os.path.abspath(scene)
+
+
+# ── Habitat ObjectNav episode datasets (Gibson/SemExp, HM3D, MP3D) ───────────
+
+# BEV height band offsets above the episode's floor (= the start position's Y,
+# which in Habitat is the agent base on the floor). Mirrors the convention
+# documented in config.py: min ~0.2 m above the floor surface (the occupancy
+# grid marks the floor plane occupied and bleeds up ~one voxel), max at
+# standing-obstacle height. Benchmark scenes are multi-floor, so the band must
+# follow each episode's floor instead of the static config value.
+BEV_BAND_ABOVE_FLOOR = (0.2, 1.5)
+
+
+def _read_json_maybe_gz(path):
+    import gzip
+    if path.endswith(".gz"):
+        with gzip.open(path, "rt") as f:
+            return json.load(f)
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def _dataset_files(path):
+    """Episode files for a dataset path: a single .json/.json.gz file, or a
+    directory in the standard habitat-lab layout (`<split>/content/<scene>.json.gz`;
+    the top-level `<split>.json.gz` holds no episodes for ObjectNav and is
+    ignored when a content/ dir exists)."""
+    if os.path.isfile(path):
+        return [path]
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"dataset path not found: {path}")
+    content = os.path.join(path, "content")
+    scan_dir = content if os.path.isdir(content) else path
+    files = [os.path.join(scan_dir, fn) for fn in sorted(os.listdir(scan_dir))
+             if fn.endswith((".json", ".json.gz"))]
+    if not files:
+        raise FileNotFoundError(f"no .json/.json.gz episode files under {scan_dir}")
+    return files
+
+
+def _rotation_xyzw(rot):
+    """Normalize a start-rotation quaternion to [x, y, z, w].
+
+    habitat-lab episode files store [x, y, z, w]; the SemExp Gibson episodes
+    store [w, x, y, z]. Both datasets only use yaw (rotation about +Y), whose
+    quaternion has exactly two non-zero components — (y, w) — so the ordering
+    is identified by which pair of slots is zero."""
+    a, b, c, d = (float(v) for v in rot)
+    if abs(b) < 1e-5 and abs(d) < 1e-5 and (abs(a) > 1e-5 or abs(c) > 1e-5):
+        return [b, c, d, a]  # was [w, x, y, z]
+    return [a, b, c, d]
+
+
+# SemExp's category list (Gibson ObjectNav v1.1). `sem_map` channel 0 is the
+# navigable area; channel i+1 is the mask of category SEMEXP_CATEGORIES[i].
+# Only the first six are used as goals in the benchmark.
+SEMEXP_CATEGORIES = ["chair", "couch", "potted plant", "bed", "toilet", "tv",
+                     "dining-table", "oven", "sink", "refrigerator", "book",
+                     "clock", "vase", "cup", "bottle"]
+SEMEXP_MAP_RES = 0.05  # m per sem_map cell
+
+
+def _semexp_goal_lookup(split_dir):
+    """Ground-truth goals for the SemExp Gibson ObjectNav v1.1 variant, whose
+    `<scene>_episodes.json.gz` files carry no goal positions — the ground truth
+    is the rasterized per-floor semantic map in `<split>_info.pbz2`.
+
+    Map→world (from SemExp's sim_continuous_to_sim_map, verified against the
+    scenes' navmesh bounds): habitat x = row * 0.05 + origin[1]/100,
+    habitat z = col * 0.05 + origin[0]/100 (origin is in cm).
+
+    Returns lookup(scene_stem, floor_id, category) -> list of rect goals
+    (each connected component of the category mask becomes an axis-aligned
+    {rect, y} footprint, scored against its nearest point — equivalent to
+    SemExp's "geodesic to the nearest category cell" up to bbox concavity),
+    or None when no *_info.pbz2 exists next to the dataset."""
+    import glob
+    cands = sorted(glob.glob(os.path.join(split_dir, "*_info.pbz2")))
+    if not cands:
+        return None
+    import bz2
+    import pickle
+    with bz2.BZ2File(cands[0], "rb") as f:
+        info = pickle.load(f)
+    from scipy import ndimage
+    cache = {}
+
+    def lookup(stem, floor_id, category):
+        key = (stem, floor_id, category)
+        if key in cache:
+            return cache[key]
+        goals = []
+        floor = (info.get(stem) or {}).get(floor_id)
+        if floor is not None and category in SEMEXP_CATEGORIES:
+            sem, origin = floor["sem_map"], floor["origin"]
+            y = float(floor["floor_height"])
+            mask = sem[SEMEXP_CATEGORIES.index(category) + 1] > 0
+            labels, n = ndimage.label(mask)
+            for sl in ndimage.find_objects(labels):
+                r, c = sl[0], sl[1]
+                x_min = r.start * SEMEXP_MAP_RES + origin[1] / 100.0
+                x_max = r.stop * SEMEXP_MAP_RES + origin[1] / 100.0
+                z_min = c.start * SEMEXP_MAP_RES + origin[0] / 100.0
+                z_max = c.stop * SEMEXP_MAP_RES + origin[0] / 100.0
+                goals.append({"rect": [x_min, z_min, x_max, z_max], "y": y})
+        cache[key] = goals
+        return goals
+
+    return lookup
+
+
+def load_objectnav_dataset(path, scenes_root="gibson_scenes",
+                           categories=None, scenes=None, max_per_combo=None,
+                           success_radius_m=1.0, query_template="a {category}"):
+    """Load a standard Habitat ObjectNav episode dataset (the benchmarks VLFM /
+    SemExp evaluate on) into the same (scn, runs) shape the scenarios path
+    produces, so `run`/`review`/`report` work unchanged.
+
+    Handles the habitat-lab ObjectNav-v1 JSON schema: per-scene `episodes`
+    (scene_id, start_position, start_rotation, object_category) with goal
+    instances either inline (`episode["goals"]`), in the file-level
+    `goals_by_category` (keyed `<scene_basename>_<category>`), or — for the
+    SemExp Gibson v1.1 variant, whose episode files carry no goal positions —
+    extracted from the `<split>_info.pbz2` GT semantic maps as rectangular
+    footprints (see `_semexp_goal_lookup`; episodes without a category, like
+    SemExp's `<scene>.glb.json.gz` stubs, are skipped). Each episode
+    becomes one run:
+      id           {category}__{scene_stem}__ep{episode_id}
+      combo        {category}__{scene_stem}  (per-combo rollup = per scene+category)
+      query        query_template.format(category=...)  (underscores → spaces)
+      goals        every goal instance's object position (scored geodesically
+                   against the nearest, success_radius_m default 1.0 m — the
+                   SemExp/VLFM "stop within 1 m of the object" protocol)
+    plus per-run extras the scenarios path doesn't carry: `scene` (local .glb
+    resolved as <scenes_root>/<scene_stem>.glb), `start_rotation` ([x,y,z,w]
+    quaternion), `episode_id`, and `bev_band` (the BEV height band for the
+    episode's floor, derived from the start Y).
+
+    `categories` / `scenes` filter by object category / scene stem;
+    `max_per_combo` caps episodes per (category × scene) for balanced subsets.
+    Episodes whose scene .glb is missing locally are skipped with a warning.
+    """
+    cat_filter = ({c.lower().replace("_", " ") for c in categories}
+                  if categories else None)
+    scene_filter = {s.lower() for s in scenes} if scenes else None
+
+    # SemExp-variant ground truth (goals live in <split>_info.pbz2, not in the
+    # episode files). Search next to the given file, or in the split dir.
+    semexp_lookup = None
+    for d in ({os.path.dirname(path), os.path.dirname(os.path.dirname(path))}
+              if os.path.isfile(path) else {path}):
+        if d:
+            semexp_lookup = _semexp_goal_lookup(d)
+            if semexp_lookup is not None:
+                break
+
+    runs, missing_scenes, combo_counts = [], set(), {}
+    for fp in _dataset_files(path):
+        data = _read_json_maybe_gz(fp)
+        goals_by_cat = data.get("goals_by_category") or {}
+        for ep in data.get("episodes", []):
+            scene_id = str(ep["scene_id"])
+            stem = os.path.splitext(os.path.basename(scene_id))[0]
+            if stem.endswith(".glb"):  # scene ids like "gibson/X.glb"
+                stem = os.path.splitext(stem)[0]
+            if scene_filter and stem.lower() not in scene_filter:
+                continue
+            category = ep.get("object_category")
+            if category is None:
+                continue  # e.g. SemExp's <scene>.glb.json.gz stubs (no category)
+            category = str(category)
+            cat_human = category.replace("_", " ")
+            if cat_filter and cat_human.lower() not in cat_filter:
+                continue
+            combo = f"{category}__{stem}"
+            if max_per_combo is not None and combo_counts.get(combo, 0) >= max_per_combo:
+                continue
+
+            glb = os.path.join(scenes_root, stem + ".glb")
+            if not os.path.exists(glb):
+                missing_scenes.add(stem)
+                continue
+
+            goals = (ep.get("goals")
+                     or goals_by_cat.get(f"{os.path.basename(scene_id)}_{category}")
+                     or [])
+            goal_pts = [[float(v) for v in g["position"]]
+                        for g in goals if g.get("position")]
+            if not goal_pts and semexp_lookup is not None:
+                # SemExp variant: rect goals from the GT semantic map.
+                goal_pts = semexp_lookup(stem, ep.get("floor_id", 0), category)
+            if not goal_pts:
+                continue
+
+            start = [float(v) for v in ep["start_position"]]
+            rot = ep.get("start_rotation")
+            eid = str(ep.get("episode_id", len(runs)))
+            combo_counts[combo] = combo_counts.get(combo, 0) + 1
+            runs.append({
+                "id": f"{combo}__ep{eid}",
+                "combo": combo, "repeat": 0,
+                "target": category, "start_name": f"ep{eid}",
+                "start": start,
+                "start_rotation": (_rotation_xyzw(rot) if rot else None),
+                "query": query_template.format(category=cat_human),
+                "goals": goal_pts,
+                "success_radius_m": float(success_radius_m),
+                "scene": os.path.abspath(glb),
+                "episode_id": eid,
+                "bev_band": [start[1] + BEV_BAND_ABOVE_FLOOR[0],
+                             start[1] + BEV_BAND_ABOVE_FLOOR[1]],
+            })
+
+    if missing_scenes:
+        print(f"[dataset] skipped {len(missing_scenes)} scene(s) with no local .glb "
+              f"under {scenes_root}: {', '.join(sorted(missing_scenes))}")
+    scn = {
+        "scene": f"dataset:{path}",
+        "success_radius_m": float(success_radius_m),
+        # Episodes per (category × scene); drives the per-combo rollup display.
+        "runs_per_combo": max(combo_counts.values()) if combo_counts else 1,
+    }
+    return scn, runs
 
 
 # ── Goal geometry (offline, euclidean — for evidence display) ────────────────
@@ -178,7 +400,7 @@ def from_records(out_dir):
     """Reconstruct (scn, runs) from the records actually present in
     <out>/runs/, so report/review aggregate exactly what's on disk regardless
     of the current scenarios file. `scn` carries only the metadata report needs
-    (scene, detector, runs_per_combo); `runs` are self-describing (each record
+    (scene, runs_per_combo); `runs` are self-describing (each record
     stores its id/combo/goals). Runs are ordered by id."""
     runs, scene = [], None
     for p in _record_files(out_dir):
@@ -203,7 +425,6 @@ def from_records(out_dir):
         combo_counts[r["combo"]] = combo_counts.get(r["combo"], 0) + 1
     scn = {
         "scene": scene or "(from records)",
-        "detector": None,
         "runs_per_combo": max(combo_counts.values()) if combo_counts else 1,
     }
     return scn, runs
@@ -402,24 +623,28 @@ def aggregate(runs, records, verdicts):
 # ── Final-BEV evidence render (matplotlib, reads saved maps) ──────────────────
 
 def _latest_map_step(run_dir):
-    """Highest step index for which similarity + occupancy maps exist."""
-    sim_dir = os.path.join(run_dir, "sim_maps")
-    if not os.path.isdir(sim_dir):
+    """Highest step index for which an occupancy map exists. Occupancy is the
+    one BEV map saved in every evidence mode (the minimal path saves only it),
+    so it is the common key; similarity/uncertainty exist only with --video."""
+    occ_dir = os.path.join(run_dir, "occ_maps")
+    if not os.path.isdir(occ_dir):
         return None
     steps = []
-    for fn in os.listdir(sim_dir):
-        if fn.startswith("bev_similarity_") and fn.endswith(".npy"):
+    for fn in os.listdir(occ_dir):
+        if fn.startswith("bev_occupancy_") and fn.endswith(".npy"):
             try:
-                steps.append(int(fn[len("bev_similarity_"):-len(".npy")]))
+                steps.append(int(fn[len("bev_occupancy_"):-len(".npy")]))
             except ValueError:
                 pass
     return max(steps) if steps else None
 
 
 def render_final_bev(run_dir, record, goals, out_png):
-    """Render a static final-BEV PNG (similarity + occupancy) with the agent's
-    final pose and the goal geometry marked. Returns the path on success, None
-    if the maps aren't on disk. Used as review evidence."""
+    """Render a static final-BEV PNG with the agent's final pose and the goal
+    geometry marked. Uses the occupancy map (always saved) plus similarity when
+    present (--video only): two panels with --video, one occupancy panel in the
+    default minimal-evidence mode. Returns the path on success, None if the
+    occupancy map isn't on disk. Used as review evidence."""
     import numpy as np
     import matplotlib
     matplotlib.use("Agg")
@@ -435,16 +660,17 @@ def render_final_bev(run_dir, record, goals, out_png):
     min_z, max_z = ext["min_z"], ext["max_z"]
     extent = [min_x, max_x, min_z, max_z]
 
-    sim = os.path.join(run_dir, "sim_maps", f"bev_similarity_{step}.npy")
     occ = os.path.join(run_dir, "occ_maps", f"bev_occupancy_{step}.npy")
-    if not (os.path.exists(sim) and os.path.exists(occ)):
+    if not os.path.exists(occ):
         return None
-    sim_map, occ_map = np.load(sim), np.load(occ)
+    panels = [(np.load(occ), "Occupancy", "gray")]
+    sim = os.path.join(run_dir, "sim_maps", f"bev_similarity_{step}.npy")
+    if os.path.exists(sim):
+        panels.insert(0, (np.load(sim), "Similarity", "viridis"))
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-    for ax, (data, title, cmap) in zip(
-            axes, [(sim_map, "Similarity", "viridis"),
-                   (occ_map, "Occupancy", "gray")]):
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 5),
+                             squeeze=False)
+    for ax, (data, title, cmap) in zip(axes[0], panels):
         ax.imshow(data, origin="lower", extent=extent, cmap=cmap, aspect="equal")
         ax.set_title(f"{title} (step {step})")
         ax.set_xlabel("x (m)"); ax.set_ylabel("z (m)")

@@ -1,5 +1,6 @@
 import math
 import numpy as np
+import quaternion  # registers the numpy.quaternion dtype (np.quaternion)
 import habitat_sim
 import habitat_sim.utils.common as utils
 
@@ -44,8 +45,13 @@ def spawn_agent_at_random_navpoint(sim, agent) -> np.ndarray:
         print("Warning: No navmesh found. Agent spawned at origin.")
         return np.zeros(3)
 
-def spawn_agent_at_pos(sim, agent, pos: np.ndarray) -> np.ndarray:
-    """Spawn agent at the navmesh point closest to `pos`. Falls back to origin if no navmesh."""
+def spawn_agent_at_pos(sim, agent, pos: np.ndarray, rotation=None) -> np.ndarray:
+    """Spawn agent at the navmesh point closest to `pos`. Falls back to origin
+    if no navmesh.
+
+    `rotation`, if given, is the start orientation as an [x, y, z, w] quaternion
+    (the habitat episode-dataset convention, w last); None keeps the default
+    identity orientation."""
     if sim.pathfinder.is_loaded:
         nav_point = sim.pathfinder.snap_point(pos)
         if np.isnan(nav_point).any():
@@ -53,8 +59,13 @@ def spawn_agent_at_pos(sim, agent, pos: np.ndarray) -> np.ndarray:
             return np.zeros(3)
         initial_state = habitat_sim.AgentState()
         initial_state.position = nav_point
+        if rotation is not None:
+            x, y, z, w = (float(v) for v in rotation)
+            initial_state.rotation = np.quaternion(w, x, y, z)
         agent.set_state(initial_state)
-        print(f"Agent spawned at: {nav_point}")
+        print(f"Agent spawned at: {nav_point}"
+              + (f" rot(xyzw)={[round(float(v), 3) for v in rotation]}"
+                 if rotation is not None else ""))
         return np.array(nav_point)
     else:
         print("Warning: No navmesh found. Agent spawned at origin.")
