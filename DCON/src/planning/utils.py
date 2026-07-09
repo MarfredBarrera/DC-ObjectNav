@@ -6,17 +6,29 @@ from scipy.sparse.csgraph import dijkstra
 
 
 def reachable_min(field, occ_map, seed_zx):
-    """Min of `field` over the 8-connected non-occupied component containing
-    `seed_zx` — i.e. the best field value actually reachable from the seed.
+    """Min of `field` over the observed-FREE cells of the 8-connected
+    non-occupied component containing `seed_zx` — i.e. the best field value at
+    a spot the agent can reach AND has actually observed to be standable.
 
-    Used to anchor the goal distance field: a global min over non-occupied
-    cells can be hijacked by an enclosed observed-free or unseen pocket inside
-    the goal object's blob (floor slivers seen under/behind furniture), which
-    deflates the anchor at a spot no rollout can reach and inflates the
-    anchored distance everywhere reachable — making the arrival radius
-    unsatisfiable. The seed cell is treated as traversable regardless of its
-    occupancy (the agent may start dilated into a wall), which bridges it to
-    its adjacent non-occupied cells.
+    Used to anchor the goal distance field. Two hijack modes are guarded:
+    * an enclosed observed-free or unseen pocket inside the goal object's blob
+      (floor slivers seen under/behind furniture) — excluded by the component
+      test (not 8-connected to the seed);
+    * the unseen EXTERIOR of the scene for a goal on an outer wall (e.g. a
+      window): unseen cells beyond the wall connect to the seed's component
+      through frontier/map-edge cells and sit within a step or two of the goal,
+      so an unrestricted min deflates the anchor to a cell on the far side of
+      the wall — every interior cell then keeps the full wall-crossing penalty
+      and the arrival radius (and the caller's stop check) becomes
+      unsatisfiable, orbiting the agent forever. Restricting the min to
+      observed-FREE members keeps the anchor on real floor near the goal.
+
+    Connectivity still runs over all non-occupied cells (unseen doesn't
+    disconnect the component). Falls back to the unrestricted component min
+    when it holds no observed-free cell yet (degenerate early-episode maps).
+    The seed cell is treated as traversable regardless of its occupancy (the
+    agent may start dilated into a wall), which bridges it to its adjacent
+    non-occupied cells.
     """
     occ = np.asarray(occ_map)
     sz = min(max(int(round(float(seed_zx[0]))), 0), occ.shape[0] - 1)
@@ -25,7 +37,10 @@ def reachable_min(field, occ_map, seed_zx):
     mask[sz, sx] = True
     labels, _ = ndimage.label(mask, structure=np.ones((3, 3), dtype=bool))
     comp = labels == labels[sz, sx]
-    return float(np.asarray(field)[comp].min())
+    anchor_cells = comp & (occ == 1)
+    if not anchor_cells.any():
+        anchor_cells = comp
+    return float(np.asarray(field)[anchor_cells].min())
 
 
 def goal_distance_field(occ_map, goal_zx, occupied_cell_cost, unseen_cell_cost=1.0):

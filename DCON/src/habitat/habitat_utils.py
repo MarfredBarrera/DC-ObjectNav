@@ -84,7 +84,8 @@ def get_camera_matrix(agent) -> np.ndarray:
 
 def make_cfg(
     scene_filepath: str,
-    resolution: int = 512,
+    width: int = 512,
+    height: int = 512,
     fov_deg: float = 90.0,
     sensor_height: float = 1.5,
 ) -> habitat_sim.Configuration:
@@ -97,7 +98,7 @@ def make_cfg(
         spec = habitat_sim.CameraSensorSpec()
         spec.uuid = uuid
         spec.sensor_type = sensor_type
-        spec.resolution = [resolution, resolution]
+        spec.resolution = [height, width]  # habitat spec order is [H, W]
         spec.position = [0.0, sensor_height, 0.0]
         spec.orientation = [0.0, 0.0, 0.0]
         spec.hfov = fov_deg

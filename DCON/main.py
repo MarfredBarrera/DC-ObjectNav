@@ -42,7 +42,7 @@ from src.perception.obj_detection import make_detector
 from src.perception.perception_stack import PerceptionStack
 from src.perception.utils import unprojection
 from src.planning.mppi import MPPIPlanner
-from visualize import render_navigation
+from tools.visualize import render_navigation
 
 
 REPLAN_INTERVAL = 100
@@ -426,12 +426,36 @@ def run(cfg: Config, save_enabled: bool = True,
         start_pos = [-2.0, -3.0, 6.0]
     # 1. Init simulator
     sim, agent = init_simulator(
-        cfg.scene_path, resolution=cfg.img_width, fov_deg=cfg.fov, sensor_height=cfg.sensor_height,
+        cfg.scene_path, width=cfg.img_width, height=cfg.img_height,
+        fov_deg=cfg.fov, sensor_height=cfg.sensor_height,
         agent_radius=cfg.agent_radius,
         agent_height=cfg.agent_height,
     )
     start_nav = spawn_agent_at_pos(sim, agent, start_pos,
                                    rotation=start_rotation)  # snapped navmesh start
+    snap_dist = float(np.linalg.norm(np.asarray(start_nav) - np.asarray(start_pos)))
+    if snap_dist > cfg.max_spawn_snap_m:
+        sim.close()
+        raise RuntimeError(
+            f"spawn point {list(start_pos)} snapped {snap_dist:.2f}m to "
+            f"{list(np.asarray(start_nav))} (> max_spawn_snap_m="
+            f"{cfg.max_spawn_snap_m}m) — requested spawn isn't connected to "
+            "this scene's navmesh (disconnected floor / broken reconstruction "
+            "/ bad annotation); not a fair episode to evaluate.")
+    # `bev_height_min`/`bev_height_max` may have been set from the *nominal*
+    # start_pos[1] by the caller (e.g. eval_scene.py's per-episode floor
+    # band) before the sim existed to snap it. Shift the band by however much
+    # snapping moved the agent vertically, so a small mismatch here doesn't
+    # silently starve every BEV map of observed cells for the whole episode.
+    dy = float(np.asarray(start_nav)[1] - start_pos[1])
+    if dy:
+        cfg.bev_height_min += dy
+        cfg.bev_height_max += dy
+    # grid_max_height is a hard absolute-Y cap applied once at grid
+    # construction (VoxelGrid.initialize_from_bounds); grow it to cover the
+    # (possibly just-shifted) band so upper-floor bands don't get silently
+    # clipped to an empty Y-range.
+    cfg.grid_max_height = max(cfg.grid_max_height, cfg.bev_height_max)
     scene_bounds = get_scene_bounds_from_pathfinder(sim)
 
     sim_iface = SimInterface(cfg, sim, agent)

@@ -17,6 +17,7 @@ from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 
@@ -354,6 +355,139 @@ class LocateAnythingDetector:
         xs = sorted((x1 * w, x2 * w))
         ys = sorted((y1 * h, y2 * h))
         return 1.0, (xs[0], ys[0], xs[1], ys[1])
+
+
+class CLIPSegDetector:
+    """Open-vocabulary segmentation-based verifier using CLIPSeg (Lueddecke &
+    Ecker, 2022).
+
+    Unlike LLMDet/LocateAnything, CLIPSeg is not a box detector: a lightweight
+    transformer decoder, trained on top of *frozen* CLIP, predicts a dense
+    per-pixel activation map for a text prompt. There is no box regression and
+    no vision-language early-fusion — architecturally and in training data it
+    is unlike both LLMDet (grounding-DINO) and LocateAnything (generative
+    Qwen-VL-style), so its failure modes are plausibly uncorrelated with
+    either, which is what would make it useful as a second-stage verifier: a
+    proposal box counts only if the region also carries high CLIPSeg
+    activation for the same query.
+
+    No boxes of its own, so `detect`/`detect_all` derive one from the
+    thresholded activation mask's bounding box (largest connected blob) purely
+    for interface parity with the other detectors; the intended use is
+    `verify()` against an already-proposed box.
+    """
+
+    name = "clipseg"
+
+    def __init__(
+        self,
+        device: str = "cuda",
+        model_name: str = "CIDAS/clipseg-rd64-refined",
+        threshold: float = 0.5,
+    ):
+        from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
+
+        self.device = device
+        self.threshold = float(threshold)
+        self.processor = CLIPSegProcessor.from_pretrained(model_name)
+        self.model = CLIPSegForImageSegmentation.from_pretrained(model_name).to(device)
+        self.model.eval()
+
+    @classmethod
+    def from_config(cls, cfg) -> "CLIPSegDetector":
+        return cls(
+            device=cfg.device,
+            model_name=cfg.clipseg_model_name,
+            threshold=cfg.clipseg_threshold,
+        )
+
+    @torch.no_grad()
+    def segment(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> torch.Tensor:
+        """Dense sigmoid activation map for `query`, upsampled (bilinear) to
+        the input image's (H, W). Values in [0, 1]; higher = more relevant.
+        CLIPSeg's native output is a low-res (352/16=22^2-ish) logit grid."""
+        arr = to_uint8_rgb(image)
+        pil = Image.fromarray(arr)
+        h, w = arr.shape[:2]
+
+        inputs = self.processor(text=[query], images=[pil], return_tensors="pt").to(self.device)
+        outputs = self.model(**inputs)
+        logits = outputs.logits          # (H', W') for a single prompt
+        if logits.dim() == 2:
+            logits = logits.unsqueeze(0)
+        mask = torch.sigmoid(logits[0])  # (H', W')
+        mask = F.interpolate(
+            mask[None, None], size=(h, w), mode="bilinear", align_corners=False,
+        )[0, 0]
+        return mask
+
+    @staticmethod
+    def score_in_box(
+        mask: torch.Tensor,
+        box: Tuple[float, float, float, float],
+        reduce: str = "mean",
+        top_frac: float = 0.2,
+    ) -> float:
+        """Reduce `mask` (H, W) over `box` (xmin, ymin, xmax, ymax) in pixel
+        coords. `reduce`: "mean" (region-wide activation, robust to a box
+        that's slightly loose but diluted by background inside a loose box),
+        "max" (peak activation anywhere in-box, a single-pixel statistic so
+        noisy), or "topk" (mean of the top `top_frac` fraction of in-box
+        pixels — a middle ground: robust to a loose box like mean, but not
+        swamped by background the way a whole-box mean is)."""
+        h, w = mask.shape
+        x0 = max(0, int(round(box[0])))
+        y0 = max(0, int(round(box[1])))
+        x1 = min(w, max(x0 + 1, int(round(box[2]))))
+        y1 = min(h, max(y0 + 1, int(round(box[3]))))
+        crop = mask[y0:y1, x0:x1]
+        if crop.numel() == 0:
+            return 0.0
+        if reduce == "mean":
+            return float(crop.mean())
+        if reduce == "max":
+            return float(crop.max())
+        if reduce == "topk":
+            flat = crop.reshape(-1)
+            k = max(1, int(round(flat.numel() * top_frac)))
+            return float(torch.topk(flat, k).values.mean())
+        raise ValueError(f"Unknown reduce {reduce!r} (expected 'mean', 'max', or 'topk')")
+
+    def verify(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+        box: Tuple[float, float, float, float],
+        reduce: str = "mean",
+        top_frac: float = 0.2,
+    ) -> Tuple[bool, float]:
+        """Does `query`'s CLIPSeg activation over `box` clear `self.threshold`?
+        Returns (accepted, score). Intended as a verifier over a proposal box
+        from another detector (mirrors CascadeDetector's role for LLMDet)."""
+        mask = self.segment(image, query)
+        score = self.score_in_box(mask, box, reduce=reduce, top_frac=top_frac)
+        return score >= self.threshold, score
+
+    def detect(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image],
+        query: str,
+    ) -> Tuple[float, Optional[Tuple[float, float, float, float]]]:
+        """Bounding box of the largest thresholded activation blob, for
+        interface parity with the other detectors. Score is the mean
+        activation inside that box. `(0.0, None)` if nothing clears
+        `self.threshold`."""
+        mask = self.segment(image, query)
+        keep = (mask >= self.threshold).cpu().numpy()
+        if not keep.any():
+            return 0.0, None
+        ys, xs = np.where(keep)
+        box = (float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1))
+        return self.score_in_box(mask, box), box
 
 
 class CascadeDetector:

@@ -1,0 +1,20 @@
+# HM3D-OVON agent profile — the Hello Robot Stretch embodiment the benchmark
+# simulates (values from the OVON task config, ovon repo
+# config/tasks/objectnav_stretch_hm3d.yaml). Overlay on the base config:
+#
+#   python benchmarks/eval_scene.py run --dataset <ovon split dir> \
+#       --scenes-root <hm3d val scenes> --discrete --radius 1.0 \
+#       --agent-config config/evaluation_configs/agent_ovon_stretch.yaml ...
+#
+# Only the keys present here override the base config. Note the camera is a
+# narrow (42° HFOV) portrait 360x640 — expect meaningfully less per-frame
+# coverage for the detector / MaskCLIP / IG raycast than the default 90° 720².
+# Action space (25 cm forward, 30° turns, 500-step budget) is NOT set here:
+# that's the standard discrete protocol, already applied by --discrete.
+habitat:
+  img_width: 360
+  img_height: 640
+  fov: 42            # horizontal FOV, degrees
+  sensor_height: 1.31
+  agent_height: 1.41
+  agent_radius: 0.17

@@ -1,0 +1,366 @@
+{
+  "tp": [
+    {
+      "id": "bed__Corozal__ep0",
+      "query": "a bed",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.7591652870178223,
+      "ep_dir": "output/objectnav_val_Corozal_jul2/ep/bed__Corozal__ep0",
+      "frame_path": "output/objectnav_val_Corozal_jul2/ep/bed__Corozal__ep0/rgbs/rgb_9700.png"
+    },
+    {
+      "id": "tv__Corozal__ep1",
+      "query": "a tv",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.8469366431236267,
+      "ep_dir": "output/objectnav_val_Corozal_jul2/ep/tv__Corozal__ep1",
+      "frame_path": "output/objectnav_val_Corozal_jul2/ep/tv__Corozal__ep1/rgbs/rgb_1183.png"
+    },
+    {
+      "id": "tv__Collierville__ep18",
+      "query": "a tv",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.019561128690838814,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep18",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep18/rgbs/rgb_90500.png"
+    },
+    {
+      "id": "bench__4ok3usBNeis__ep283",
+      "query": "a bench",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.6301466226577759,
+      "ep_dir": "output/ovon_val_seen_jul8/ep/bench__4ok3usBNeis__ep283",
+      "frame_path": "output/ovon_val_seen_jul8/ep/bench__4ok3usBNeis__ep283/rgbs/rgb_12200.png"
+    },
+    {
+      "id": "basketball_hoop__bathroom__r0",
+      "query": "mini basketball hoop",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.6471688151359558,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/basketball_hoop__bathroom__r0",
+      "frame_path": "output/saved_data/goffs_jul2/ep/basketball_hoop__bathroom__r0/rgbs/rgb_46900.png"
+    },
+    {
+      "id": "basketball_hoop__bathroom__r1",
+      "query": "mini basketball hoop",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.7796466946601868,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/basketball_hoop__bathroom__r1",
+      "frame_path": "output/saved_data/goffs_jul2/ep/basketball_hoop__bathroom__r1/rgbs/rgb_57200.png"
+    },
+    {
+      "id": "chair__bathroom__r0",
+      "query": "chair",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.8206937909126282,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/chair__bathroom__r0",
+      "frame_path": "output/saved_data/goffs_jul2/ep/chair__bathroom__r0/rgbs/rgb_5200.png"
+    },
+    {
+      "id": "chair__bathroom__r2",
+      "query": "chair",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.8537483215332031,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/chair__bathroom__r2",
+      "frame_path": "output/saved_data/goffs_jul2/ep/chair__bathroom__r2/rgbs/rgb_8300.png"
+    },
+    {
+      "id": "coat__bathroom__r0",
+      "query": "coat",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.16744869947433472,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/coat__bathroom__r0",
+      "frame_path": "output/saved_data/goffs_jul2/ep/coat__bathroom__r0/rgbs/rgb_60400.png"
+    },
+    {
+      "id": "coat__bathroom__r1",
+      "query": "coat",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.4552178978919983,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/coat__bathroom__r1",
+      "frame_path": "output/saved_data/goffs_jul2/ep/coat__bathroom__r1/rgbs/rgb_10900.png"
+    },
+    {
+      "id": "coffee_maker__bathroom__r0",
+      "query": "coffee maker",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.34957897663116455,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/coffee_maker__bathroom__r0",
+      "frame_path": "output/saved_data/goffs_jul2/ep/coffee_maker__bathroom__r0/rgbs/rgb_26300.png"
+    },
+    {
+      "id": "coffee_maker__bathroom__r1",
+      "query": "coffee maker",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.2462436407804489,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/coffee_maker__bathroom__r1",
+      "frame_path": "output/saved_data/goffs_jul2/ep/coffee_maker__bathroom__r1/rgbs/rgb_62900.png"
+    },
+    {
+      "id": "fume_hood__bathroom__r0",
+      "query": "kitchen fume hood",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.21115005016326904,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/fume_hood__bathroom__r0",
+      "frame_path": "output/saved_data/goffs_jul2/ep/fume_hood__bathroom__r0/rgbs/rgb_31500.png"
+    },
+    {
+      "id": "fume_hood__bathroom__r1",
+      "query": "kitchen fume hood",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.19585150480270386,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/fume_hood__bathroom__r1",
+      "frame_path": "output/saved_data/goffs_jul2/ep/fume_hood__bathroom__r1/rgbs/rgb_31600.png"
+    },
+    {
+      "id": "refrigerator__bathroom__r0",
+      "query": "silver refrigerator",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.37421560287475586,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/refrigerator__bathroom__r0",
+      "frame_path": "output/saved_data/goffs_jul2/ep/refrigerator__bathroom__r0/rgbs/rgb_57100.png"
+    },
+    {
+      "id": "refrigerator__bathroom__r1",
+      "query": "silver refrigerator",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.37464210391044617,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/refrigerator__bathroom__r1",
+      "frame_path": "output/saved_data/goffs_jul2/ep/refrigerator__bathroom__r1/rgbs/rgb_72600.png"
+    },
+    {
+      "id": "toilet__bathroom__r0",
+      "query": "toilet",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.776448667049408,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/toilet__bathroom__r0",
+      "frame_path": "output/saved_data/goffs_jul2/ep/toilet__bathroom__r0/rgbs/rgb_21300.png"
+    },
+    {
+      "id": "toilet__bathroom__r1",
+      "query": "toilet",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.8651509284973145,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/toilet__bathroom__r1",
+      "frame_path": "output/saved_data/goffs_jul2/ep/toilet__bathroom__r1/rgbs/rgb_31400.png"
+    },
+    {
+      "id": "chair__Collierville__ep12",
+      "query": "a chair",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.4967648684978485,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/chair__Collierville__ep12",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/chair__Collierville__ep12/rgbs/rgb_4800.png"
+    },
+    {
+      "id": "chair__Collierville__ep2",
+      "query": "a chair",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.8431612253189087,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/chair__Collierville__ep2",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/chair__Collierville__ep2/rgbs/rgb_8900.png"
+    },
+    {
+      "id": "couch__Collierville__ep17",
+      "query": "a couch",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.3845230042934418,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/couch__Collierville__ep17",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/couch__Collierville__ep17/rgbs/rgb_6600.png"
+    },
+    {
+      "id": "potted plant__Collierville__ep16",
+      "query": "a potted plant",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.5463811755180359,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/potted plant__Collierville__ep16",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/potted plant__Collierville__ep16/rgbs/rgb_5100.png"
+    },
+    {
+      "id": "potted plant__Collierville__ep7",
+      "query": "a potted plant",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.6475775837898254,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/potted plant__Collierville__ep7",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/potted plant__Collierville__ep7/rgbs/rgb_5100.png"
+    },
+    {
+      "id": "toilet__Collierville__ep0",
+      "query": "a toilet",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.5228466391563416,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/toilet__Collierville__ep0",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/toilet__Collierville__ep0/rgbs/rgb_11300.png"
+    },
+    {
+      "id": "toilet__Collierville__ep10",
+      "query": "a toilet",
+      "success": true,
+      "agent_stopped": true,
+      "final_geodesic": 0.004339784383773804,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/toilet__Collierville__ep10",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/toilet__Collierville__ep10/rgbs/rgb_89300.png"
+    }
+  ],
+  "fp": [
+    {
+      "id": "chair__4ok3usBNeis__ep565",
+      "query": "a chair",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 1.820188283920288,
+      "ep_dir": "output/ovon_val_seen_jul8/ep/chair__4ok3usBNeis__ep565",
+      "frame_path": "output/ovon_val_seen_jul8/ep/chair__4ok3usBNeis__ep565/rgbs/rgb_5900.png"
+    },
+    {
+      "id": "rack__4ok3usBNeis__ep1123",
+      "query": "a rack",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 1.3211761713027954,
+      "ep_dir": "output/ovon_val_seen_jul8/ep/rack__4ok3usBNeis__ep1123",
+      "frame_path": "output/ovon_val_seen_jul8/ep/rack__4ok3usBNeis__ep1123/rgbs/rgb_35500.png"
+    },
+    {
+      "id": "cabinet__5cdEh9F2hJL__ep3979",
+      "query": "a cabinet",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 5.511277198791504,
+      "ep_dir": "output/ovon_val_seen_jul9/ep/cabinet__5cdEh9F2hJL__ep3979",
+      "frame_path": "output/ovon_val_seen_jul9/ep/cabinet__5cdEh9F2hJL__ep3979/rgbs/rgb_6600.png"
+    },
+    {
+      "id": "chair__bathroom__r1",
+      "query": "chair",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 1.2143151760101318,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/chair__bathroom__r1",
+      "frame_path": "output/saved_data/goffs_jul2/ep/chair__bathroom__r1/rgbs/rgb_16900.png"
+    },
+    {
+      "id": "chair__dining_room__r2",
+      "query": "chair",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 1.8549362421035767,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/chair__dining_room__r2",
+      "frame_path": "output/saved_data/goffs_jul2/ep/chair__dining_room__r2/rgbs/rgb_5800.png"
+    },
+    {
+      "id": "refrigerator__office__r0",
+      "query": "silver refrigerator",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 4.715500354766846,
+      "ep_dir": "output/saved_data/goffs_jul2/ep/refrigerator__office__r0",
+      "frame_path": "output/saved_data/goffs_jul2/ep/refrigerator__office__r0/rgbs/rgb_10200.png"
+    },
+    {
+      "id": "couch__Collierville__ep13",
+      "query": "a couch",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 2.1953811645507812,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/couch__Collierville__ep13",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/couch__Collierville__ep13/rgbs/rgb_200.png"
+    },
+    {
+      "id": "couch__Collierville__ep21",
+      "query": "a couch",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 2.6748414039611816,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/couch__Collierville__ep21",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/couch__Collierville__ep21/rgbs/rgb_1400.png"
+    },
+    {
+      "id": "tv__Collierville__ep11",
+      "query": "a tv",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 5.958159446716309,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep11",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep11/rgbs/rgb_19200.png"
+    },
+    {
+      "id": "tv__Collierville__ep14",
+      "query": "a tv",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 6.960085868835449,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep14",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep14/rgbs/rgb_13400.png"
+    },
+    {
+      "id": "tv__Collierville__ep15",
+      "query": "a tv",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 6.902257919311523,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep15",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep15/rgbs/rgb_33900.png"
+    },
+    {
+      "id": "tv__Collierville__ep22",
+      "query": "a tv",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 6.93739128112793,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep22",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep22/rgbs/rgb_16200.png"
+    },
+    {
+      "id": "tv__Collierville__ep4",
+      "query": "a tv",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 6.952309608459473,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep4",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep4/rgbs/rgb_44300.png"
+    },
+    {
+      "id": "tv__Collierville__ep5",
+      "query": "a tv",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 6.186406135559082,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep5",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep5/rgbs/rgb_4500.png"
+    },
+    {
+      "id": "tv__Collierville__ep9",
+      "query": "a tv",
+      "success": false,
+      "agent_stopped": true,
+      "final_geodesic": 6.990514755249023,
+      "ep_dir": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep9",
+      "frame_path": "output/saved_data/objectnav_val_Collierville_jul2/ep/tv__Collierville__ep9/rgbs/rgb_6900.png"
+    }
+  ]
+}

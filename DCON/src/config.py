@@ -11,7 +11,7 @@ class Config:
         'paths': ['output_dir'],
         'habitat': ['scene_path', 'img_width', 'img_height', 'fov',
                     'sensor_height', 'min_sensor_dist', 'max_sensor_dist',
-                    'agent_radius', 'agent_height'],
+                    'agent_radius', 'agent_height', 'max_spawn_snap_m'],
         'semantics': ['maskclip_model_name', 'maskclip_input_size', 'target_query'],
         'training': ['iterations', 'device'],
         'hashgrid': {
@@ -56,7 +56,8 @@ class Config:
                       'llmdet_threshold', 'llmdet_use_sinks',
                       'llmdet_num_sinks', 'llmdet_sink_init',
                       'detector_cascade', 'locate_anything_model_name',
-                      'locate_anything_max_new_tokens', 'cascade_min_iou'],
+                      'locate_anything_max_new_tokens', 'cascade_min_iou',
+                      'clipseg_model_name', 'clipseg_threshold'],
         'visualization': ['viz_interval', 'vmax_epi'],
     }
 
@@ -86,6 +87,15 @@ class Config:
         # squeezes through tighter gaps. <=0 keeps the scene's baked navmesh.
         self.agent_radius = 0.1
         self.agent_height = 1.5
+        # Max distance (m) pathfinder.snap_point may move a requested spawn
+        # point. Normal navmesh snapping is a few cm (settling onto the
+        # walkable surface); a much larger snap means the requested point
+        # isn't actually connected to this scene's navmesh (a disconnected
+        # floor, broken stairs in the reconstruction, or a bad annotation)
+        # and got matched to an unrelated, possibly different-floor location
+        # instead. main.run() raises rather than running a doomed episode
+        # against the wrong floor's geometry for the full step budget.
+        self.max_spawn_snap_m = 1.0
 
         # Semantics Settings (MaskCLIP)
         self.maskclip_model_name = "ViT-B/16"
@@ -145,7 +155,7 @@ class Config:
         self.mppi_dt = 0.1
         self.mppi_w_sign = -1.0  # flip if Habitat ω rotates opposite of MPPI's heading convention
         self.mppi_max_w_rps = 2.0  # rad/s clamp — prevents huge spins from sharp turns
-        self.mppi_min_v_mps = 0.05
+        self.mppi_min_v_mps = 0.0
         self.mppi_max_v_mps = 1.0
         self.mppi_horizon = 150           # rollout length (steps)
         # Collision-check subsampling: number of intermediate points checked
@@ -250,7 +260,7 @@ class Config:
         self.detected_min_box_frac = 0.01
         self.detected_max_box_frac = 0.97
         self.detected_min_dist_m = 0.05
-        self.detected_max_dist_m = 3.5
+        self.detected_max_dist_m = 3.0
 
         # Detector cadence once latched into EXPLOIT (`detected`) mode. The goal
         # is pinned to the cached box cell and committed hard there, so
@@ -306,12 +316,25 @@ class Config:
         self.locate_anything_max_new_tokens = 128
         self.cascade_min_iou = 0.1
 
+        # CLIPSegDetector (src/perception/obj_detection.py): a segmentation-
+        # based verifier candidate, not yet wired into the cascade. Frozen CLIP
+        # + a small trained decoder over a text prompt -> dense activation map;
+        # architecturally unlike both LLMDet and LocateAnything, so its FPs are
+        # plausibly uncorrelated. Threshold is un-calibrated (no sweep done
+        # yet, unlike llmdet_threshold's 60-frame sweep) -- treat 0.5 as a
+        # placeholder until validated.
+        self.clipseg_model_name = "CIDAS/clipseg-rd64-refined"
+        self.clipseg_threshold = 0.5
+
         # Load from YAML if path provided
         if yaml_path is not None:
-            self._load_from_yaml(yaml_path)
+            self.apply_yaml(yaml_path)
 
-    def _load_from_yaml(self, yaml_path: str):
-        """Override defaults from a YAML file, driven by _YAML_SCHEMA."""
+    def apply_yaml(self, yaml_path: str):
+        """Override current values from a YAML file, driven by _YAML_SCHEMA.
+        Callable repeatedly — later files overlay earlier ones (used by
+        eval_scene.py --agent-config to stack an agent/sensor profile on the
+        base config)."""
         with open(yaml_path, 'r') as f:
             yaml_data = yaml.safe_load(f) or {}
 
