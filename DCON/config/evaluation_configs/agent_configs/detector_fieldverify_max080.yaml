@@ -1,0 +1,9 @@
+# Field-verified LLMDet — sweep point: MAX pooling, threshold 0.80 (strict:
+# the map must strongly assert the target somewhere inside the box).
+# τ=0.47 sink-gated LLMDet, no cascade.
+detection:
+  llmdet_threshold: 0.47
+  detector_cascade: false
+  field_verify: true
+  field_verify_threshold: 0.80
+  field_verify_pool: "max"

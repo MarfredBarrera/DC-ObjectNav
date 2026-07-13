@@ -91,19 +91,19 @@ class VoxelGrid:
         return max(0, idx_start), min(self.num_y, idx_end)
 
 class SimilarityGrid(VoxelGrid):
-    """3D Similarity Voxel Grid with 2D BEV projection."""
-    def __init__(self, config, feature_field, semantics, scene_bounds):
+    """3D Similarity Voxel Grid with 2D BEV projection.
+
+    The feature field's output IS the relevance score directly (trained to
+    regress CLIPSeg's scalar activation for a fixed query) -- no text
+    embedding or dot-product step needed here anymore.
+    """
+    def __init__(self, config, feature_field, scene_bounds):
         super().__init__(config, scene_bounds, device=config.device)
         self.feature_field = feature_field
-        self.semantics = semantics
         self.voxels = None # 3D Similarity Map (Y, Z, X)
 
-    def compute_similarity_map(self, text_query, batch_size=100000, occupancy_grid=None):
+    def compute_similarity_map(self, batch_size=100000, occupancy_grid=None):
         if not self.initialized: return None
-
-        # Embed Text via MaskCLIP
-        with torch.no_grad():
-            text_embed = self.semantics.encode_text(text_query)
 
         # Full grid points
         points, grid_shape = self.generate_sample_points()
@@ -123,11 +123,8 @@ class SimilarityGrid(VoxelGrid):
                 start, end = i * batch_size, min((i + 1) * batch_size, query_points.shape[0])
                 batch_pts = points_tensor[start:end]
 
-                gamma, _, _, _ = self.feature_field.forward(batch_pts, normalize=True)
-                gamma = gamma / (gamma.norm(dim=-1, keepdim=True) + 1e-8)
-
-                sim = torch.matmul(gamma, text_embed.T).squeeze(-1)
-                sim = (sim + 1.0) / 2.0
+                gamma, _, _, _ = self.feature_field.forward(batch_pts, normalize=False)
+                sim = gamma.squeeze(-1).clamp(0.0, 1.0)
                 all_sims.append(sim)
 
         all_sims = torch.cat(all_sims, dim=0)
@@ -289,7 +286,7 @@ class UncertaintyGrid(VoxelGrid):
         with torch.no_grad():
             for i in range(int(np.ceil(pts_tensor.shape[0] / batch_size))):
                 start, end = i * batch_size, min((i + 1) * batch_size, pts_tensor.shape[0])
-                _, ale, epi, _ = self.feature_field.forward(pts_tensor[start:end], normalize=True)
+                _, ale, epi, _ = self.feature_field.forward(pts_tensor[start:end], normalize=False)
                 epi_chunks.append(epi.squeeze(-1))
                 ale_chunks.append(ale.squeeze(-1))
 

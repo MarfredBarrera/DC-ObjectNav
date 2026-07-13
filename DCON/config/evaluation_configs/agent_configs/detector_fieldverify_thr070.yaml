@@ -1,0 +1,9 @@
+# Field-verified LLMDet — sweep point: threshold 0.70 (aggressive; SR was
+# still climbing at 0.50 with FP-stops remaining). τ=0.47 sink-gated LLMDet,
+# no cascade.
+detection:
+  llmdet_threshold: 0.47
+  detector_cascade: false
+  field_verify: true
+  field_verify_threshold: 0.70
+  field_verify_top_frac: 0.10

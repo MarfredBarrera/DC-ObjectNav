@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from src.config import Config
-from src.perception.semantics import MaskCLIPSemantics
+from src.perception.semantics import CLIPSegSemantics
 from src.perception.featurefield import EvidentialFeatureField
 from src.perception.grid import UncertaintyGrid, OccupancyGrid, SimilarityGrid
 from src.perception.utils import unprojection
@@ -73,14 +73,25 @@ class PerceptionStack:
         self.device = cfg.device
         self.scene_bounds = scene_bounds
 
-        self.mask_clip = MaskCLIPSemantics(
+        # CLIPSeg is query-conditioned (a trained decoder scores one fixed
+        # prompt), not a query-agnostic embedding like MaskCLIP -- accepted
+        # tradeoff: target_query never changes mid-run, and CLIPSeg's per-
+        # pixel signal is much cleaner, especially before the target has been
+        # well-observed. See CLIPSegSemantics docstring.
+        self.semantics = CLIPSegSemantics(
+            query=cfg.target_query,
             device=self.device,
-            model_name=cfg.maskclip_model_name,
-            input_size=cfg.maskclip_input_size,
+            model_name=cfg.clipseg_model_name,
+            distractors=cfg.distractor_objects if cfg.clipseg_contrastive else None,
+            softmax_temp=cfg.clipseg_softmax_temp,
         )
         # Single evidential field: aleatoric + epistemic uncertainty in one
         # forward pass via the Normal-Inverse-Gamma marginal (replaces the
         # ensemble whose only role was empirical epistemic from prediction var).
+        # Output is now a scalar CLIPSeg relevance score (hash_feature_dim=1),
+        # not a 512-D embedding -- the field aggregates that score across
+        # every observed viewpoint into one persistent, multi-view-consistent
+        # relevance map instead of trusting any single noisy frame.
         self.feature_field = EvidentialFeatureField(
             cfg, scene_bounds=scene_bounds, device=self.device,
         )
@@ -88,7 +99,7 @@ class PerceptionStack:
         self.ugrid = UncertaintyGrid(cfg, feature_field=self.feature_field, scene_bounds=scene_bounds)
         self.occupancy_grid = OccupancyGrid(cfg, scene_bounds=scene_bounds)
         self.similarity_grid = SimilarityGrid(
-            cfg, feature_field=self.feature_field, semantics=self.mask_clip, scene_bounds=scene_bounds,
+            cfg, feature_field=self.feature_field, scene_bounds=scene_bounds,
         )
 
         # Flat history buffer: bounded-memory ring over all observed points
@@ -106,9 +117,9 @@ class PerceptionStack:
         depth_gpu = depth.to(self.device)
         c2w_gpu = c2w.to(self.device)
 
-        # MaskCLIP: pass the image tensor directly on GPU — no numpy conversion
+        # CLIPSeg: pass the image tensor directly on GPU — no numpy conversion
         rgb_gpu = rgb.to(self.device)
-        clip_features = self.mask_clip.extract_dense_features(rgb_gpu)
+        clip_features = self.semantics.extract_dense_features(rgb_gpu)
 
         if depth_near is None:
             depth_near = self.cfg.min_sensor_dist
@@ -118,10 +129,6 @@ class PerceptionStack:
         mask = (depth_gpu > depth_near) & (depth_gpu < depth_far)
         world_points = unprojection(depth_gpu, intrinsics, c2w_gpu, self.device, mask=mask)
         gt_features = clip_features[mask]
-
-        valid = gt_features.norm(dim=-1) > 1e-6
-        world_points = world_points[valid]
-        gt_features = gt_features[valid]
 
         return world_points, gt_features
 
@@ -239,7 +246,7 @@ class PerceptionStack:
             self.occupancy_grid.save(step)
 
         # Similarity
-        self.similarity_grid.compute_similarity_map(self.target_query, occupancy_grid=self.occupancy_grid)
+        self.similarity_grid.compute_similarity_map(occupancy_grid=self.occupancy_grid)
         if save_enabled:
             self.similarity_grid.save(step)
 
@@ -282,11 +289,9 @@ class PerceptionStack:
         if not self.target_query:
             return
 
-        # 1. Get Text Embedding
-        with torch.no_grad():
-            text_embed = self.mask_clip.encode_text(self.target_query)
-
-        # 2. Project View to 3D
+        # Project View to 3D. No text embedding needed anymore -- the field's
+        # output IS the relevance score directly (trained to regress CLIPSeg's
+        # scalar activation for the fixed target_query).
         fx, fy, cx, cy, H, W = intrinsics
         mask = (depth > self.cfg.min_sensor_dist) & (depth < self.cfg.max_sensor_dist)
         world_points = unprojection(depth.to(self.device), intrinsics, c2w.to(self.device), self.device, mask=mask)
@@ -303,11 +308,8 @@ class PerceptionStack:
                     start, end = i * batch_size, min((i + 1) * batch_size, world_points.shape[0])
                     batch_pts = world_points[start:end]
 
-                    gamma, _, _, _ = self.feature_field.forward(batch_pts, normalize=True)
-                    gamma = gamma / (gamma.norm(dim=-1, keepdim=True) + 1e-8)
-
-                    sim = (gamma @ text_embed.T).squeeze(-1)
-                    sim = (sim + 1.0) / 2.0
+                    gamma, _, _, _ = self.feature_field.forward(batch_pts, normalize=False)
+                    sim = gamma.squeeze(-1).clamp(0.0, 1.0)
                     all_sims.append(sim)
 
             sim_2d = torch.zeros((H, W), device=self.device)
@@ -318,6 +320,62 @@ class PerceptionStack:
         os.makedirs(sim_dir, exist_ok=True)
         save_path = os.path.join(sim_dir, f"sim2d_{step:03d}.npy")
         np.save(save_path, sim_2d.cpu().numpy())
+
+    @torch.no_grad()
+    def field_score_in_box(
+        self,
+        depth: torch.Tensor,
+        c2w: torch.Tensor,
+        intrinsics: tuple,
+        box,
+        top_frac: float = 0.10,
+        min_points: int = 20,
+        pool: str = "topk",
+    ) -> Optional[float]:
+        """Pooled field relevance over the depth pixels inside a detector box.
+
+        Unprojects every valid-depth pixel inside `box` (xmin, ymin, xmax,
+        ymax, in `depth`'s pixel space) to a world point, forward-passes the
+        trained CLIPSeg relevance field there, and pools the point scores:
+        `pool="topk"` returns the mean of the top `top_frac` fraction (robust
+        to background inside a loose box, unlike a whole-box mean; not a
+        single-pixel statistic like max); `pool="max"` returns the single
+        highest point score. Used to verify detections against the accumulated
+        multi-view map: a look-alike that fools the detector on one frame
+        reads low until the field itself has learned "target here".
+
+        Returns None when the box is degenerate or has fewer than
+        `min_points` valid-depth pixels (can't be verified).
+        """
+        if box is None:
+            return None
+        depth_gpu = depth.to(self.device)
+        H, W = depth_gpu.shape[-2:]
+        x0 = max(0, int(box[0]))
+        y0 = max(0, int(box[1]))
+        x1 = min(W, int(np.ceil(box[2])))
+        y1 = min(H, int(np.ceil(box[3])))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        mask = torch.zeros((H, W), dtype=torch.bool, device=self.device)
+        mask[y0:y1, x0:x1] = True
+        mask &= (depth_gpu > self.cfg.min_sensor_dist) & (depth_gpu < self.cfg.max_sensor_dist)
+        if int(mask.sum()) < max(1, int(min_points)):
+            return None
+        pts = unprojection(depth_gpu, intrinsics, c2w.to(self.device), self.device, mask=mask)
+
+        batch_size = self.cfg.hash_inference_batch_size
+        scores = []
+        for i in range(0, pts.shape[0], batch_size):
+            gamma, _, _, _ = self.feature_field.forward(pts[i:i + batch_size], normalize=False)
+            scores.append(gamma.squeeze(-1).clamp(0.0, 1.0))
+        flat = torch.cat(scores, dim=0)
+        if pool == "max":
+            return float(flat.max())
+        if pool == "topk":
+            k = max(1, int(round(flat.numel() * top_frac)))
+            return float(torch.topk(flat, k).values.mean())
+        raise ValueError(f"Unknown field_verify pool {pool!r} (expected 'topk' or 'max')")
 
     @property
     def buffer_size(self) -> int:

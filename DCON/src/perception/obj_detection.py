@@ -75,6 +75,20 @@ class LLMDetDetector:
 
     The sink mechanism here lives inside the detector's own vision-language
     fusion layers on the full image, which is exactly what the paper validated.
+
+    NOTE (2026-07-12 probe): do NOT append semantic distractor phrases to the
+    prompt alongside the sinks — the 48-sink suffix tokenizes to ~240
+    wordpieces (each "[unusedN]" splits into ~5, so the re-initialized sink
+    embeddings never actually appear in the tokenized prompt, which is why
+    `sink_init` measured inert) and crushes every non-lead phrase's per-box
+    score, silently disabling any inter-phrase comparison. A sink-free
+    multi-phrase prompt discriminates cleanly (couch box: "a couch"=0.607 /
+    "a bed"=0.036 in either phrase order) but changes the score distribution
+    τ was calibrated on. A distractor-phrase gate built this way was
+    implemented and then removed per user decision (2026-07-12; see
+    handoff.md work package 3); look-alike suppression lives in the
+    contrastive CLIPSeg field target instead (`cfg.clipseg_contrastive`,
+    semantics.py).
     """
 
     name = "llmdet"

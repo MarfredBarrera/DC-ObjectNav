@@ -214,13 +214,40 @@ def detect_classify_latch(detector, perception, sim_iface, cfg,
     once `cfg.detected_persistence` consecutive persistent detections accrue
     (never unlatches).
 
+    When `cfg.field_verify` is on, a detector box must additionally be
+    confirmed by the learned relevance field before it counts: the box's
+    valid-depth pixels are unprojected to 3D, the field is queried there, and
+    the pooled score (`cfg.field_verify_pool`: top-`cfg.field_verify_top_frac`
+    mean, or max) must clear `cfg.field_verify_threshold` (see
+    PerceptionStack.field_score_in_box). A
+    frame that fails the gate is treated as no detection at all — no goal, no
+    confidence, no latch. `field_score` is the pooled score (None when the
+    gate didn't run or the box couldn't be verified).
+
     Returns (det_score, det_box, det_persistent, det_investigate, conf_score,
-    detected, detected_streak).
+    detected, detected_streak, field_score).
     """
     if run_detector:
         det_score, det_box = detector.detect(rgb, perception.target_query)
     else:
         det_score, det_box = 0.0, None
+
+    field_score = None
+    if cfg.field_verify and det_box is not None:
+        field_score = perception.field_score_in_box(
+            depth, c2w, sim_iface.intrinsics, det_box,
+            top_frac=cfg.field_verify_top_frac,
+            min_points=cfg.field_verify_min_points,
+            pool=cfg.field_verify_pool)
+        if field_score is None or field_score < cfg.field_verify_threshold:
+            fs = "n/a" if field_score is None else f"{field_score:.3f}"
+            print(f"{tag}: field-verify REJECTED detection "
+                  f"(llmdet={det_score:.3f}, field={fs} < "
+                  f"{cfg.field_verify_threshold:.2f})")
+            det_score, det_box = 0.0, None
+        else:
+            print(f"{tag}: field-verify accepted "
+                  f"(llmdet={det_score:.3f}, field={field_score:.3f})")
 
     det_persistent, det_investigate = classify_detection(
         perception, cfg, sim_iface.intrinsics, det_box, depth, c2w, pos)
@@ -239,7 +266,7 @@ def detect_classify_latch(detector, perception, sim_iface, cfg,
             print(f"{tag}: DETECTED — entering exploit mode "
                   f"(det_score={det_score:.3f})")
     return (det_score, det_box, det_persistent, det_investigate, conf_score,
-            detected, detected_streak)
+            detected, detected_streak, field_score)
 
 
 def plan_one_action(perception, sim_iface, mppi, cfg,
@@ -610,7 +637,7 @@ def run(cfg: Config, save_enabled: bool = True,
             # approaches a far sighting and commits only once it has closed into
             # the usable band.
             (det_score, det_box, det_persistent, det_investigate, conf_score,
-             detected, detected_streak) = detect_classify_latch(
+             detected, detected_streak, field_score) = detect_classify_latch(
                 detector, perception, sim_iface, cfg,
                 rgb_cur, depth_cur, c2w_cur, pos, detected, detected_streak,
                 run_detector=run_detector, tag=f"step {step}")
@@ -712,6 +739,8 @@ def run(cfg: Config, save_enabled: bool = True,
                                      if action is not None else [0.0, 0.0])),
                     'opt_traj': [[int(p[0]), int(p[1])] for p in opt_traj] if opt_traj else [],
                     'det_conf': float(det_score),
+                    'field_score': (float(field_score)
+                                    if field_score is not None else None),
                     'det_box': [float(v) for v in det_box] if det_box is not None else None,
                     'goal': [int(goal_cell[0]), int(goal_cell[1])] if goal_cell is not None else None,
                     'mode': mode,

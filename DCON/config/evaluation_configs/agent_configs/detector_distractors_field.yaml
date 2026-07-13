@@ -1,0 +1,15 @@
+# Look-alike FP suppression, field layer only: the CLIPSeg field target
+# becomes sigmoid(target) x softmax over [target]+distractors, so the map
+# (and the field-verify gate reading it) answers "more couch than bed?"
+# instead of "couch-like?". Stacked on the fieldverify sweep winner.
+# NOTE: contrastive scores run lower on ambiguous objects than the plain
+# sigmoid the 0.50 threshold was swept on — if timeouts rise, sweep the
+# threshold down before judging the feature.
+detection:
+  llmdet_threshold: 0.47
+  detector_cascade: false
+  field_verify: true
+  field_verify_threshold: 0.50
+  field_verify_top_frac: 0.10
+  clipseg_contrastive: true
+  clipseg_softmax_temp: 1.0

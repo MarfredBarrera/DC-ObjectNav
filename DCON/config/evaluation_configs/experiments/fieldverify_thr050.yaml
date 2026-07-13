@@ -1,0 +1,6 @@
+# Current best stack: τ0.47 sink-gated LLMDet + CLIPSeg field-verify gate
+# (topk >= 0.50, the 2026-07 sweep winner). Continuous actions, matching the
+# jul3/jul4 baselines.
+#
+#   python benchmarks/eval_scene.py run --benchmark gibson --experiment fieldverify_thr050 --gpu 3
+agent_config: detector_fieldverify_thr050

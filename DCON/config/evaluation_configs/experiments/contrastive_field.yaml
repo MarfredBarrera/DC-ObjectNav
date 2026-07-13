@@ -1,0 +1,5 @@
+# Contrastive CLIPSeg field target on top of the fieldverify thr050 winner
+# (look-alike FP suppression: the field regresses sigmoid x softmax over
+# target+distractors — handoff.md work package 3). A/B against
+# fieldverify_thr050 on the same benchmark.
+agent_config: detector_distractors_field

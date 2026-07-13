@@ -1,14 +1,20 @@
 """ObjectNav evaluation — three transparent stages.
 
-Episodes come from one of two sources:
-  --scenarios  a hand-written per-scene sweep (custom targets × starts with
-               ground-truth goals; see config/evaluation_configs/scenarios_*.yaml), or
-  --dataset    a standard Habitat ObjectNav episode dataset (.json[.gz] — the
-               Gibson/SemExp, HM3D, or MP3D benchmark episodes VLFM and
-               Goal-Oriented Semantic Exploration report on). Pass --discrete
-               for the challenge action space (25 cm / 30°, 500-step budget).
+An eval is specified by two named configs plus a handful of session flags:
+  --benchmark   WHICH EPISODES — a named entry in
+                config/evaluation_configs/benchmarks.yaml (gibson, ovon, ...):
+                the episode source (standard Habitat ObjectNav dataset or a
+                hand-written scenarios sweep) plus any protocol embodiment
+                overlay (e.g. the OVON Stretch camera).
+  --experiment  EVERYTHING ELSE — one yaml under
+                config/evaluation_configs/experiments/: detector overlays,
+                action mode (discrete: true for the challenge 25 cm / 30° /
+                500-step space), subset caps, scoring options, output dir.
+  --gpu / --video / --agent-config / --rerun / --only / --verdicts / --out
+                per-invocation choices (hardware, evidence volume, quick
+                overlay tweaks, re-scoring) that never define an experiment.
 
-Either way the pipeline separates *evidence* from *judgment*:
+The pipeline separates *evidence* from *judgment*:
 
     run     execute episodes; save a raw record + evidence bundle per run
             (final pose, geodesics, BEV maps, trajectory video). Bakes in NO
@@ -24,11 +30,14 @@ Either way the pipeline separates *evidence* from *judgment*:
 verdicts.yaml is the single, authoritative human-judgment file (status per run:
 auto / success / fail / exclude). It replaces the old excluded.txt + overrides.txt.
 
-Typical loop (inside the docker container):
-    python benchmarks/eval_scene.py run    --scenarios config/evaluation_configs/scenarios_Goffs.yaml --out output/goffs
-    python benchmarks/eval_scene.py review --scenarios config/evaluation_configs/scenarios_Goffs.yaml --out output/goffs
-    # ...edit output/goffs/verdicts.yaml after watching the evidence...
-    python benchmarks/eval_scene.py report --scenarios config/evaluation_configs/scenarios_Goffs.yaml --out output/goffs
+Typical loop (inside the docker container; --out defaults to
+output/<benchmark>_<experiment>):
+    python benchmarks/eval_scene.py run    --benchmark gibson --experiment fieldverify_thr050 --gpu 3
+    python benchmarks/eval_scene.py review --benchmark gibson --experiment fieldverify_thr050
+    # ...edit the out dir's verdicts.yaml after watching the evidence...
+    python benchmarks/eval_scene.py report --benchmark gibson --experiment fieldverify_thr050
+Re-scoring an existing directory needs no configs at all:
+    python benchmarks/eval_scene.py report --out output/gibson_val_CLIPSEG_jul12
 
 Layout under <out>/:
     runs/<id>.json     raw per-run record (immutable evidence index)
@@ -39,6 +48,7 @@ Layout under <out>/:
 
 import argparse
 import gc
+import glob
 import json
 import os
 import sys
@@ -76,6 +86,158 @@ def resolve_results_path(args, verdicts_path):
     return os.path.join(args.out, name)
 
 
+# ── benchmark + experiment resolution ────────────────────────────────────────
+#
+# An eval is the product of three orthogonal choices, and the CLI carries only
+# the per-invocation ones:
+#   --benchmark   WHICH EPISODES: a named entry in benchmarks.yaml (episode
+#                 source + protocol embodiment overlay, e.g. gibson / ovon).
+#   --experiment  EVERYTHING ELSE, in one yaml under experiments/: detector
+#                 overlays, action mode, subset caps, scoring options, output
+#                 dir — the identity of the experiment.
+#   --gpu / --video / --agent-config / --rerun / --only / --verdicts / --out
+#                 session choices (hardware, evidence volume, quick overlay
+#                 tweaks, re-scoring) that never define an experiment.
+
+EVAL_CONFIG_DIR = "config/evaluation_configs"
+BENCHMARKS_FILE = os.path.join(EVAL_CONFIG_DIR, "benchmarks.yaml")
+EXPERIMENT_DIR = os.path.join(EVAL_CONFIG_DIR, "experiments")
+
+# Keys an experiment yaml may set. A benchmark entry may set the same minus
+# `benchmark`/`out` (it IS the episode source; it doesn't own the campaign).
+EXPERIMENT_KEYS = {
+    "benchmark", "scenarios", "dataset", "scenes_root", "categories",
+    "scenes", "max_per_combo", "viewpoints", "radius", "out", "discrete",
+    "config", "agent_config",
+}
+BENCHMARK_KEYS = EXPERIMENT_KEYS - {"benchmark", "out"}
+
+
+def _load_yaml_mapping(path: str, what: str) -> dict:
+    import yaml
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise SystemExit(f"{what} {path} must be a YAML mapping")
+    return data
+
+
+def _check_keys(data: dict, allowed: set, what: str):
+    unknown = {k for k in data if k.replace("-", "_") not in allowed}
+    if unknown:
+        raise SystemExit(f"{what}: unknown key(s) {sorted(unknown)} "
+                         f"(allowed: {', '.join(sorted(allowed))})")
+
+
+def load_benchmark(name: str) -> dict:
+    """Named episode source from benchmarks.yaml (dataset/scenarios paths,
+    scenes root, protocol embodiment overlay, protocol scoring defaults)."""
+    benchmarks = _load_yaml_mapping(BENCHMARKS_FILE, "benchmarks file")
+    if name not in benchmarks:
+        raise SystemExit(f"unknown benchmark {name!r} "
+                         f"(available: {', '.join(sorted(benchmarks))} — "
+                         f"defined in {BENCHMARKS_FILE})")
+    entry = benchmarks[name] or {}
+    _check_keys(entry, BENCHMARK_KEYS, f"benchmark {name!r}")
+    return entry
+
+
+def resolve_experiment_path(name: str) -> str:
+    """A real path is used as-is; a bare name resolves to
+    config/evaluation_configs/experiments/<name>.yaml."""
+    if os.path.exists(name):
+        return name
+    fname = name if name.endswith((".yaml", ".yml")) else name + ".yaml"
+    path = os.path.join(EXPERIMENT_DIR, fname)
+    if os.path.exists(path):
+        return path
+    avail = sorted(os.path.splitext(f)[0] for f in os.listdir(EXPERIMENT_DIR)
+                   if f.endswith((".yaml", ".yml"))) if os.path.isdir(EXPERIMENT_DIR) else []
+    raise SystemExit(f"experiment not found: {name!r} "
+                     f"(available: {', '.join(avail) or 'none'})")
+
+
+def resolve_overlay_path(name: str) -> str:
+    """agent_config value: a real path is used as-is; a bare name is searched
+    recursively under config/evaluation_configs/ (must match exactly one file,
+    so overlays can be referenced without their directory)."""
+    if os.path.exists(name):
+        return name
+    fname = name if name.endswith((".yaml", ".yml")) else name + ".yaml"
+    matches = sorted(glob.glob(os.path.join(EVAL_CONFIG_DIR, "**", fname),
+                               recursive=True))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SystemExit(f"agent-config not found: {name!r} "
+                         f"(no {fname} under {EVAL_CONFIG_DIR}/)")
+    raise SystemExit(f"agent-config name {name!r} is ambiguous: {matches}")
+
+
+def _as_list(v) -> list:
+    if v is None:
+        return []
+    return [v] if isinstance(v, str) else list(v)
+
+
+def resolve_settings(args):
+    """Merge experiment yaml + benchmark entry + CLI into the flat attrs the
+    stages consume. Precedence per key: CLI > experiment > benchmark >
+    built-in default. Overlays stack instead (benchmark embodiment first,
+    then the experiment's, then CLI --agent-config) so the most specific
+    layer wins per config key."""
+    exp, exp_name = {}, None
+    if args.experiment:
+        path = resolve_experiment_path(args.experiment)
+        exp = _load_yaml_mapping(path, "experiment")
+        exp = {k.replace("-", "_"): v for k, v in exp.items()}
+        _check_keys(exp, EXPERIMENT_KEYS, f"experiment {path}")
+        exp_name = os.path.splitext(os.path.basename(path))[0]
+        print(f"[experiment] {path}")
+
+    bench_name = args.benchmark or exp.get("benchmark")
+    bench = load_benchmark(bench_name) if bench_name else {}
+    bench = {k.replace("-", "_"): v for k, v in bench.items()}
+    if bench_name:
+        print(f"[benchmark] {bench_name}: "
+              f"{bench.get('dataset') or bench.get('scenarios')}")
+
+    def pick(key, default=None):
+        return exp.get(key, bench.get(key, default))
+
+    args.scenarios = pick("scenarios")
+    args.dataset = pick("dataset")
+    args.scenes_root = pick("scenes_root", "gibson_scenes")
+    args.categories = pick("categories")
+    args.scenes = pick("scenes")
+    args.max_per_combo = pick("max_per_combo")
+    args.viewpoints = bool(pick("viewpoints", False))
+    args.radius = pick("radius")           # None → protocol default below
+    args.discrete = bool(pick("discrete", False))
+
+    if args.out is None:
+        args.out = exp.get("out")
+    if args.out is None:
+        parts = [p for p in (bench_name, exp_name) if p]
+        if parts:
+            args.out = os.path.join("output", "_".join(parts))
+    # review/report on a plain directory: --out alone is a valid spec.
+    if args.out is None:
+        raise SystemExit("no output dir: pass --benchmark/--experiment "
+                         "(out defaults to output/<benchmark>_<experiment>) "
+                         "or an explicit --out")
+
+    if hasattr(args, "gpu"):               # run-only settings
+        args.gpu = "0" if args.gpu is None else str(args.gpu)
+        args.config = exp.get("config", "config/config.yaml")
+        args.video = bool(args.video)
+        args.no_evidence = bool(args.no_evidence)
+        overlays = (_as_list(bench.get("agent_config"))
+                    + _as_list(exp.get("agent_config"))
+                    + _as_list(args.agent_config))
+        args.agent_config = [resolve_overlay_path(p) for p in overlays]
+
+
 # ── run ──────────────────────────────────────────────────────────────────────
 
 def cmd_run(args, scn, runs):
@@ -84,9 +246,10 @@ def cmd_run(args, scn, runs):
     from src.config import Config
 
     evidence = "off" if args.no_evidence else ("minimal + video" if args.video else "minimal")
+    overlays = ", ".join(args.agent_config) if args.agent_config else "none"
     print(f"[run] scene={os.path.basename(scn['scene'])} | {len(runs)} run(s) "
           f"({scn['runs_per_combo']}x per combo) | discrete={args.discrete} | "
-          f"evidence={evidence}")
+          f"evidence={evidence} | overlays={overlays}")
 
     for i, r in enumerate(runs):
         rid = r["id"]
@@ -100,11 +263,12 @@ def cmd_run(args, scn, runs):
               f"'{r['query']}' @ {r['start_name']} ===")
 
         cfg = Config(args.config)
-        # Agent/sensor profile overlaid on the base config (e.g. the HM3D-OVON
-        # Stretch camera), applied before the per-run overrides below so it
-        # can never clobber the episode's scene/query/band.
-        if args.agent_config:
-            cfg.apply_yaml(args.agent_config)
+        # Agent/sensor/detector profiles overlaid on the base config (e.g. the
+        # HM3D-OVON Stretch camera), in order, applied before the per-run
+        # overrides below so they can never clobber the episode's
+        # scene/query/band. Already resolved to real paths in main().
+        for overlay in args.agent_config:
+            cfg.apply_yaml(overlay)
         # Dataset runs carry their own scene (episodes span scenes) and the BEV
         # height band for their floor; scenarios runs use the file-level scene
         # and the config's band.
@@ -274,39 +438,22 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     def common(p):
-        p.add_argument("--scenarios", default=None,
-                       help="Per-scene scenarios YAML/JSON (custom targets/starts/goals). "
-                            "`run` needs this or --dataset. For `review`/`report`, omit "
-                            "both to aggregate exactly the records in <out>/runs/.")
-        p.add_argument("--dataset", default=None,
-                       help="Standard Habitat ObjectNav episode dataset (.json[.gz] "
-                            "file, or a split dir with content/*.json.gz) — the "
-                            "benchmark episodes VLFM / SemExp evaluate on. "
-                            "Mutually exclusive with --scenarios.")
-        p.add_argument("--scenes-root", default="gibson_scenes",
-                       help="--dataset: directory with local scene .glb files "
-                            "(episodes whose scene is missing are skipped)")
-        p.add_argument("--categories", nargs="*", default=None,
-                       help="--dataset: keep only these object categories")
-        p.add_argument("--scenes", nargs="*", default=None,
-                       help="--dataset: keep only these scene stems (e.g. Collierville)")
-        p.add_argument("--max-per-combo", type=int, default=None,
-                       help="--dataset: cap episodes per (category x scene) for "
-                            "balanced subsets")
-        p.add_argument("--viewpoints", action="store_true", default=False,
-                       help="--dataset: score against the goals' view_points "
-                            "(the navigable poses around each object habitat's "
-                            "official DistanceToGoal VIEW_POINTS measure uses) "
-                            "instead of the object positions. Default --radius "
-                            "becomes 0.1 (the official success_distance).")
-        p.add_argument("--radius", type=float, default=None,
-                       help="--dataset: success radius (m, geodesic). Default "
-                            "1.0 — the SemExp/VLFM 'stop within 1 m of the "
-                            "object' protocol — or 0.1 with --viewpoints "
-                            "(habitat's success_distance to a view point).")
-        p.add_argument("--out", default="output/scene_eval", help="Output directory")
-        p.add_argument("--discrete", action="store_true", default=False,
-                       help="Discrete Habitat ObjectNav action mode")
+        p.add_argument("--benchmark", default=None,
+                       help="Which episodes: a named entry in "
+                            "config/evaluation_configs/benchmarks.yaml "
+                            "(gibson, ovon, ...). Provides the episode source "
+                            "+ any protocol embodiment overlay.")
+        p.add_argument("--experiment", default=None,
+                       help="Everything else, in one yaml: config/evaluation_"
+                            "configs/experiments/<name>.yaml (or a path) — "
+                            "detector overlays, action mode, subset caps, "
+                            "scoring options, output dir. CLI flags override "
+                            "its values.")
+        p.add_argument("--out", default=None,
+                       help="Output directory (default output/<benchmark>_"
+                            "<experiment>). Alone it is a valid spec for "
+                            "review/report: aggregate exactly the records in "
+                            "<out>/runs/.")
         p.add_argument("--only", nargs="*", default=None, help="Restrict to these run ids")
         p.add_argument("--verdicts", default=None,
                        help="Verdicts file to use (default <out>/verdicts.yaml). "
@@ -315,22 +462,23 @@ def main():
 
     p_run = sub.add_parser("run", help="Execute episodes + save evidence")
     common(p_run)
-    p_run.add_argument("--gpu", default="0", help="GPU device index")
-    p_run.add_argument("--config", default="config/config.yaml", help="Base config YAML")
-    p_run.add_argument("--agent-config", default=None,
-                       help="Agent/sensor profile YAML overlaid on --config "
-                            "(same schema, only the keys present override) — "
-                            "e.g. config/evaluation_configs/agent_ovon_stretch.yaml "
-                            "for the HM3D-OVON Stretch camera/body.")
-    p_run.add_argument("--rerun", action="store_true", default=False,
-                       help="Re-simulate runs even if a saved result exists")
-    p_run.add_argument("--no-evidence", action="store_true", default=False,
-                       help="Save nothing but traj_log + grid_extent (no final "
-                            "occupancy map, no inspection bundle)")
+    p_run.add_argument("--gpu", default=None, help="GPU device index (default 0)")
+    p_run.add_argument("--agent-config", action="append", default=None,
+                       help="Extra agent/sensor/detector profile YAML overlaid "
+                            "on the experiment's stack (same schema as "
+                            "config/config.yaml, only the keys present "
+                            "override). Repeatable — overlays apply in order. "
+                            "A bare name (e.g. detector_fieldverify_thr050) is "
+                            "found anywhere under config/evaluation_configs/.")
     p_run.add_argument("--video", action="store_true", default=False,
                        help="Also save the full per-step BEV map + RGB history and "
                             "render nav_history.mp4 (large; default keeps only the "
                             "final occupancy map + bev_final.png)")
+    p_run.add_argument("--no-evidence", action="store_true", default=False,
+                       help="Save nothing but traj_log + grid_extent (no final "
+                            "occupancy map, no inspection bundle)")
+    p_run.add_argument("--rerun", action="store_true", default=False,
+                       help="Re-simulate runs even if a saved result exists")
     p_run.add_argument("--refresh-bev", action="store_true", default=False,
                        help="Re-render bev_final.png even if it exists")
 
@@ -348,16 +496,24 @@ def main():
 
     args = parser.parse_args()
 
-    # `run` must know what to execute: either a scenarios file (custom
-    # targets/starts/goals) or a standard ObjectNav episode dataset. `review`
-    # and `report` operate on data already on disk: with a source they use
-    # that run set (and warn about records it doesn't cover); without one they
-    # aggregate exactly the records present in <out>/runs/ — immune to the
-    # source having since changed (renamed combos, restricted targets).
+    # Fold the experiment yaml + benchmark entry into the flat settings the
+    # stages consume (CLI > experiment > benchmark > default per key).
+    resolve_settings(args)
+
+    # `run` must know what to execute: a benchmark (or an experiment carrying
+    # a dataset/scenarios source). `review` and `report` operate on data
+    # already on disk: with a source they use that run set (and warn about
+    # records it doesn't cover); with only --out they aggregate exactly the
+    # records present in <out>/runs/ — immune to the source having since
+    # changed (renamed combos, restricted targets).
     if args.scenarios and args.dataset:
-        parser.error("--scenarios and --dataset are mutually exclusive")
+        raise SystemExit("config error: both scenarios and dataset ended up "
+                         "set (benchmark + experiment overlap?) — they are "
+                         "mutually exclusive")
     if args.command == "run" and not (args.scenarios or args.dataset):
-        parser.error("run requires --scenarios or --dataset")
+        parser.error("run needs an episode source: --benchmark <name> "
+                     "(see config/evaluation_configs/benchmarks.yaml) or an "
+                     "--experiment whose yaml sets benchmark:/dataset:/scenarios:")
     if args.radius is None:
         args.radius = 0.1 if args.viewpoints else 1.0
 

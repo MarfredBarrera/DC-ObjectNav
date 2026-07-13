@@ -1,301 +1,286 @@
-# DCON Handoff Notes
+# Handoff: CLIPSeg feature field + field-verified detection
 
-Snapshot of the current state of the MPPI planning stack and how the main loop
-flows. Captures the changes the user has applied directly (some without
-discussion), so future-me reads this instead of guessing.
+Three stacked, **uncommitted** work packages (working tree dirty — `git status` from
+the repo root); the newest is #3:
 
----
+## Work package 4: eval CLI rework — benchmark × experiment (2026-07-13)
 
-## High-level algorithm
+`benchmarks/eval_scene.py`'s CLI was rebuilt (per user spec: only gpu,
+benchmark choice, video, and agent-config on the command line; everything
+else in a pointed-to yaml). An earlier `--preset` design from the same day
+was replaced by this. BREAKING: the old `--dataset/--scenarios/--scenes-root/
+--categories/--scenes/--max-per-combo/--viewpoints/--radius/--discrete/
+--config` flags are GONE from the CLI:
 
-The agent runs a perception–planning loop with three cadences:
+- `--benchmark <name>` → entry in `config/evaluation_configs/benchmarks.yaml`
+  (gibson, ovon, ovon_unseen, ovon_synonyms, goffs): episode source +
+  scenes_root + protocol embodiment overlay (ovon* bake in
+  `agent_ovon_stretch`).
+- `--experiment <name>` → `config/evaluation_configs/experiments/<name>.yaml`:
+  everything else (agent_config overlays, discrete, max_per_combo,
+  categories/scenes, radius/viewpoints, out, base config). Keys validated.
+  Current: `fieldverify_thr050`, `contrastive_field`, + `*_smoke` (cap 2).
+- Session flags: `--gpu --video --no-evidence --agent-config (repeatable,
+  bare names resolve anywhere under evaluation_configs) --rerun --only
+  --verdicts --results --refresh-bev --out`.
+- Precedence per key CLI > experiment > benchmark > default; overlays STACK
+  (benchmark → experiment → CLI). `--out` defaults to
+  `output/<benchmark>_<experiment>`; `report --out <dir>` alone still
+  re-scores any existing directory.
 
-1. **Every step** — one gradient step on the feature-field ensemble.
-2. **Every `REPLAN_INTERVAL = 200` steps** — call MPPI for a new plan, execute
-   exactly **one** action from the resulting control sequence, then discard the
-   rest of the queue next replan.
-3. **Every `cfg.hash_buffer_refresh_interval = 2000` steps** — pull a fresh
-   RGB-D frame, update the replay buffer + occupancy, rebuild the BEV maps.
+Typical: `python benchmarks/eval_scene.py run --benchmark gibson
+--experiment contrastive_field --gpu 3`. See
+`config/evaluation_configs/README.md`. Existing overlay yamls were
+deliberately NOT moved: the live gibson_val_CLIPSEG_jul12 run re-reads
+`detector_fieldverify_thr050.yaml` by path every episode.
 
-The replan path is now A\*-free and top-k-free:
+## Work package 3: look-alike FP suppression (2026-07-12)
 
-```
-plan_one_action():
-    bev_sim, bev_epi, bev_occ = perception.* .get_2d_map(...)
-    approach_points = mppi.get_goals_near_highest_sim(bev_sim, bev_occ, max_candidates=1)
-    goal = approach_points[0]                          # closest free cell to highest-sim peak
-    opt_path, U_opt, _ = mppi.optimize_trajectory(
-        start_grid, goal, bev_epi, bev_occ,
-        initial_heading=heading, progress=progress, ...
-    )
-    # Fill action queue with U_opt, pop one, return.
-    # On failure (U_opt = None): try queue, else idle.
-```
+Targets the 13 FP-stops that SURVIVE the field gate (CLIPSeg corroborates
+geometric look-alikes, e.g. bed__Corozal 0.83).
 
-`astar` is still imported and passed into `plan_one_action` for parameter
-compatibility, but it is **not called anywhere on the MPPI path**.
+**Contrastive CLIPSeg field target** (`clipseg_contrastive`,
+`clipseg_softmax_temp`, default OFF) — the field's per-pixel training target
+becomes sigmoid(target) × softmax over [target] + `cfg.distractor_objects`
+(18 canonical phrases incl. wall/floor as background classes; one batched
+CLIPSeg pass, K conditional embeddings cached at construction; the query's
+own category is word-overlap-filtered out per query —
+`semantics.filter_distractors`). The map answers "more couch than bed?"
+instead of "couch-like?". Field/gate/BEV machinery unchanged (still scalar
+[0,1]); `field_verify_threshold` 0.50 was swept on the plain sigmoid, so
+re-sweep if timeouts rise.
 
----
+Smoke-tested on the gate-resistant FP frame itself
+(bed__Corozal__ep0/rgbs/rgb_12500.png, the couch the run latched on):
+bed-on-couch topk10 0.730 → 0.210 while couch-on-couch reads 0.571;
+distractors-off path byte-identical to plain sigmoid. Test:
+`output/scratch_distractor/smoke_distractor.py` (run with
+`-e PYTHONPATH=/workspace/DCON`).
 
-## MPPI in detail (`src/planning/mppi.py`)
+Eval overlay (stacked on the fieldverify thr050 winner):
+`config/evaluation_configs/detector_distractors_field.yaml`. Suggested A/B:
+vs `fieldverify_sweep_thr050` on the same 50-ep subset.
 
-### Signature
-
-```python
-optimize_trajectory(
-    start, goal, epi_map, occ_map,
-    num_samples=100, num_iters=3, horizon=100,
-    lambda_weight=None, w_goal=None, w_ig=None,
-    w_occ=1e6, w_unseen=0,
-    intrinsics=None, sensor_height=1.5,
-    initial_heading=None, progress=0.0, cov_scale=None,
-)
-```
-
-Takes a `(z, x)` start cell, a `(z, x)` goal cell, BEV maps. No reference
-trajectory.
-
-### Goal selection — `get_goals_near_highest_sim`
-
-BFS outward from the single highest-similarity cell through *any* cell type
-(unseen, free, obstacle). Returns free cells in BFS-distance order. The peak
-similarity often lands on an obstacle (e.g. a bed is marked occupied), so the
-caller can't step *on* it; the closest free cell is the approach point. With
-`max_candidates=1` in main.py, only the single closest free cell is returned.
-
-### Nominal control — warm-started receding-horizon
-
-`U_nom` is **not** zeros. It's the previous successful plan, shifted left by
-one (the action just executed is dropped):
-
-```python
-U_nom = torch.zeros((horizon, 2), device=...)
-if self.last_U is not None:
-    shifted_len = min(self.last_U.shape[0] - 1, horizon)
-    U_nom[:shifted_len] = self.last_U[1:1 + shifted_len]
-```
-
-`self.last_U` is only updated at the end of `optimize_trajectory` if MPPI found
-a safe rollout this call. On first call (or after a manual reset), `last_U`
-is `None` and `U_nom = 0`.
-
-### Sample noise
-
-```python
-cov_matrix = cov_scale * tensor([[0.5, 0], [0, π/4]])
-noise = randn(K, H, 2) @ cov_matrix
-noise[0] = 0.0                  # row 0 evaluates the warm-started plan as-is
-U_samples = U_nom + noise
-U_samples[..., 0] = clamp(..., min_v_cells, max_v_cells)
-U_samples[..., 1] = clamp(..., -max_w_rad, max_w_rad)
-```
-
-The first row pins zero noise so the unmutated warm start is always among the
-candidates — protects against the case where all noisy variants happen to be
-worse than the carried-over plan.
-
-### Rollout (turn-first integration)
-
-```python
-Theta[:, 1:] = θ_start + cumsum(U[:, :-1, 1])
-Z[:, 1:] = z_start + cumsum(U[:, :-1, 0] * sin(Theta[:, 1:]))   # post-rotation heading
-X[:, 1:] = x_start + cumsum(U[:, :-1, 0] * cos(Theta[:, 1:]))
-```
-
-Translation each step uses the heading **after** that step's rotation. This
-matters for in-place spins: without it, `w_0` couldn't steer step 1, so an
-agent pinned facing a wall would always commit the first translation into the
-wall.
-
-### Cost terms
-
-1. **Goal distance** — `dist_cost = mean(||(Z, X) - goal||)` per rollout.
-   Weight `w_goal` from `scheduled_params`.
-2. **Collision** — subsampled along each segment (alpha-interpolated
-   between waypoints, `n_sub = max(2, ceil(max_v_cells * 2.5))` per segment,
-   plus the final waypoint). Cells at `(start_z_idx, start_x_idx)` are
-   *forgiven* (treated as free) so an agent technically inside an obstacle
-   isn't penalized for being where it is — only for moving into *new* obstacle
-   cells. Weight `w_occ = 1e6` (catastrophic).
-3. **Unseen traversal** — count of cells with value 0 (unseen). Currently
-   `w_unseen = 0` — unseen cells are not penalized at all. The exploration
-   gradient comes entirely from IG.
-4. **Information gain** — discounted FOV raycast IG from each rollout
-   waypoint, but **only computed for collision-free rollouts** (`safe_mask`).
-   Weight `w_ig` from schedule (currently 30).
-
-### Hard-exclude on collision
-
-```python
-safe_mask = (collision_cost == 0)
-if safe_mask.any():
-    masked_scores = where(safe_mask, scores, -inf)
-    iter_best = argmax(masked_scores)
-    # ... update best_U if scores improve
-    weights = exp((masked_scores - beta) / λ)        # softmax over safe only
-else:
-    print("NO SAFE ROLLOUTS")
-    weights = exp((scores - beta) / λ)               # fall back to soft penalty
-weights /= weights.sum()
-U_nom += sum(weights * noise)
-```
-
-When any rollout is safe, MPPI never picks a colliding plan — colliders get
-zero softmax weight and are excluded from `argmax`. When all rollouts collide
-in some iter, the soft `-w_occ * collision_cost` is still in `scores`, so the
-softmax-weighted update at least nudges `U_nom` toward less-bad samples.
-
-### Final fallback
-
-After all iters, if `best_U` is still `None` (no safe rollout was ever found
-in any iter), MPPI reconstructs a trajectory from the shifted previous plan
-and returns *that* rather than `(., None, None)`:
-
-```python
-if best_U is None and self.last_U is not None:
-    print("MPPI: No safe rollout found, falling back to shifted previous plan")
-    # rebuild U_fallback from self.last_U shifted, then roll out kinematics
-    best_U = U_fallback.cpu().numpy()
-    best_traj = [reconstructed_(z, x) per step]
-```
-
-This keeps the agent moving along its last-known-safe trajectory when the
-current state confuses MPPI. The action queue in main.py then executes one
-step of this fallback plan.
-
-### Escape rollouts — **currently disabled**
-
-The escape-rollout block (stop / CCW spin / CW spin injected as deterministic
-samples) is **commented out** in the current file. Search for
-`# Inject deterministic escape rollouts` to find it. The user removed these
-when they added warm-starting; the warm-start preserves multi-step plans
-across replans, which addresses the IG-seesaw failure mode that the escapes
-were originally meant to fix. If the agent gets stuck oscillating in tight
-spots again, re-enable the escape block.
+**LLMDet distractor-phrase gate — implemented, then REMOVED per user decision
+(same day).** Confusable phrases appended to the detection prompt as competing
+classes; killed the bed__Corozal FP cleanly. Findings worth keeping (also in
+LLMDetDetector's docstring) for anyone resurrecting it (git has no trace —
+it never got committed):
+- Sinks and distractor phrases CANNOT coexist in one prompt: the 48-sink
+  suffix is ~240 wordpieces (each `[unusedN]` tokenizes to ~5 pieces — which
+  also explains the "inert sink init" mystery: the re-initialized embeddings
+  never appear in the tokenized prompt) and it crushes every non-lead
+  phrase's per-box score (couch box: "a couch"=0.607/"a bed"=0.036 sink-free
+  in either order, vs 0.061/0.536 with sinks). The gate must REPLACE sinks.
+- Sink-free multi-phrase prompts discriminate cleanly and order-invariantly,
+  but shift the TP score distribution (couch TP 0.495 joint vs 0.54
+  single-phrase), so τ0.47 is marginal and would need re-validation.
+LLMDet itself is now byte-identical to the pre-WP3 sink-gated original.
 
 ---
 
-## Map semantics
+# Previous handoff (work packages 1–2)
 
-`occ_map` values: `0 = unseen`, `1 = free`, `2 = obstacle`.
+Two stacked, **uncommitted** work packages (working tree dirty — `git status` from
+the repo root):
 
-- `OccupancyGrid.update_from_observation` now uses
-  `thickness = voxel_resolution * 1.2` (was hardcoded `0.05`). At
-  `voxel_resolution = 0.10`, that's a 0.12 m occupied shell around the
-  observed depth surface — enough to register a wall as ≥2 contiguous voxel
-  layers rather than a sub-voxel stripe with unseen gaps.
-- `OccupancyGrid.get_2d_map_dilated(radius)` exists but isn't currently used.
-  It dilates obstacles **only into free cells**, never into unseen — preserves
-  exploration.
+1. **CLIPSeg feature-field swap** (earlier session, verified) — the field now
+   regresses a scalar CLIPSeg relevance score instead of a 512-D MaskCLIP
+   embedding. Background section below.
+2. **Field-verified detection** (this session, 2026-07-09/10) — LLMDet detections
+   are gated by querying that trained field inside the detection box. Sweep in
+   progress; live status below.
 
-`SimilarityGrid.compute_similarity_map`:
-- Masks query points to `voxels == occupied_val` only (so similarity is
-  evaluated only at obstacle cells).
-- Returns `(sim + 1) / 2` of `ensemble_mean · text_embedding`.
-- `get_2d_map` does **top-5%-mean** along Y (rather than mean or max), then
-  returns the BEV.
+## Operational constraints (user instructions, this campaign)
+
+- All python runs inside the container: `docker exec -w /workspace/DCON objectnav_container python ...`
+  (`/workspace/DCON` = bind mount of `DCON/`).
+- **GPU 3 only, one job at a time** — shared server; check `nvtop`/`nvidia-smi`
+  for other users' processes before every launch. No multi-GPU parallelism.
+- If mp4 assembly OOM-kills the container (known issue, see bottom): prioritize
+  retrying for the video; only fall back to a last-frame PNG
+  (`tools.visualize.render_navigation(cfg, out, snapshot_step=<last step>)`)
+  if retries keep failing.
+
+## Field-verified detection — what was built
+
+The "next step #1" of the previous handoff, per user spec: τ=0.47-gated LLMDet
+(no LocateAnything cascade); for every frame where LLMDet fires, unproject the
+valid-depth pixels inside the box to 3D, query the trained CLIPSeg relevance
+field (`gamma`), pool, and count the frame as a detection only if the pooled
+score clears a threshold. A rejected frame is a full non-detection (no goal, no
+confidence, no latch-streak).
+
+Changes (all uncommitted):
+- `src/perception/perception_stack.py` — `PerceptionStack.field_score_in_box(depth,
+  c2w, intrinsics, box, top_frac, min_points, pool)`: pooled field relevance over
+  the box's valid-depth pixels. `pool="topk"` = mean of the top `top_frac`
+  fraction of point scores; `pool="max"` = single best point.
+- `main.py` — the gate lives in `detect_classify_latch` (after `detector.detect`,
+  before `classify_detection`); prints accept/reject per frame; the pooled score
+  is logged as `field_score` in every `traj_log.jsonl` replan line (also when
+  the gate is off-threshold — it logs whatever was computed).
+- `src/config.py` — `detection:` knobs, all defaulting to OFF/neutral:
+  `field_verify` (False), `field_verify_threshold` (0.30), `field_verify_pool`
+  ("topk"), `field_verify_top_frac` (0.10), `field_verify_min_points` (20 —
+  fewer valid-depth pixels ⇒ unverifiable ⇒ rejected).
+- `config/evaluation_configs/detector_fieldverify_*.yaml` — overlays for
+  `eval_scene.py run --agent-config` (only the keys present override):
+  `calib` (τ0.47, cascade off, gate log-only at threshold 0.0 — doubles as the
+  no-gate reference), `thr010/030/050/070` (topk), `max050/max080` (max-pool).
+
+Verified by `output/scratch_fieldverify/smoke_test.py`: cold/untrained field
+reads ~0.018 in-box (the `COLD_START_BIAS` sigmoid shift), degenerate boxes →
+None, a briefly-trained region → 1.0; real episode logs `field_score` on every
+fired frame.
+
+## Calibration findings (11 full episodes, gate log-only → `output/fieldverify_calib/`)
+
+SR 0.545 / SPL 0.400; **all 5 failures were false-positive self-stops** — the
+failure mode the gate targets. Latch-level analysis
+(`output/scratch_fieldverify/analyze_latch.py`):
+- FP latches often score HIGH on the field (bed__Corozal 0.83, tv__Corozal 0.77):
+  CLIPSeg itself corroborates geometric look-alikes — no threshold fixes those.
+- Some correct latches happen COLD (potted plant__Corozal 0.02, toilet__Collierville
+  0.05): first sighting precedes field training, so a static per-frame ROC is
+  flat (`analyze_calib.py`). The gate's value is **dynamic**: rejecting a cold
+  latch keeps the agent searching while multi-view CLIPSeg evidence accumulates
+  (couch__Collierville re-latched later at 0.88).
+
+## Sweep — COMPLETE (50-episode subset: `--max-per-combo 2`, all 5 Gibson-val scenes)
+
+| sweep point | out dir | SR | SPL | FP-stops | timeouts |
+|---|---|---|---|---|---|
+| no gate (thr 0.0) | `output/fieldverify_sweep_thr000` | 0.500 | 0.335 | 22 | 3 |
+| topk ≥ 0.10 | `output/fieldverify_sweep_thr010` | 0.500 | 0.257 | 21 | 4 |
+| topk ≥ 0.30 | `output/fieldverify_sweep_thr030` | 0.560 | 0.281 | 19 | 3 |
+| **topk ≥ 0.50 (WINNER)** | `output/fieldverify_sweep_thr050` | **0.620** | **0.264** | 13 | 6 |
+| topk ≥ 0.70 | `output/fieldverify_sweep_thr070` | 0.620 | 0.232 | — | — |
+| max ≥ 0.50 | `output/fieldverify_sweep_max050` | 0.600 | 0.272 | — | — |
+| max ≥ 0.80 | `output/fieldverify_sweep_max080` | 0.620 | 0.255 | — | — |
+
+Read: the gate monotonically converts FP-stops into successes (22→13 at topk
+0.50) at only +3 timeouts; SR plateaus at 0.620 (thr070/max080 match it with
+worse SPL), so **topk ≥ 0.50 wins** (SR-primary, SPL tiebreak). SPL falls vs
+no-gate because successful paths lengthen (mean 6.0 m → 13.4 m) — latching
+waits for map corroboration. Max pooling ties on SR, never beats topk.
+Per-episode flips thr000→thr050: 11 fixed (9 FP-stops + 2 timeouts → success),
+5 broken (3 → timeout — two of them reach the goal but never pass the gate —
+and 2 → new FP-stops). 13 FP-stops survive the gate (CLIPSeg corroborates the
+look-alike, e.g. bed__Corozal). Sweep runners:
+`output/scratch_fieldverify/run_sweep*.sh`.
+
+## Final results (chain completed 2026-07-11 16:58)
+
+**Inspection videos** (all rendered first-attempt, no OOM) →
+`output/fieldverify_videos/ep/<id>/nav_history.mp4`:
+tv__Collierville__ep4 + toilet__Wiconisco__ep14 (gate fixed these FP-stops),
+toilet__Collierville__ep0 (user-requested), couch__Collierville__ep6 (gate
+broke it: reaches the couch, never latches, timeout), bed__Corozal__ep0
+(gate-resistant FP).
+
+**Full 250-episode run** (`output/fieldverify_full_thr050`, seeded with the 50
+identical-config sweep records):
+
+| system (250 eps, gibson v1.1_sub10) | SR | SPL | FP-stops | timeouts |
+|---|---|---|---|---|
+| jul3 baseline (MaskCLIP field + cascade τ0.45) | 0.604 | 0.336 | — | — |
+| jul4 baseline (same) | 0.616 | 0.348 | 86 | 10 |
+| **CLIPSeg field + τ0.47 LLMDet + gate topk≥0.50** | **0.572** | **0.262** | 79 | 28 |
+
+Read carefully — two opposing effects:
+- **Within the new stack the gate clearly helps** (subset: 0.500 → 0.620 SR),
+  and the full run's FP-stops are lower than the baseline's (79 vs 86).
+- **But the new stack overall still trails the old cascade+MaskCLIP baseline**
+  (−4 SR points, −0.086 SPL): timeouts nearly tripled (10 → 28) and successful
+  paths are longer (delayed latching), which is where both the SR gap and the
+  SPL gap live. The confound (field swap + detector swap + gate in one diff)
+  means the gap can't be attributed to the gate — the subset A/B says the gate
+  component is strongly positive within the CLIPSeg stack.
+
+Obvious next experiments (NOT run): (a) cascade detector + field gate combined
+(the gate replaced the cascade this campaign; they're complementary — the
+cascade kills uncorrelated-FP frames, the gate kills map-uncorroborated ones);
+(b) relax `stop_distance_m`/arrival to cut the new timeouts; (c) re-tune
+`detected_persistence` under the gate (gated frames are already filtered, so
+persistence 2 may be redundant and is costing time-to-latch.
+
+## OVON failure-mode analysis (side quest, 2026-07-10)
+
+Per user request, every failed run of `output/ovon_val_seen_full` (79 eps, SR
+0.114) was classified; all 48 self-stopped failures were **visually
+adjudicated** by re-rendering each run's final pose as a 4-view panorama
+(`output/scratch_fieldverify/finalviews/`, generator `render_final_views.py`).
+Result (artifact: https://claude.ai/code/artifact/10835fdc-3ca3-44da-b0db-02ea62e89847
+— flowchart generator `make_flowchart.py`): of 70 failures, 19 (27%) actually
+found the right object (7 near-miss 1–2 m, 3 right-object-stopped-too-far,
+9 correct-but-not-in-OVON-goals annotation gaps) → effective SR ≈ 35%, not
+11.4%. True detector FPs: 22 (31%, not 59% as distance-only suggests). Vague
+categories: 7. Timeouts: 4 stuck (<2 m travel), 8 latched-never-arrived,
+1 sightings-no-latch, 9 never-detected (recall). Implications: stop-distance
+calibration is the cheapest win; the FP gate addresses the largest bucket;
+recall needs a different lever.
+
+All eval runs use: `python benchmarks/eval_scene.py run --dataset
+episodes/gibson/v1.1_sub10/val --scenes-root gibson_scenes --gpu 3
+--agent-config config/evaluation_configs/detector_fieldverify_<point>.yaml
+[--max-per-combo 2] --out output/<name>` — continuous actions (no `--discrete`),
+matching the jul3/jul4 baselines. Success = self-stop ≤ 1.0 m geodesic
+(SemExp rect goals from `val_info.pbz2`).
+
+Analysis helpers (in `output/scratch_fieldverify/`, gitignored): `analyze_calib.py`
+(per-frame near/off-goal score distributions + TP-ret/FP-rej table),
+`analyze_latch.py` (field scores of the latch-causing detections). Both take an
+eval `--out` dir.
 
 ---
 
-## Config state (`src/config.py` + `config/config.yaml`)
+# Background: CLIPSeg feature-field swap (previous session, verified)
 
-Key values (YAML overrides Python defaults):
+The feature field used to learn a 512-D MaskCLIP embedding at every 3D point,
+dotted against a text embedding later. CLIPSeg gives a much cleaner per-pixel
+relevance signal at the cost of being query-conditioned — accepted because
+`target_query` is fixed per run. The field's job became: aggregate CLIPSeg's
+per-pixel score across every observed viewpoint into one persistent,
+multi-view-consistent scalar relevance map. This map is exactly what the
+field-verify gate above queries.
 
-| Knob | YAML value | Notes |
-|---|---|---|
-| `voxel_resolution` | `0.10` | |
-| `iterations` | `60000` | |
-| `sensor_height` | `1.0` | |
-| `mppi_dt` | `0.1` | Very short. Each MPPI step is 0.1 s. |
-| `mppi_max_v_mps` | `1.0` (default) | → `max_v_cells = 1.0 * 0.1 / 0.10 = 1` cell/step |
-| `mppi_max_w_rps` | `2.0` (default) | → `max_w_rad = 0.2` rad/step (~11.5° per step) |
-| `mppi_w_sign` | `-1.0` (default) | Habitat ω is opposite sign from MPPI heading convention |
-| `hash_buffer_refresh_interval` | `2000` | |
-| `target_query` | `"a pillow"` | |
-| `scene_path` | `gibson_scenes/Annawan.glb` | |
+What changed: `src/perception/semantics.py` (new `CLIPSegSemantics`; MaskCLIP
+kept but unwired), `perception_stack.py` (wiring; both similarity call sites
+use the scalar directly), `grid.py` (`SimilarityGrid` needs no text embedding),
+`config.py` + `config/config.yaml` (`hash_feature_dim` 512→1 in BOTH places —
+the YAML silently overrides), and `featurefield.py` (the substance):
 
-### Schedule values (all `*_start == *_end` currently — no active scheduling)
+1. `safe_normalize()` no-ops at `feature_dim==1` (a scalar isn't a direction).
+2. Fixed a latent bug: `torch.nan_to_num(loss, ...)` result was discarded.
+3. `v`/`beta` epsilon floors raised 1e-6 → 1e-2 (near-uniform scalar batches
+   drove `omega` → 0 and blew up the NLL's log).
+4. `alpha` capped at 100 (unbounded evidence with omega at its floor explodes
+   the `-alpha/omega` gradient).
+5. Root cause of the NaNs: unbounded `gamma` drift → `gamma = sigmoid(raw)` at
+   `feature_dim==1` (CLIPSeg targets are provably in [0,1]).
+6. `COLD_START_BIAS = 4.0`: `gamma = sigmoid(raw - 4.0)` so untrained regions
+   read ~0.018, not ~1.0 ("everything is the target"). Holds even for regions
+   that stay untrained after convergence elsewhere.
 
-| Knob | start | end |
-|---|---|---|
-| `mppi_lambda` | 4.0 | 4.0 |
-| `mppi_w_ig` | 30.0 | 30.0 |
-| `mppi_w_goal` | 0.0 | 0.0 |
-| `mppi_cov_scale` | 4.0 | 4.0 |
+Verified: standalone CLIPSeg peak inside GT box; synthetic scalar-field
+convergence (MAE 0.02–0.07); 1000–2000-step near-constant-batch stress test
+with zero NaN; end-to-end `main.run()` on Goffs + a real OVON episode, real
+spatial structure in `bev_similarity_*.npy`, cold regions uniformly low.
 
-`w_goal = 0` everywhere means MPPI is currently driven purely by IG — there's
-no goal-distance pull at all. The agent moves toward whatever direction has
-the most uncertainty-rich cells visible by raycast. The "goal" computed by
-`get_goals_near_highest_sim` is therefore informational only right now; it
-doesn't shape the rollout cost.
+## Known issues / open items (carried over)
 
-`scheduled_params` still has the delayed-ramp logic (`p_goal = max(0, p -
-0.75)`) but with `*_start == *_end` it has no effect.
-
-`cov_scale = 4.0` means noise std for v ≈ 2.0 cells/step, w ≈ π·1 rad/step
-clamped to `max_w_rad = 0.2`. The w-clamp will fire on most samples → most
-rollouts saturate at full-CW or full-CCW per-step turn.
-
----
-
-## Perception (`src/perception/perception_stack.py`)
-
-The replay buffer interface changed:
-
-- `observe(sim_iface)` now returns `(rgb, depth, c2w)` — **raw** frame, no
-  unprojection.
-- `update_replay_buffer(rgb, depth, c2w, intrinsics)` stores the raw tuple.
-- `make_super_batch()` is the place where unprojection happens, on a randomly
-  sampled subset of buffer frames. This pushes the per-frame CLIP-feature
-  extraction cost from observation time to batch-build time, and lets the
-  super-batch reuse frames across many training steps.
-- `extract_and_unproject(rgb, depth, c2w, intrinsics)` is the helper.
-
-`save_2d_similarity(step, depth, c2w, intrinsics)` is new — renders a 2D
-similarity map from the current camera view by querying the ensemble at the
-unprojected 3D points of the current frame, then resampling into image space.
-
----
-
-## Failure modes & current best-known knobs to turn
-
-If the agent stays stuck or plans through walls again, the things to check, in
-order:
-
-1. **Is `last_U` getting persistently bad?** Add a manual reset
-   (`mppi.last_U = None`) whenever a replan triggers `"NO SAFE ROLLOUTS"`
-   or the final fallback. The shifted-warm-start can lock in a stale direction.
-2. **Re-enable the escape rollouts** at the commented block in `optimize_trajectory`.
-   Stop / CCW spin / CW spin give MPPI guaranteed-safe candidates regardless of
-   warm-start state.
-3. **`w_unseen = 0`** — if you see rollouts slipping through partially-observed
-   walls, give unseen cells a small penalty (e.g. 10–100). Anything ≥1e3 tends
-   to suppress exploration entirely.
-4. **`w_goal = 0`** — no goal-distance signal at all. If exploration is fine
-   but the agent never *commits* to approaching the target, bump
-   `mppi_w_goal_end` (and consider undoing the delayed ramp).
-5. **`mppi_dt = 0.1`** with `horizon = 100` → 10 s of look-ahead. Short
-   per-step distance (1 cell at v_max) means rollouts don't spread far. Either
-   shorten the horizon or raise `mppi_dt`.
-
----
-
-## Quick reference: key call paths
-
-| Where | What |
-|---|---|
-| [src/planning/mppi.py:7-14](src/planning/mppi.py#L7-L14) | `MPPIPlanner.__init__` — sets `self.last_U = None` for warm start |
-| [src/planning/mppi.py:40-81](src/planning/mppi.py#L40-L81) | `get_goals_near_highest_sim` — BFS from similarity peak |
-| [src/planning/mppi.py:117-139](src/planning/mppi.py#L117-L139) | `scheduled_params` — exploration→exploitation interpolation |
-| [src/planning/mppi.py:141-399](src/planning/mppi.py#L141-L399) | `optimize_trajectory` — main MPPI body |
-| [src/planning/mppi.py:185-198](src/planning/mppi.py#L185-L198) | Warm-start construction |
-| [src/planning/mppi.py:209-219](src/planning/mppi.py#L209-L219) | Sample + clamp |
-| [src/planning/mppi.py:221-243](src/planning/mppi.py#L221-L243) | Escape rollouts (commented out) |
-| [src/planning/mppi.py:255-262](src/planning/mppi.py#L255-L262) | Turn-first kinematic rollout |
-| [src/planning/mppi.py:272-312](src/planning/mppi.py#L272-L312) | Collision/unseen subsampling + cost |
-| [src/planning/mppi.py:333-367](src/planning/mppi.py#L333-L367) | Hard-exclude collision + softmax update |
-| [src/planning/mppi.py:369-393](src/planning/mppi.py#L369-L393) | Final fallback (shifted previous plan) |
-| [src/planning/mppi.py:395-399](src/planning/mppi.py#L395-L399) | Save `last_U` for next call |
-| [src/perception/grid.py:198-252](src/perception/grid.py#L198-L252) | `OccupancyGrid.update_from_observation` (depth-thickness shell) |
-| [src/perception/grid.py:259-281](src/perception/grid.py#L259-L281) | `OccupancyGrid.get_2d_map_dilated` (unused — available if needed) |
-| [main.py:73-141](main.py#L73-L141) | `plan_one_action` — single goal, no A\*, no top-k |
+- **Video rendering (mp4 assembly) OOM-crashed the container twice** (exit
+  137/SIGKILL) during the full multi-frame `render_navigation` at the end of
+  `main.run(..., save_video=True)` — infra contention on this shared host, not
+  a code bug. Workaround: monkeypatch `main.render_navigation = lambda *a, **kw:
+  None` and render separately afterward (single-frame PNG has no observed OOM
+  risk). For this campaign: retry for the real mp4 first (user instruction).
+- **The OVON cabinet episode wedging** (`cabinet__5cdEh9F2hJL__ep3979`: "NO SAFE
+  ROLLOUTS" near spawn, no confirmed detection in 6000 steps under the CLIPSeg
+  field, unlike the earlier MaskCLIP run that latched ~step 2800) is still not
+  root-caused. Candidates: collision/navmesh (field-independent) vs. changed
+  IG/exploration near the start under the CLIPSeg field.
+- `output/scratch_fieldverify/` holds this campaign's scratch scripts/logs
+  (gitignored via `output/`); clean up when the campaign concludes. Don't
+  `git add -A` blindly — this repo has been bitten by scratch files before.

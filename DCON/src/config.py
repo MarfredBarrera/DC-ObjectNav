@@ -57,7 +57,12 @@ class Config:
                       'llmdet_num_sinks', 'llmdet_sink_init',
                       'detector_cascade', 'locate_anything_model_name',
                       'locate_anything_max_new_tokens', 'cascade_min_iou',
-                      'clipseg_model_name', 'clipseg_threshold'],
+                      'clipseg_model_name', 'clipseg_threshold',
+                      'distractor_objects', 'clipseg_contrastive',
+                      'clipseg_softmax_temp',
+                      'field_verify', 'field_verify_threshold',
+                      'field_verify_top_frac', 'field_verify_min_points',
+                      'field_verify_pool'],
         'visualization': ['viz_interval', 'vmax_epi'],
     }
 
@@ -97,7 +102,9 @@ class Config:
         # against the wrong floor's geometry for the full step budget.
         self.max_spawn_snap_m = 1.0
 
-        # Semantics Settings (MaskCLIP)
+        # Semantics Settings. MaskCLIP is no longer the default feature-field
+        # supervisor (see clipseg_model_name / PerceptionStack) -- kept here
+        # for comparison/recovery, not wired in by default.
         self.maskclip_model_name = "ViT-B/16"
         self.maskclip_input_size = 448
         self.target_query = "green plant"
@@ -116,7 +123,10 @@ class Config:
         # HashGrid MLP
         self.hash_n_neurons = 128
         self.hash_n_hidden_layers = 3
-        self.hash_feature_dim = 512
+        # Scalar CLIPSeg relevance score, not a MaskCLIP embedding (see
+        # CLIPSegSemantics / PerceptionStack) -- the field regresses a single
+        # query-conditioned score per 3D point.
+        self.hash_feature_dim = 1
 
         # HashGrid Training
         self.hash_lr = 1e-3
@@ -125,7 +135,7 @@ class Config:
         self.hash_buffer_refresh_interval = 200
         self.hash_per_frame_cache_size = 8192*4
         # Flat history buffer: bounded ring of (pt, feat) rows. Memory cost is
-        # capacity * (3 + hash_feature_dim) * 4 bytes (~412MB at 200k & 512-dim).
+        # capacity * (3 + hash_feature_dim) * 4 bytes (~8MB at 500k & scalar feature_dim=1).
         self.history_buffer_capacity = 500_000
 
         # Grid
@@ -232,7 +242,7 @@ class Config:
 
         # Visualization
         self.viz_interval = 500
-        self.vmax_epi = 0.5
+        self.vmax_epi = 0.25
 
         # Detection-based termination. Once a usable-band detection recurs for
         # `detected_persistence` consecutive replans, latch into DETECTED mode
@@ -302,6 +312,36 @@ class Config:
         self.llmdet_num_sinks = 48
         self.llmdet_sink_init = "special"
 
+        # Contrastive CLIPSeg field target (`clipseg_contrastive`), for
+        # look-alike FP suppression (bench vs chair, bed vs couch — the FP
+        # class the sinks and the field gate are both structurally blind to,
+        # because the look-alike scores genuinely high for the query with no
+        # competing hypothesis). When on, the per-pixel field training target
+        # becomes sigmoid(target logit) x softmax over [target] +
+        # `distractor_objects` at temperature `clipseg_softmax_temp` (see
+        # CLIPSegSemantics), so the map answers "more couch than bed?"
+        # instead of "couch-like?" and kills the look-alike that survives
+        # single frames but not competing hypotheses. Wall/floor phrases act
+        # as background classes in the softmax. NOTE: contrastive scores run
+        # lower on ambiguous objects, so `field_verify_threshold` needs
+        # re-calibration when this is on.
+        # Phrases sharing a content word with the query are dropped per query
+        # (semantics.filter_distractors) so the target never competes with
+        # itself; synonyms are NOT caught (query "a sofa" keeps "a couch").
+        # Keep the list moderate — every phrase costs one CLIPSeg decoder
+        # pass per frame. (A sibling LLMDet distractor-phrase gate was
+        # implemented and removed 2026-07-12 — the sink suffix crushes
+        # inter-phrase competition, so it can't coexist with the sinks; see
+        # the note in LLMDetDetector's docstring before resurrecting it.)
+        self.distractor_objects = [
+            "a chair", "a couch", "a bed", "a potted plant", "a toilet",
+            "a tv", "a table", "a cabinet", "a bench", "a sink",
+            "a bathtub", "a window", "a door", "a picture", "a pillow",
+            "a rug", "a wall", "the floor",
+        ]
+        self.clipseg_contrastive = False
+        self.clipseg_softmax_temp = 1.0
+
         # Two-stage detection (see CascadeDetector in obj_detection.py). When
         # `detector_cascade` is True, NVIDIA LocateAnything-3B proposes a box
         # and LLMDet verifies it: a frame counts as a detection only when a
@@ -325,6 +365,33 @@ class Config:
         # placeholder until validated.
         self.clipseg_model_name = "CIDAS/clipseg-rd64-refined"
         self.clipseg_threshold = 0.5
+
+        # Field verification of detections (main.py detect_classify_latch):
+        # when a detector box fires, unproject its valid-depth pixels to 3D,
+        # forward-pass the trained CLIPSeg relevance field there, pool the top
+        # `field_verify_top_frac` fraction of point scores, and count the frame
+        # as a detection only if the pooled score clears
+        # `field_verify_threshold`. The field aggregates CLIPSeg evidence
+        # across every observed viewpoint, so a single-frame look-alike that
+        # fools the detector reads low until the map itself says "target here".
+        # Cold-start caveat: an unobserved/untrained region reads ~0.02 (the
+        # COLD_START_BIAS sigmoid shift), so the gate also delays latching
+        # until the field has actually trained on the region — first sightings
+        # of a true target are rejected until its CLIPSeg evidence lands in
+        # the map (typically one buffer refresh + some train steps later).
+        # Boxes with fewer than `field_verify_min_points` valid-depth pixels
+        # can't be verified and are rejected. The pooled score is logged as
+        # `field_score` in traj_log.jsonl for every verified frame.
+        self.field_verify = False
+        self.field_verify_threshold = 0.30
+        # Pooling over the in-box point scores: "topk" = mean of the top
+        # `field_verify_top_frac` fraction (robust to background in a loose
+        # box, not a single-point statistic); "max" = the single highest point
+        # score (most permissive — one well-corroborated point passes the box,
+        # so thresholds must sit higher than for topk).
+        self.field_verify_pool = "topk"
+        self.field_verify_top_frac = 0.10
+        self.field_verify_min_points = 20
 
         # Load from YAML if path provided
         if yaml_path is not None:

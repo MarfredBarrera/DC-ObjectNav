@@ -39,7 +39,8 @@ hashgrid:
   # MLP Architecture
   n_neurons: 128
   n_hidden_layers: 3
-  feature_dim: 512
+  # Scalar CLIPSeg relevance score, not a MaskCLIP embedding.
+  feature_dim: 1
 
   # Training
   lr: 0.001
@@ -86,9 +87,9 @@ planning:
   max_agent_steps: 500           # per-episode primitive budget (timeout = failure)
 
 detection:
-  detected_persistence: 2       # consecutive usable-band detections to latch
+  detected_persistence: 1       # consecutive usable-band detections to latch
   stop_distance_m: 0.5          # terminate within this distance of sim peak
-  llmdet_threshold: 0.45         # LLMDet per-box score floor (tau); ~99% background-FP rejection w/ sinks
+  llmdet_threshold: 0.47         # LLMDet per-box score floor (tau); ~99% background-FP rejection w/ sinks
 
   # Two-stage detection: LocateAnything-3B proposes, LLMDet (sink-gated) verifies.
   # A frame counts only when both fire on the same region (IoU >= cascade_min_iou),

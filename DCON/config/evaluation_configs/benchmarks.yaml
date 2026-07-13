@@ -1,0 +1,42 @@
+# Episode sources for `benchmarks/eval_scene.py --benchmark <name>`.
+#
+# Each entry answers "which episodes, under which protocol embodiment":
+#   dataset / scenarios   the episode source (standard Habitat ObjectNav split
+#                         dir or .json.gz, or a hand-written scenarios sweep)
+#   scenes_root           where the local scene .glb files live
+#   agent_config          protocol embodiment overlay(s), always applied first
+#                         (before the experiment's and the CLI's overlays)
+#   radius / viewpoints   protocol scoring defaults (an experiment may override)
+#
+# Everything experiment-specific (detector arms, action mode, caps, output
+# dir) belongs in experiments/<name>.yaml, not here.
+
+gibson:
+  # Gibson-val (SemExp v1.1_sub10, 250 eps over 5 scenes). Success = self-stop
+  # <= 1.0 m geodesic of the SemExp rect goals (the VLFM/SemExp convention).
+  dataset: episodes/gibson/v1.1_sub10/val
+  scenes_root: gibson_scenes
+
+ovon:
+  # HM3D-OVON val_seen (open-vocabulary). Protocol specifies the Stretch
+  # embodiment (360x640 portrait camera at 1.31 m). Headline metric is the
+  # non-viewpoints reading (object positions, radius 1.0 m); set
+  # `viewpoints: true` in an experiment for the official stricter cross-check.
+  # ~3k episodes — cap with max_per_combo in the experiment.
+  dataset: episodes/hm3d_ovon/hm3d/val_seen
+  scenes_root: scene_datasets/hm3d
+  agent_config: agent_ovon_stretch
+
+ovon_unseen:
+  dataset: episodes/hm3d_ovon/hm3d/val_unseen
+  scenes_root: scene_datasets/hm3d
+  agent_config: agent_ovon_stretch
+
+ovon_synonyms:
+  dataset: episodes/hm3d_ovon/hm3d/val_seen_synonyms
+  scenes_root: scene_datasets/hm3d
+  agent_config: agent_ovon_stretch
+
+goffs:
+  # Hand-annotated Goffs sweep (custom targets x starts, rect goals).
+  scenarios: config/evaluation_configs/experiments/scenarios_Goffs.yaml

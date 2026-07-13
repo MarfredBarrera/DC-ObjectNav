@@ -16,7 +16,11 @@ class EvidentialFeatureField(nn.Module):
     Uses tiny-cuda-nn for efficient hash encoding and MLP.
     Updated to use Evidential Regression for single-pass Aleatoric and Epistemic Uncertainty.
     """
-    
+
+    # Sigmoid input shift for the scalar (feature_dim==1) CLIPSeg-score mode:
+    # see the cold-start comment in forward().
+    COLD_START_BIAS = 4.0
+
     def __init__(self, config, scene_bounds, device="cuda"):
         super().__init__()
         self.cfg = config
@@ -102,12 +106,44 @@ class EvidentialFeatureField(nn.Module):
         
         # Extract parameters for Normal-Inverse-Gamma distribution
         gamma = raw_output[..., :-3]
-        
+
+        # Scalar CLIPSeg target is provably bounded in [0, 1] (it's a sigmoid
+        # output) -- unlike the MaskCLIP embedding case, bound the prediction
+        # to match. Without this, gamma has no output activation and can
+        # drift to an arbitrarily large magnitude under sustained gradient
+        # pressure (e.g. many steps over a near-uniform background batch),
+        # which blows up error_squared = (gt - gamma)**2 and cascades into
+        # NaN through the NLL's log terms. Bounding gamma caps error_squared
+        # at 1 in the worst case and closes that instability off at the source.
+        if self.feature_dim == 1:
+            # Cold-start bias: an untrained region evaluates to whatever the
+            # hash-grid encoding + MLP happen to produce with no gradient
+            # signal, which is arbitrary -- observed empirically landing near
+            # +1.0 similarity in unexplored territory, i.e. "everything is the
+            # target" by default. Shifting the sigmoid's input means a raw
+            # (cold) output of 0 maps to a low score instead of a coin-flip
+            # 0.5, so a location reads "not relevant" until training
+            # accumulates real positive evidence to push it up.
+            gamma = torch.sigmoid(gamma - self.COLD_START_BIAS)
+
         # Apply constraints based on Evidential Deep Learning literature
-        # v > 0, alpha > 1, beta > 0
-        v = F.softplus(raw_output[..., -3:-2]) + 1e-6
-        alpha = F.softplus(raw_output[..., -2:-1]) + 1.0 + 1e-6 
-        beta = F.softplus(raw_output[..., -1:]) + 1e-6
+        # v > 0, alpha > 1, beta > 0. v/beta floors are 1e-2, not the more
+        # typical 1e-6: a scalar CLIPSeg target is frequently near-uniform
+        # (e.g. background-only frames before the object is in view), which
+        # drives beta toward 0 as the network claims near-zero residual
+        # variance; omega = 2*beta*(1+v) then underflows and log(omega) blows
+        # up in the NLL below. The larger floor keeps omega bounded away from
+        # 0 and closes that instability off at the source.
+        v = F.softplus(raw_output[..., -3:-2]) + 1e-2
+        # alpha ceiling: unbounded "evidence" lets the network drive alpha
+        # arbitrarily high while omega sits at its floor (common on a
+        # near-uniform scalar batch, e.g. background-only frames) -- the
+        # -alpha*log(omega) term's gradient w.r.t. omega scales as -alpha/omega,
+        # which explodes as alpha grows with omega pinned near its floor.
+        # Capping alpha bounds that ratio regardless of how long training
+        # sees a low-variance batch.
+        alpha = torch.clamp(F.softplus(raw_output[..., -2:-1]) + 1.0 + 1e-6, max=100.0)
+        beta = F.softplus(raw_output[..., -1:]) + 1e-2
         
         # Calculate Uncertainties analytically 
         # Aleatoric (data uncertainty) = expected variance = beta / (alpha - 1)
@@ -118,12 +154,20 @@ class EvidentialFeatureField(nn.Module):
         
         # Only normalize mean if requested
         if normalize:
-            gamma = gamma / (gamma.norm(dim=-1, keepdim=True) + 1e-8)
+            gamma = self.safe_normalize(gamma)
         
         return gamma, aleatoric, epistemic, (v, alpha, beta)
 
     def safe_normalize(self, features, dim=-1, eps=1e-6):
-        """Safely normalize features, handling zero-norm cases."""
+        """Safely normalize features, handling zero-norm cases.
+
+        A no-op when the last dim is 1: a scalar target (e.g. a CLIPSeg
+        relevance score) isn't a direction, and L2-normalizing it would
+        collapse every value to its sign (+1.0, since sigmoid outputs are
+        always >= 0), destroying the entire training signal.
+        """
+        if features.shape[-1] == 1:
+            return features
         norms = features.norm(dim=dim, keepdim=True)
         mask = norms > eps
         safe_norms = torch.clamp(norms, min=eps)
@@ -167,8 +211,8 @@ class EvidentialFeatureField(nn.Module):
         # Total Loss
         loss = (nll + lambda_reg * reg).mean()
 
-        torch.nan_to_num(loss, nan=0.0, posinf=1e6, neginf=-1e6)
-        
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e6, neginf=-1e6)
+
         if torch.isnan(loss):
             print(f"NaN loss detected! Skipping step...")
             return None

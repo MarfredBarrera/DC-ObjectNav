@@ -1,0 +1,4 @@
+# contrastive_field capped at 2 episodes per category x scene (50 eps on
+# Gibson-val) — the fast A/B arm against fieldverify_thr050_smoke.
+agent_config: detector_distractors_field
+max_per_combo: 2
