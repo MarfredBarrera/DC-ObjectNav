@@ -1,18 +1,27 @@
 """ObjectNav evaluation — three transparent stages.
 
-An eval is specified by two named configs plus a handful of session flags:
-  --benchmark   WHICH EPISODES — a named entry in
-                config/evaluation_configs/benchmarks.yaml (gibson, ovon, ...):
-                the episode source (standard Habitat ObjectNav dataset or a
-                hand-written scenarios sweep) plus any protocol embodiment
-                overlay (e.g. the OVON Stretch camera).
-  --experiment  EVERYTHING ELSE — one yaml under
-                config/evaluation_configs/experiments/: detector overlays,
-                action mode (discrete: true for the challenge 25 cm / 30° /
-                500-step space), subset caps, scoring options, output dir.
-  --gpu / --video / --agent-config / --rerun / --only / --verdicts / --out
-                per-invocation choices (hardware, evidence volume, quick
-                overlay tweaks, re-scoring) that never define an experiment.
+A minimal run needs just three flags:
+    python benchmarks/eval_scene.py run --benchmark gibson \\
+        --agent_config config/agent_configs/detector_distractors_field.yaml --gpu 3
+
+  --benchmark    WHICH EPISODES — a named entry in
+                 config/evaluation_configs/benchmarks.yaml (gibson, ovon, ...):
+                 the episode source (standard Habitat ObjectNav dataset or a
+                 hand-written scenarios sweep) plus any protocol embodiment
+                 overlay (e.g. the OVON Stretch camera).
+  --agent_config THE DETECTOR ARM — a Config overlay yaml under
+                 config/agent_configs/ (or a bare name found anywhere under
+                 config/; same schema as config/config.yaml, only the keys
+                 present override). Repeatable; stacks after the benchmark's
+                 own embodiment overlay.
+  --gpu          device index (default 0).
+
+  --experiment   OPTIONAL — everything else (discrete action mode, subset
+                 caps, scoring, output dir), bundled into one reusable yaml
+                 under config/evaluation_configs/experiments/. Rarely needed
+                 for a one-off run.
+  --video / --rerun / --only / --verdicts / --out / --refresh-bev
+                 other per-invocation choices that never define an experiment.
 
 The pipeline separates *evidence* from *judgment*:
 
@@ -31,11 +40,11 @@ verdicts.yaml is the single, authoritative human-judgment file (status per run:
 auto / success / fail / exclude). It replaces the old excluded.txt + overrides.txt.
 
 Typical loop (inside the docker container; --out defaults to
-output/<benchmark>_<experiment>):
-    python benchmarks/eval_scene.py run    --benchmark gibson --experiment fieldverify_thr050 --gpu 3
-    python benchmarks/eval_scene.py review --benchmark gibson --experiment fieldverify_thr050
+output/<benchmark>_<agent_config>):
+    python benchmarks/eval_scene.py run    --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml --gpu 3
+    python benchmarks/eval_scene.py review --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml
     # ...edit the out dir's verdicts.yaml after watching the evidence...
-    python benchmarks/eval_scene.py report --benchmark gibson --experiment fieldverify_thr050
+    python benchmarks/eval_scene.py report --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml
 Re-scoring an existing directory needs no configs at all:
     python benchmarks/eval_scene.py report --out output/gibson_val_CLIPSEG_jul12
 
@@ -88,18 +97,19 @@ def resolve_results_path(args, verdicts_path):
 
 # ── benchmark + experiment resolution ────────────────────────────────────────
 #
-# An eval is the product of three orthogonal choices, and the CLI carries only
-# the per-invocation ones:
-#   --benchmark   WHICH EPISODES: a named entry in benchmarks.yaml (episode
-#                 source + protocol embodiment overlay, e.g. gibson / ovon).
-#   --experiment  EVERYTHING ELSE, in one yaml under experiments/: detector
-#                 overlays, action mode, subset caps, scoring options, output
-#                 dir — the identity of the experiment.
-#   --gpu / --video / --agent-config / --rerun / --only / --verdicts / --out
-#                 session choices (hardware, evidence volume, quick overlay
-#                 tweaks, re-scoring) that never define an experiment.
+# A minimal eval needs two named configs; --experiment is optional:
+#   --benchmark    WHICH EPISODES: a named entry in benchmarks.yaml (episode
+#                  source + protocol embodiment overlay, e.g. gibson / ovon).
+#   --agent_config THE DETECTOR ARM: a Config overlay yaml under
+#                  config/agent_configs/ (repeatable).
+#   --experiment   optional: EVERYTHING ELSE, in one yaml under experiments/ —
+#                  action mode, subset caps, scoring options, output dir.
+#   --gpu / --video / --rerun / --only / --verdicts / --out
+#                  session choices (hardware, evidence volume, re-scoring)
+#                  that never define an experiment.
 
-EVAL_CONFIG_DIR = "config/evaluation_configs"
+CONFIG_ROOT = "config"
+EVAL_CONFIG_DIR = os.path.join(CONFIG_ROOT, "evaluation_configs")
 BENCHMARKS_FILE = os.path.join(EVAL_CONFIG_DIR, "benchmarks.yaml")
 EXPERIMENT_DIR = os.path.join(EVAL_CONFIG_DIR, "experiments")
 
@@ -159,18 +169,19 @@ def resolve_experiment_path(name: str) -> str:
 
 def resolve_overlay_path(name: str) -> str:
     """agent_config value: a real path is used as-is; a bare name is searched
-    recursively under config/evaluation_configs/ (must match exactly one file,
-    so overlays can be referenced without their directory)."""
+    recursively under config/ (config/agent_configs/ holds the detector/sensor
+    overlays; must match exactly one file so overlays can be referenced
+    without their directory)."""
     if os.path.exists(name):
         return name
     fname = name if name.endswith((".yaml", ".yml")) else name + ".yaml"
-    matches = sorted(glob.glob(os.path.join(EVAL_CONFIG_DIR, "**", fname),
+    matches = sorted(glob.glob(os.path.join(CONFIG_ROOT, "**", fname),
                                recursive=True))
     if len(matches) == 1:
         return matches[0]
     if not matches:
         raise SystemExit(f"agent-config not found: {name!r} "
-                         f"(no {fname} under {EVAL_CONFIG_DIR}/)")
+                         f"(no {fname} under {CONFIG_ROOT}/)")
     raise SystemExit(f"agent-config name {name!r} is ambiguous: {matches}")
 
 
@@ -184,7 +195,7 @@ def resolve_settings(args):
     """Merge experiment yaml + benchmark entry + CLI into the flat attrs the
     stages consume. Precedence per key: CLI > experiment > benchmark >
     built-in default. Overlays stack instead (benchmark embodiment first,
-    then the experiment's, then CLI --agent-config) so the most specific
+    then the experiment's, then CLI --agent_config) so the most specific
     layer wins per config key."""
     exp, exp_name = {}, None
     if args.experiment:
@@ -215,16 +226,24 @@ def resolve_settings(args):
     args.radius = pick("radius")           # None → protocol default below
     args.discrete = bool(pick("discrete", False))
 
+    # CLI --agent_config names, kept raw (pre-resolution) so a run without
+    # --experiment still gets a distinguishing out-dir name below — otherwise
+    # e.g. two different detector arms against the same --benchmark would
+    # both default to output/<benchmark> and clobber each other.
+    cli_agent_config = _as_list(getattr(args, "agent_config", None))
+
     if args.out is None:
         args.out = exp.get("out")
     if args.out is None:
-        parts = [p for p in (bench_name, exp_name) if p]
+        name_hint = exp_name or "_".join(
+            os.path.splitext(os.path.basename(p))[0] for p in cli_agent_config)
+        parts = [p for p in (bench_name, name_hint) if p]
         if parts:
             args.out = os.path.join("output", "_".join(parts))
     # review/report on a plain directory: --out alone is a valid spec.
     if args.out is None:
-        raise SystemExit("no output dir: pass --benchmark/--experiment "
-                         "(out defaults to output/<benchmark>_<experiment>) "
+        raise SystemExit("no output dir: pass --benchmark (out defaults to "
+                         "output/<benchmark>[_<agent_config>][_<experiment>]) "
                          "or an explicit --out")
 
     if hasattr(args, "gpu"):               # run-only settings
@@ -234,7 +253,7 @@ def resolve_settings(args):
         args.no_evidence = bool(args.no_evidence)
         overlays = (_as_list(bench.get("agent_config"))
                     + _as_list(exp.get("agent_config"))
-                    + _as_list(args.agent_config))
+                    + cli_agent_config)
         args.agent_config = [resolve_overlay_path(p) for p in overlays]
 
 
@@ -444,14 +463,29 @@ def main():
                             "(gibson, ovon, ...). Provides the episode source "
                             "+ any protocol embodiment overlay.")
         p.add_argument("--experiment", default=None,
-                       help="Everything else, in one yaml: config/evaluation_"
-                            "configs/experiments/<name>.yaml (or a path) — "
-                            "detector overlays, action mode, subset caps, "
-                            "scoring options, output dir. CLI flags override "
-                            "its values.")
+                       help="Optional: bundle non-detector settings (discrete "
+                            "action mode, max_per_combo/categories/scenes caps, "
+                            "radius/viewpoints scoring, out dir) into one "
+                            "reusable yaml: config/evaluation_configs/"
+                            "experiments/<name>.yaml (or a path). Pick the "
+                            "detector arm itself with --agent_config, not "
+                            "here. CLI flags override its values.")
+        p.add_argument("--agent_config", "--agent-config", dest="agent_config",
+                       action="append", default=None,
+                       help="Agent/sensor/detector profile YAML (same schema "
+                            "as config/config.yaml, only the keys present "
+                            "override) — the primary way to pick a detector "
+                            "arm, e.g. --agent_config "
+                            "config/agent_configs/detector_distractors_field.yaml. "
+                            "Stacks after any benchmark/experiment overlay, and "
+                            "names the default --out dir. Repeatable — overlays "
+                            "apply in order (run only; review/report use it "
+                            "only to reconstruct the default --out). A bare "
+                            "name (e.g. detector_fieldverify_thr050) is found "
+                            "anywhere under config/.")
         p.add_argument("--out", default=None,
                        help="Output directory (default output/<benchmark>_"
-                            "<experiment>). Alone it is a valid spec for "
+                            "<agent_config>[_<experiment>]). Alone it is a valid spec for "
                             "review/report: aggregate exactly the records in "
                             "<out>/runs/.")
         p.add_argument("--only", nargs="*", default=None, help="Restrict to these run ids")
@@ -463,13 +497,6 @@ def main():
     p_run = sub.add_parser("run", help="Execute episodes + save evidence")
     common(p_run)
     p_run.add_argument("--gpu", default=None, help="GPU device index (default 0)")
-    p_run.add_argument("--agent-config", action="append", default=None,
-                       help="Extra agent/sensor/detector profile YAML overlaid "
-                            "on the experiment's stack (same schema as "
-                            "config/config.yaml, only the keys present "
-                            "override). Repeatable — overlays apply in order. "
-                            "A bare name (e.g. detector_fieldverify_thr050) is "
-                            "found anywhere under config/evaluation_configs/.")
     p_run.add_argument("--video", action="store_true", default=False,
                        help="Also save the full per-step BEV map + RGB history and "
                             "render nav_history.mp4 (large; default keeps only the "

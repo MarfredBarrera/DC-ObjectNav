@@ -1,4 +1,0 @@
-# fieldverify_thr050 capped at 2 episodes per category x scene (50 eps on
-# Gibson-val) — the fast A/B sweep configuration.
-agent_config: detector_fieldverify_thr050
-max_per_combo: 2

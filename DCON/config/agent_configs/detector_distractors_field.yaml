@@ -1,0 +1,26 @@
+# Look-alike FP suppression, field layer only: the CLIPSeg field target
+# becomes sigmoid(target) x softmax over [target]+distractors, so the map
+# (and the field-verify gate reading it) answers "more couch than bed?"
+# instead of "couch-like?". Stacked on the fieldverify sweep winner.
+#
+# field_verify_threshold=0.20 is calibrated for the contrastive field on the
+# TRAINED field's field_score, verified against real RGB frames (2026-07-13):
+# 50 representative samples (highest-scoring frame per Gibson episode, from
+# output/gibson_fieldverify_contrastive_calib), each hand-labeled TP/FP by
+# eye against the saved field_verify_frames/*.png (not a distance-to-goal
+# proxy, which earlier gave the wrong answer — it suggested the plain-sigmoid
+# field separated TP/FP better, which the RGB ground truth contradicts).
+# RGB-verified result: TP mean 0.251 vs FP mean 0.050 (5x), and at thr=0.20
+# all 19 sampled FPs are rejected (100% FP-rejection) while retaining 41.9%
+# of TPs — the cleanest operating point in the sweep. The plain-sigmoid field
+# never reaches full FP-rejection even at thr=0.50 (only 84%), confirming the
+# contrastive field target preserves its raw-frame advantage after training.
+# Re-verify if the distractor list or clipseg_softmax_temp changes.
+detection:
+  llmdet_threshold: 0.47
+  detector_cascade: false
+  field_verify: true
+  field_verify_threshold: 0.15
+  field_verify_top_frac: 0.10
+  clipseg_contrastive: true
+  clipseg_softmax_temp: 1.0

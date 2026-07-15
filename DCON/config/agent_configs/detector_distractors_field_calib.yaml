@@ -1,0 +1,21 @@
+# Contrastive-field CALIBRATION overlay (gate log-only).
+#
+# Same detector arm as detector_distractors_field.yaml (τ0.47 sink-gated
+# LLMDet, contrastive CLIPSeg field target) but field_verify_threshold is 0.0,
+# so every fired box passes the gate — behaviorally this is the plain
+# contrastive-field detector with the gate off, and field_score is only
+# *logged* (traj_log.jsonl `field_score`, recorded even when a gate would
+# reject: main.py computes it before the threshold check). Use this to
+# collect field_score samples across real rollouts for a threshold sweep
+# (tools/calibrate_field_verify.py) instead of guessing a cutoff — the
+# contrastive scores run lower on ambiguous objects than the plain sigmoid
+# the old 0.50 threshold was swept on, so that number doesn't transfer.
+detection:
+  llmdet_threshold: 0.47
+  detector_cascade: false
+  field_verify: true
+  field_verify_threshold: 0.0
+  field_verify_top_frac: 0.10
+  clipseg_contrastive: true
+  clipseg_softmax_temp: 1.0
+  field_verify_save_frames: true

@@ -4,12 +4,13 @@
 #   dataset / scenarios   the episode source (standard Habitat ObjectNav split
 #                         dir or .json.gz, or a hand-written scenarios sweep)
 #   scenes_root           where the local scene .glb files live
-#   agent_config          protocol embodiment overlay(s), always applied first
-#                         (before the experiment's and the CLI's overlays)
-#   radius / viewpoints   protocol scoring defaults (an experiment may override)
+#   agent_config          protocol embodiment overlay(s) (config/agent_configs/),
+#                         always applied first (before CLI --agent_config, which
+#                         is where you pick the detector arm)
+#   radius / viewpoints   protocol scoring defaults (--experiment may override)
 #
-# Everything experiment-specific (detector arms, action mode, caps, output
-# dir) belongs in experiments/<name>.yaml, not here.
+# Everything else (detector arms via --agent_config, action mode, caps, output
+# dir) is a CLI flag or an optional experiments/<name>.yaml — not here.
 
 gibson:
   # Gibson-val (SemExp v1.1_sub10, 250 eps over 5 scenes). Success = self-stop
@@ -39,4 +40,4 @@ ovon_synonyms:
 
 goffs:
   # Hand-annotated Goffs sweep (custom targets x starts, rect goals).
-  scenarios: config/evaluation_configs/experiments/scenarios_Goffs.yaml
+  scenarios: config/evaluation_configs/scenarios_Goffs.yaml

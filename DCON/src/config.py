@@ -62,7 +62,7 @@ class Config:
                       'clipseg_softmax_temp',
                       'field_verify', 'field_verify_threshold',
                       'field_verify_top_frac', 'field_verify_min_points',
-                      'field_verify_pool'],
+                      'field_verify_pool', 'field_verify_save_frames'],
         'visualization': ['viz_interval', 'vmax_epi'],
     }
 
@@ -392,6 +392,13 @@ class Config:
         self.field_verify_pool = "topk"
         self.field_verify_top_frac = 0.10
         self.field_verify_min_points = 20
+        # Calibration aid: dump the exact rgb_cur frame (with the detector box
+        # drawn) to <output_dir>/field_verify_frames/ whenever field_score is
+        # computed, so a field_score sample logged in traj_log.jsonl can be
+        # visually verified against the actual image instead of a proxy.
+        # Only meaningful when the box wasn't reset by a real (>0) gate —
+        # calibration runs use field_verify_threshold=0.0 so it never is.
+        self.field_verify_save_frames = False
 
         # Load from YAML if path provided
         if yaml_path is not None:
@@ -400,7 +407,7 @@ class Config:
     def apply_yaml(self, yaml_path: str):
         """Override current values from a YAML file, driven by _YAML_SCHEMA.
         Callable repeatedly — later files overlay earlier ones (used by
-        eval_scene.py --agent-config to stack an agent/sensor profile on the
+        eval_scene.py --agent_config to stack an agent/sensor profile on the
         base config)."""
         with open(yaml_path, 'r') as f:
             yaml_data = yaml.safe_load(f) or {}

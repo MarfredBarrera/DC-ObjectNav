@@ -1,14 +1,13 @@
 # Evaluation configs
 
-An eval invocation for `benchmarks/eval_scene.py` is the product of three
-orthogonal choices. The CLI carries only the per-invocation ones; everything
-that defines the experiment lives in a yaml here:
+A minimal `benchmarks/eval_scene.py` invocation needs two named configs plus
+`--gpu`:
 
 ```bash
 # inside the container, from /workspace/DCON
-python benchmarks/eval_scene.py run    --benchmark gibson --experiment fieldverify_thr050 --gpu 3 [--video]
-python benchmarks/eval_scene.py review --benchmark gibson --experiment fieldverify_thr050
-python benchmarks/eval_scene.py report --benchmark gibson --experiment fieldverify_thr050
+python benchmarks/eval_scene.py run    --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml --gpu 3 [--video]
+python benchmarks/eval_scene.py review --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml
+python benchmarks/eval_scene.py report --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml
 # re-score any existing output dir with no configs at all:
 python benchmarks/eval_scene.py report --out output/gibson_val_CLIPSEG_jul12
 ```
@@ -16,27 +15,29 @@ python benchmarks/eval_scene.py report --out output/gibson_val_CLIPSEG_jul12
 | choice | where | what it holds |
 |---|---|---|
 | **Which episodes** | `--benchmark <name>` → an entry in [`benchmarks.yaml`](benchmarks.yaml) | Episode source (`dataset:` split dir / `scenarios:` sweep), `scenes_root`, protocol embodiment overlay (e.g. OVON's Stretch camera), protocol scoring defaults. Entries: `gibson`, `ovon`, `ovon_unseen`, `ovon_synonyms`, `goffs`. |
-| **Everything else** | `--experiment <name>` → `experiments/<name>.yaml` | The experiment's identity: `agent_config:` overlay(s) (detector arm), `discrete:` action mode, `max_per_combo:`/`categories:`/`scenes:` caps, `radius:`/`viewpoints:` scoring, `out:`, `config:` (base config), or even a default `benchmark:`. Allowed keys are validated — a typo fails before anything runs. |
-| **Session flags** | CLI only | `--gpu`, `--video` / `--no-evidence`, `--agent-config` (extra overlay tweaks, repeatable), `--rerun`, `--only`, `--verdicts`, `--results`, `--refresh-bev`, `--out` (override). These never define an experiment. |
+| **The detector arm** | `--agent_config <path>` (repeatable) → yaml under [`../agent_configs/`](../agent_configs/) | A partial `Config` overlay (same schema as `config/config.yaml`; only the keys present override). Names the default `--out` dir. |
+| **Everything else (optional)** | `--experiment <name>` → `experiments/<name>.yaml` | Only needed when you want to bundle non-detector settings into a reusable preset: `discrete:` action mode, `max_per_combo:`/`categories:`/`scenes:` caps, `radius:`/`viewpoints:` scoring, `out:`, `config:` (base config), or even a default `benchmark:`/`agent_config:`. Allowed keys are validated — a typo fails before anything runs. |
+| **Session flags** | CLI only | `--gpu`, `--video` / `--no-evidence`, `--rerun`, `--only`, `--verdicts`, `--results`, `--refresh-bev`, `--out` (override). These never define an experiment. |
 
 Precedence per key: **CLI > experiment > benchmark > built-in default**.
 Overlays instead *stack* (benchmark embodiment first, then the experiment's,
-then CLI `--agent-config`), so the most specific layer wins per config key.
-`--out` defaults to `output/<benchmark>_<experiment>`.
+then CLI `--agent_config`), so the most specific layer wins per config key.
+`--out` defaults to `output/<benchmark>_<agent_config>` (or
+`output/<benchmark>_<experiment>` when `--experiment` is given — it names the
+run instead).
 
-## File kinds in this directory
+## File kinds
 
-- **`benchmarks.yaml`** — the named episode sources (above).
-- **`experiments/*.yaml`** — one file per experiment. Current:
-  `fieldverify_thr050` (τ0.47 LLMDet + field gate 0.50, the sweep winner),
-  `contrastive_field` (adds the contrastive CLIPSeg field target), and
-  `*_smoke` variants (capped at 2 eps per category×scene for fast A/Bs).
-  When a configuration proves itself, freeze it here.
-- **`agent_*.yaml` / `detector_*.yaml`** — partial `Config` overlays (same
-  schema as `config/config.yaml`; only the keys present override). `agent_*`
-  = sensor/body profiles; `detector_*` = detection-stack settings. Referenced
-  by bare name from benchmarks/experiments/`--agent-config`; found anywhere
-  under this directory.
+- **`benchmarks.yaml`** (this directory) — the named episode sources (above).
+- **`../agent_configs/*.yaml`** — partial `Config` overlays (same schema as
+  `config/config.yaml`; only the keys present override). `agent_*` = sensor/
+  body profiles (e.g. `agent_ovon_stretch`); `detector_*` = detection-stack
+  settings. Referenced by full path or bare name from `--agent_config` /
+  a benchmark's `agent_config:`; bare names are found anywhere under
+  `config/`.
+- **`experiments/*.yaml`** (optional) — reusable presets for the non-detector
+  settings (discrete mode, caps, scoring, out dir). Most one-off runs don't
+  need one; freeze a configuration here once it's worth re-running by name.
 - **`scenarios_<Scene>.yaml`** — hand-written per-scene sweeps (targets ×
   starts with ground-truth rect goals), referenced by a benchmark's
   `scenarios:` key.

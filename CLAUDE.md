@@ -49,13 +49,14 @@ DCON/
 │   └── exploration_env.py     # Exploration policy definitions
 │
 ├── config/config.yaml         # Active config (YAML overrides Python defaults)
+├── config/agent_configs/                       # Config overlays — see evaluation_configs/README.md
+│   ├── agent_*.yaml                            # Agent/sensor profiles overlaid on the base config (eval_scene.py run --agent_config)
+│   └── detector_*.yaml                         # Detection-stack overlays (τ, field-verify gate, contrastive map)
 ├── config/evaluation_configs/                  # Eval configs — see its README.md
 │   ├── benchmarks.yaml                         # Named episode sources (eval_scene.py --benchmark: gibson, ovon, ... — dataset/scenarios + embodiment)
-│   ├── experiments/*.yaml                      # Experiment definitions (eval_scene.py --experiment: overlays, action mode, caps, scoring, out)
+│   ├── experiments/*.yaml                      # Optional presets (eval_scene.py --experiment: non-detector overlays, action mode, caps, scoring, out)
 │   ├── episodes.yaml                           # Hand-annotated episodes for benchmarks/evaluate.py (scene, query, start, goals)
-│   ├── scenarios_*.yaml                        # Per-scene sweep specs for benchmarks/eval_scene.py (targets × starts, rect goals)
-│   ├── agent_*.yaml                            # Agent/sensor profiles overlaid on the base config (eval_scene.py run --agent-config)
-│   └── detector_*.yaml                         # Detection-stack overlays (τ, field-verify gate, contrastive map)
+│   └── scenarios_*.yaml                        # Per-scene sweep specs for benchmarks/eval_scene.py (targets × starts, rect goals)
 ├── output/                    # Results (scenes, maps, models, traj_log.jsonl; eval runs/, verdicts.yaml)
 ├── figs/                      # Generated figures and videos
 └── gibson_scenes/             # Scene assets (.glb)
@@ -191,20 +192,21 @@ Runs each hand-annotated episode (scene, query, start pos, goals) through `main.
 
 **3. Sweep with human adjudication (`benchmarks/eval_scene.py`)**
 
-An eval is the product of three orthogonal choices (see `config/evaluation_configs/README.md`); the CLI carries only the per-invocation ones:
+A minimal eval needs two named configs (see `config/evaluation_configs/README.md`); the CLI carries only the per-invocation ones:
 - **`--benchmark <name>`** — WHICH EPISODES: a named entry in `config/evaluation_configs/benchmarks.yaml` (`gibson`, `ovon`, `ovon_unseen`, `ovon_synonyms`, `goffs`): the episode source (`dataset:` split or `scenarios:` sweep), `scenes_root`, and any protocol embodiment overlay (OVON's Stretch camera) + scoring defaults.
-- **`--experiment <name>`** — EVERYTHING ELSE, in `config/evaluation_configs/experiments/<name>.yaml`: detector overlays (`agent_config:`), action mode (`discrete:`), caps (`max_per_combo:`, `categories:`, `scenes:`), scoring (`radius:`, `viewpoints:`), `out:`, base `config:`. Keys are validated; a typo fails before anything runs.
-- **Session flags** — `--gpu`, `--video`/`--no-evidence`, `--agent-config` (extra overlays, repeatable, bare names found anywhere under `config/evaluation_configs/`), `--rerun`, `--only`, `--verdicts`, `--results`, `--refresh-bev`, `--out` (override).
+- **`--agent_config <path>`** — THE DETECTOR ARM: a `Config` overlay yaml under `config/agent_configs/` (repeatable; stacks after the benchmark's own embodiment overlay; a bare name is found anywhere under `config/`). Also names the default `--out` dir.
+- **`--experiment <name>`** (optional) — EVERYTHING ELSE, only needed when bundling non-detector settings into a reusable preset: `config/evaluation_configs/experiments/<name>.yaml` — action mode (`discrete:`), caps (`max_per_combo:`, `categories:`, `scenes:`), scoring (`radius:`, `viewpoints:`), `out:`, base `config:`, even a default `benchmark:`/`agent_config:`. Keys are validated; a typo fails before anything runs.
+- **Session flags** — `--gpu`, `--video`/`--no-evidence`, `--rerun`, `--only`, `--verdicts`, `--results`, `--refresh-bev`, `--out` (override).
 
-Precedence per key: CLI > experiment > benchmark > default; overlays stack (benchmark embodiment → experiment → CLI) so the most specific wins per config key. `--out` defaults to `output/<benchmark>_<experiment>`.
+Precedence per key: CLI > experiment > benchmark > default; overlays stack (benchmark embodiment → experiment → CLI `--agent_config`) so the most specific wins per config key. `--out` defaults to `output/<benchmark>_<agent_config>` (or `output/<benchmark>_<experiment>` when `--experiment` is given).
 ```bash
-python benchmarks/eval_scene.py run    --benchmark gibson --experiment fieldverify_thr050 --gpu 3   # execute + save evidence
-python benchmarks/eval_scene.py review --benchmark gibson --experiment fieldverify_thr050           # (re)build verdicts.yaml + BEV evidence
+python benchmarks/eval_scene.py run    --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml --gpu 3   # execute + save evidence
+python benchmarks/eval_scene.py review --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml           # (re)build verdicts.yaml + BEV evidence
 # ...inspect the out dir's ep/<id>/ (nav_history.mp4, bev_final.png), edit verdicts.yaml...
-python benchmarks/eval_scene.py report --benchmark gibson --experiment fieldverify_thr050           # aggregate SR/SPL
-python benchmarks/eval_scene.py report --out output/<any_existing_dir>                              # re-score records on disk, no configs
+python benchmarks/eval_scene.py report --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml           # aggregate SR/SPL
+python benchmarks/eval_scene.py report --out output/<any_existing_dir>                                                                  # re-score records on disk, no configs
 ```
-Current experiments: `fieldverify_thr050` (τ0.47 LLMDet + field gate 0.50, the sweep winner), `contrastive_field` (adds the contrastive CLIPSeg field target), plus `*_smoke` variants (2 eps per category×scene). Freeze any proven configuration as a new experiment yaml.
+`config/agent_configs/` holds the detector arms, e.g. `detector_distractors_field` (contrastive CLIPSeg field on top of the fieldverify sweep winner) and `detector_fieldverify_thr050` (τ0.47 LLMDet + field gate 0.50, the sweep winner). `--experiment` presets are for bundling caps/scoring, e.g. a `*_smoke` variant capped at 2 eps per category×scene — freeze one under `experiments/` once it's worth re-running by name.
 A benchmark's episode source is either `scenarios:` (a hand-written per-scene sweep of **targets × start positions**; `runs_per_combo` repeats each; run id `{target}__{start}[__r{k}]`) **or** `dataset:` (standard benchmark episodes; below). Either way the pipeline separates **evidence** from **judgment**:
 - **`run`** executes each combo (skips completed unless `--rerun`), saving a raw record to `runs/<id>.json` + an evidence bundle in `ep/<id>/`. Evidence is **minimal by default** — `traj_log.jsonl`, `grid_extent.json`, the FINAL occupancy BEV `.npy`, and `bev_final.png` (goals/start/final marked) — a few tens of KB per run. `--video` adds the full per-step BEV map + RGB history and renders `nav_history.mp4` (megabytes/run). `--no-evidence` keeps only `traj_log` + `grid_extent`. The feature-field checkpoint is never saved (nothing consumes it). Bakes in no verdict — auto-success is only a suggestion.
 - **`review`** (re)generates a single **`verdicts.yaml`** (one entry per run, `status: auto|success|fail|exclude`, pre-filled with the auto-suggestion + evidence inline as comments). Preserves your edits on re-run. This is the authoritative human judgment (replaces the older exclude/override files).
