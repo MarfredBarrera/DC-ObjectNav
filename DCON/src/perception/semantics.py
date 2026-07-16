@@ -174,7 +174,8 @@ class CLIPSegSemantics:
     IMAGENET_STD = (0.229, 0.224, 0.225)
 
     def __init__(self, query: str, device="cuda", model_name="CIDAS/clipseg-rd64-refined",
-                 input_size=352, distractors=None, softmax_temp: float = 1.0):
+                 input_size=352, distractors=None, softmax_temp: float = 1.0,
+                 pairwise: bool = False):
         from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
         self.device = device
@@ -182,6 +183,11 @@ class CLIPSegSemantics:
         self.query = query
         self.distractors = filter_distractors(query, distractors)
         self.softmax_temp = float(softmax_temp)
+        # Pairwise mode: emit one sigmoid channel per prompt (row 0 = query)
+        # instead of collapsing to the scalar sigmoid x softmax-share. The
+        # contrast then happens downstream at field-verify time on the
+        # multi-view-averaged channels (margin-of-means), not per frame.
+        self.pairwise = bool(pairwise)
 
         processor = CLIPSegProcessor.from_pretrained(model_name)
         self.model = CLIPSegForImageSegmentation.from_pretrained(model_name).to(device)
@@ -200,7 +206,11 @@ class CLIPSegSemantics:
                 input_ids=text_inputs["input_ids"],
                 attention_mask=text_inputs.get("attention_mask"),
             )
-        if self.distractors:
+        if self.pairwise:
+            print(f"[CLIPSeg] pairwise mode: {1 + len(self.distractors)} sigmoid "
+                  f"channels ([query] + {len(self.distractors)} distractors) "
+                  f"for {query!r}")
+        elif self.distractors:
             print(f"[CLIPSeg] contrastive mode: {len(self.distractors)} distractors "
                   f"for {query!r} (temp={self.softmax_temp})")
 
@@ -233,13 +243,19 @@ class CLIPSegSemantics:
         if logits.dim() == 2:
             logits = logits.unsqueeze(0)
 
-        score = torch.sigmoid(logits[0])                            # (352, 352)
-        if K > 1:
-            # Contrastive posterior over [query] + distractors; row 0 = query.
-            posterior = torch.softmax(logits / self.softmax_temp, dim=0)[0]
-            score = score * posterior
-        score = score[None]              # (1, 352, 352)
+        if self.pairwise:
+            # Per-term sigmoid channels, no per-frame contrast: (K, 352, 352).
+            # Each channel is independently bounded in [0, 1]; the field
+            # regresses the full vector and the margin is taken at read time.
+            score = torch.sigmoid(logits)
+        else:
+            score = torch.sigmoid(logits[0])                        # (352, 352)
+            if K > 1:
+                # Contrastive posterior over [query] + distractors; row 0 = query.
+                posterior = torch.softmax(logits / self.softmax_temp, dim=0)[0]
+                score = score * posterior
+            score = score[None]          # (1, 352, 352)
 
         score = F.interpolate(score.unsqueeze(1), size=(H, W),
-                              mode="bilinear", align_corners=False)  # (1, 1, H, W)
-        return score[0].permute(1, 2, 0).float()  # (H, W, 1)
+                              mode="bilinear", align_corners=False)  # (C, 1, H, W)
+        return score.squeeze(1).permute(1, 2, 0).float()  # (H, W, C)

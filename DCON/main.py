@@ -29,6 +29,7 @@ import numpy as np
 import quaternion  # registers numpy.quaternion dtype used by habitat-sim
 import torch
 import imageio
+from PIL import Image, ImageDraw
 
 from src.config import Config
 from src.habitat.habitat_utils import (
@@ -239,15 +240,31 @@ def detect_classify_latch(detector, perception, sim_iface, cfg,
             top_frac=cfg.field_verify_top_frac,
             min_points=cfg.field_verify_min_points,
             pool=cfg.field_verify_pool)
-        if field_score is None or field_score < cfg.field_verify_threshold:
+        # Pairwise mode: field_score is the worst-case margin; the presence
+        # floor is a separate "is anything here" conjunct on the query
+        # channel (0.0 disables). Kept apart from the margin threshold so
+        # the two scales stay decoupled (see config.py).
+        fv = perception.last_field_verify
+        presence_ok = True
+        if (cfg.clipseg_pairwise and fv is not None
+                and cfg.field_verify_presence_floor > 0.0):
+            presence_ok = fv["presence"] >= cfg.field_verify_presence_floor
+        if (field_score is None or field_score < cfg.field_verify_threshold
+                or not presence_ok):
             fs = "n/a" if field_score is None else f"{field_score:.3f}"
+            why = (f"presence={fv['presence']:.3f} < floor "
+                   f"{cfg.field_verify_presence_floor:.2f}"
+                   if (field_score is not None
+                       and field_score >= cfg.field_verify_threshold)
+                   else f"field={fs} < {cfg.field_verify_threshold:.2f}")
             print(f"{tag}: field-verify REJECTED detection "
-                  f"(llmdet={det_score:.3f}, field={fs} < "
-                  f"{cfg.field_verify_threshold:.2f})")
+                  f"(llmdet={det_score:.3f}, {why})")
             det_score, det_box = 0.0, None
         else:
+            extra = (f", presence={fv['presence']:.3f}"
+                     if (fv is not None and fv["margin"] is not None) else "")
             print(f"{tag}: field-verify accepted "
-                  f"(llmdet={det_score:.3f}, field={field_score:.3f})")
+                  f"(llmdet={det_score:.3f}, field={field_score:.3f}{extra})")
 
     det_persistent, det_investigate = classify_detection(
         perception, cfg, sim_iface.intrinsics, det_box, depth, c2w, pos)
@@ -642,6 +659,17 @@ def run(cfg: Config, save_enabled: bool = True,
                 rgb_cur, depth_cur, c2w_cur, pos, detected, detected_streak,
                 run_detector=run_detector, tag=f"step {step}")
 
+            # Calibration aid: dump the exact frame + box field_score was
+            # computed on, so it can be visually verified later (see
+            # cfg.field_verify_save_frames docstring in config.py).
+            if cfg.field_verify_save_frames and field_score is not None and det_box is not None:
+                frames_dir = os.path.join(cfg.output_dir, "field_verify_frames")
+                os.makedirs(frames_dir, exist_ok=True)
+                frame_img = Image.fromarray((rgb_cur.numpy() * 255).astype(np.uint8))
+                ImageDraw.Draw(frame_img).rectangle(list(det_box), outline=(255, 0, 0), width=3)
+                frame_img.save(os.path.join(
+                    frames_dir, f"step{step:06d}_fs{field_score:.3f}.png"))
+
             # # SEARCH-mode goal disconfirmation: if the agent has reached its
             # # cached box-goal but nothing is detected there now, the earlier
             # # sighting was a false positive (a transient detector spike or a
@@ -741,6 +769,16 @@ def run(cfg: Config, save_enabled: bool = True,
                     'det_conf': float(det_score),
                     'field_score': (float(field_score)
                                     if field_score is not None else None),
+                    # Pairwise-mode components (None otherwise): query-channel
+                    # presence + per-term pooled scores behind the margin.
+                    'field_presence': (perception.last_field_verify["presence"]
+                                       if (field_score is not None
+                                           and perception.last_field_verify is not None)
+                                       else None),
+                    'field_terms': (perception.last_field_verify["terms"]
+                                    if (field_score is not None
+                                        and perception.last_field_verify is not None)
+                                    else None),
                     'det_box': [float(v) for v in det_box] if det_box is not None else None,
                     'goal': [int(goal_cell[0]), int(goal_cell[1])] if goal_cell is not None else None,
                     'mode': mode,

@@ -1,0 +1,20 @@
+# Pairwise-logit field arm — max-Youden-J operating point (τ_margin = 0.0).
+#
+# Same detector arm as the contrastive winner (τ0.47 sink-gated LLMDet) but the
+# CLIPSeg field regresses one sigmoid channel per term ([query] + filtered
+# distractors) and field-verify accepts a box only when the worst-case MARGIN
+# (query presence - hardest distractor presence, pooled over the top-frac
+# in-box cells) clears 0.0 — the tuning-free anchor: on the 50-episode calib
+# set this is the max-Youden-J point (TP-ret 40.9% / FP-rej 92.9%), and unlike
+# the contrastive scalar-margin (FP mean +0.085) the pairwise FP mean is
+# negative (-0.119) so 0.0 needs no per-scene calibration.
+detection:
+  llmdet_threshold: 0.47
+  detector_cascade: false
+  field_verify: true
+  field_verify_threshold: 0.0
+  field_verify_presence_floor: 0.0
+  field_verify_top_frac: 0.10
+  clipseg_pairwise: true
+  clipseg_contrastive: false
+  field_verify_save_frames: false

@@ -1,0 +1,18 @@
+# Pairwise-logit field arm — full-FP-rejection operating point (τ_margin = 0.10).
+#
+# Same detector arm as detector_pairwise_field_maxj but the worst-case-margin
+# gate is raised to 0.10, the point at which the 50-episode calib set reaches
+# 100% FP-rejection (31.8% TP-ret). This is the conservative arm: it should
+# 100%-suppress the bed/toilet look-alike latches that survive the contrastive
+# field, at the cost of some recall on under-observed / distant targets whose
+# presence sits near the cold-start floor.
+detection:
+  llmdet_threshold: 0.47
+  detector_cascade: false
+  field_verify: true
+  field_verify_threshold: 0.10
+  field_verify_presence_floor: 0.0
+  field_verify_top_frac: 0.10
+  clipseg_pairwise: true
+  clipseg_contrastive: false
+  field_verify_save_frames: false

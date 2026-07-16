@@ -59,8 +59,9 @@ class Config:
                       'locate_anything_max_new_tokens', 'cascade_min_iou',
                       'clipseg_model_name', 'clipseg_threshold',
                       'distractor_objects', 'clipseg_contrastive',
-                      'clipseg_softmax_temp',
+                      'clipseg_softmax_temp', 'clipseg_pairwise',
                       'field_verify', 'field_verify_threshold',
+                      'field_verify_presence_floor',
                       'field_verify_top_frac', 'field_verify_min_points',
                       'field_verify_pool', 'field_verify_save_frames'],
         'visualization': ['viz_interval', 'vmax_epi'],
@@ -341,6 +342,28 @@ class Config:
         ]
         self.clipseg_contrastive = False
         self.clipseg_softmax_temp = 1.0
+
+        # Pairwise-logit CLIPSeg field (`clipseg_pairwise`): instead of
+        # collapsing the contrast into a scalar at supervision time
+        # (`clipseg_contrastive`'s sigmoid x softmax-share, whose share is
+        # structurally lower for sibling-crowded categories and depends on
+        # distractor count), the field regresses one sigmoid CHANNEL PER TERM
+        # ([query] + filtered `distractor_objects`; hash_feature_dim is
+        # overridden to 1+K at PerceptionStack init). Contrast happens at
+        # VERIFY time on the multi-view-converged channels: field-verify pools
+        # the top-frac in-box cells selected by the QUERY channel, reads every
+        # channel at those same cells, and scores the box by the worst-case
+        # margin  presence_q - max_i presence_i  (margin-of-means, not the
+        # reverted 2026-07 mean-of-margins scalar target). `field_score` IS
+        # that margin in this mode — it lives in [-1, 1], so a log-only
+        # calibration gate needs field_verify_threshold <= -1.0, not 0.0.
+        # `field_verify_presence_floor` is a separate "is anything here"
+        # conjunct on the query channel (0.0 disables): margin answers
+        # "more couch than bed?", the floor answers "couch-like at all?" —
+        # kept separate so the two scales stay decoupled.
+        # Mutually exclusive with clipseg_contrastive (pairwise wins).
+        self.clipseg_pairwise = False
+        self.field_verify_presence_floor = 0.0
 
         # Two-stage detection (see CascadeDetector in obj_detection.py). When
         # `detector_cascade` is True, NVIDIA LocateAnything-3B proposes a box

@@ -1,0 +1,25 @@
+# Pairwise-logit field CALIBRATION overlay (gate log-only).
+#
+# Same detector arm as the contrastive calib (τ0.47 sink-gated LLMDet) but the
+# CLIPSeg field regresses one sigmoid channel per term ([query] + filtered
+# distractors) and field-verify scores a box by the worst-case MARGIN
+# (query presence - hardest distractor presence) pooled over the top-frac
+# in-box cells — contrast at verify time on the multi-view-converged field
+# (margin-of-means), not baked into the per-frame supervision like
+# clipseg_contrastive (softmax-share) or the reverted 2026-07 scalar-margin
+# target (mean-of-margins).
+#
+# field_score in traj_log.jsonl IS the margin, in [-1, 1] — so the log-only
+# gate needs threshold -1.0 (0.0 would silently reject negative-margin
+# frames and bias the calibration sample). field_presence / field_terms are
+# logged alongside for 2-D (margin x presence) threshold analysis.
+detection:
+  llmdet_threshold: 0.47
+  detector_cascade: false
+  field_verify: true
+  field_verify_threshold: -1.0
+  field_verify_presence_floor: 0.0
+  field_verify_top_frac: 0.10
+  clipseg_pairwise: true
+  clipseg_contrastive: false
+  field_verify_save_frames: true

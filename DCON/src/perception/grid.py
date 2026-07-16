@@ -124,7 +124,14 @@ class SimilarityGrid(VoxelGrid):
                 batch_pts = points_tensor[start:end]
 
                 gamma, _, _, _ = self.feature_field.forward(batch_pts, normalize=False)
-                sim = gamma.squeeze(-1).clamp(0.0, 1.0)
+                if gamma.shape[-1] > 1:
+                    # Pairwise field: BEV similarity = clamped worst-case
+                    # margin (query channel minus hardest distractor
+                    # channel). Cold regions read ~0 (all channels sit at
+                    # the cold-start sigmoid), same as the scalar field.
+                    sim = (gamma[..., 0] - gamma[..., 1:].max(dim=-1).values).clamp(0.0, 1.0)
+                else:
+                    sim = gamma.squeeze(-1).clamp(0.0, 1.0)
                 all_sims.append(sim)
 
         all_sims = torch.cat(all_sims, dim=0)

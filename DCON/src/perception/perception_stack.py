@@ -82,9 +82,23 @@ class PerceptionStack:
             query=cfg.target_query,
             device=self.device,
             model_name=cfg.clipseg_model_name,
-            distractors=cfg.distractor_objects if cfg.clipseg_contrastive else None,
+            distractors=(cfg.distractor_objects
+                         if (cfg.clipseg_contrastive or cfg.clipseg_pairwise)
+                         else None),
             softmax_temp=cfg.clipseg_softmax_temp,
+            pairwise=cfg.clipseg_pairwise,
         )
+        # Pairwise mode: the field regresses one sigmoid channel per term
+        # ([query] + the per-query filtered distractors), so the feature dim
+        # is only known after filter_distractors ran. Override before the
+        # field/buffer are sized. K can hit 0 if every distractor shares a
+        # word with the query — then pairwise degenerates to the plain
+        # sigmoid field (margin falls back to presence at verify time).
+        if cfg.clipseg_pairwise:
+            cfg.hash_feature_dim = 1 + len(self.semantics.distractors)
+            print(f"[PerceptionStack] pairwise field: hash_feature_dim -> "
+                  f"{cfg.hash_feature_dim} (query + {len(self.semantics.distractors)} "
+                  f"distractor channels)")
         # Single evidential field: aleatoric + epistemic uncertainty in one
         # forward pass via the Normal-Inverse-Gamma marginal (replaces the
         # ensemble whose only role was empirical epistemic from prediction var).
@@ -112,6 +126,9 @@ class PerceptionStack:
         )
         self._latest_frame = None         # most-recent (pts_cpu, feats_cpu), held out
         self.target_query = cfg.target_query
+        # Components of the most recent field_score_in_box call (pairwise
+        # mode: presence / margin / per-term pooled scores) for logging.
+        self.last_field_verify = None
         
     def extract_and_unproject(self, rgb, depth, c2w, intrinsics, depth_near=None, depth_far=None) -> Tuple[torch.Tensor, torch.Tensor]:
         depth_gpu = depth.to(self.device)
@@ -309,7 +326,12 @@ class PerceptionStack:
                     batch_pts = world_points[start:end]
 
                     gamma, _, _, _ = self.feature_field.forward(batch_pts, normalize=False)
-                    sim = gamma.squeeze(-1).clamp(0.0, 1.0)
+                    if gamma.shape[-1] > 1:
+                        # Pairwise field: clamped worst-case margin (query
+                        # channel minus hardest distractor channel).
+                        sim = (gamma[..., 0] - gamma[..., 1:].max(dim=-1).values).clamp(0.0, 1.0)
+                    else:
+                        sim = gamma.squeeze(-1).clamp(0.0, 1.0)
                     all_sims.append(sim)
 
             sim_2d = torch.zeros((H, W), device=self.device)
@@ -344,9 +366,18 @@ class PerceptionStack:
         multi-view map: a look-alike that fools the detector on one frame
         reads low until the field itself has learned "target here".
 
+        Pairwise mode (cfg.clipseg_pairwise): the field is multi-channel
+        (channel 0 = query, 1..K = distractors). The top-frac cells are
+        selected by the QUERY channel, every channel is pooled over those
+        same cells (margin-of-means over the multi-view-converged field),
+        and the returned score is the worst-case margin
+        presence_q - max_i presence_i in [-1, 1]. The components (presence,
+        margin, per-term pooled scores) land in `self.last_field_verify`.
+
         Returns None when the box is degenerate or has fewer than
         `min_points` valid-depth pixels (can't be verified).
         """
+        self.last_field_verify = None
         if box is None:
             return None
         depth_gpu = depth.to(self.device)
@@ -368,14 +399,44 @@ class PerceptionStack:
         scores = []
         for i in range(0, pts.shape[0], batch_size):
             gamma, _, _, _ = self.feature_field.forward(pts[i:i + batch_size], normalize=False)
-            scores.append(gamma.squeeze(-1).clamp(0.0, 1.0))
-        flat = torch.cat(scores, dim=0)
+            scores.append(gamma.clamp(0.0, 1.0))
+        flat = torch.cat(scores, dim=0)  # (N, C); C == 1 unless pairwise
+
+        if self.cfg.clipseg_pairwise and flat.shape[-1] > 0:
+            # Select cells by the query channel, pool every channel over the
+            # SAME cells (top-k'ing channels independently would compare
+            # different locations).
+            q = flat[:, 0]
+            if pool == "max":
+                idx = q.argmax().unsqueeze(0)
+            elif pool == "topk":
+                k = max(1, int(round(q.numel() * top_frac)))
+                idx = torch.topk(q, k).indices
+            else:
+                raise ValueError(f"Unknown field_verify pool {pool!r} (expected 'topk' or 'max')")
+            pooled = flat[idx].mean(dim=0)          # (C,)
+            presence = float(pooled[0])
+            if pooled.numel() > 1:
+                margin = presence - float(pooled[1:].max())
+            else:
+                margin = presence  # no distractor channels survived filtering
+            self.last_field_verify = {
+                "presence": presence,
+                "margin": margin,
+                "terms": [round(float(x), 4) for x in pooled],
+            }
+            return margin
+
+        flat = flat.squeeze(-1)
         if pool == "max":
-            return float(flat.max())
-        if pool == "topk":
+            score = float(flat.max())
+        elif pool == "topk":
             k = max(1, int(round(flat.numel() * top_frac)))
-            return float(torch.topk(flat, k).values.mean())
-        raise ValueError(f"Unknown field_verify pool {pool!r} (expected 'topk' or 'max')")
+            score = float(torch.topk(flat, k).values.mean())
+        else:
+            raise ValueError(f"Unknown field_verify pool {pool!r} (expected 'topk' or 'max')")
+        self.last_field_verify = {"presence": score, "margin": None, "terms": None}
+        return score
 
     @property
     def buffer_size(self) -> int:

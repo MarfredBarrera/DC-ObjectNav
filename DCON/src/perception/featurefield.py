@@ -59,6 +59,12 @@ class EvidentialFeatureField(nn.Module):
         # Calculate encoding output dimension
         self.encoding_dim = encoding_config["n_levels"] * encoding_config["n_features_per_level"]
         self.feature_dim = config.hash_feature_dim
+        # Bounded per-channel targets (CLIPSeg sigmoid scores), as opposed to
+        # a MaskCLIP embedding: the scalar case (dim 1) and the pairwise
+        # multi-channel case (dim 1+K, one sigmoid channel per term) both get
+        # the sigmoid output activation and must NOT be L2-normalized —
+        # channels are independent scores, not a direction.
+        self.bounded_channels = (self.feature_dim == 1) or bool(config.clipseg_pairwise)
 
         # Output dims: Mean (feature_dim) + Evidential Params (v, alpha, beta)
         # Using isotropic uncertainty (1 scalar set for the whole feature vector)
@@ -115,7 +121,7 @@ class EvidentialFeatureField(nn.Module):
         # which blows up error_squared = (gt - gamma)**2 and cascades into
         # NaN through the NLL's log terms. Bounding gamma caps error_squared
         # at 1 in the worst case and closes that instability off at the source.
-        if self.feature_dim == 1:
+        if self.bounded_channels:
             # Cold-start bias: an untrained region evaluates to whatever the
             # hash-grid encoding + MLP happen to produce with no gradient
             # signal, which is arbitrary -- observed empirically landing near
@@ -152,8 +158,10 @@ class EvidentialFeatureField(nn.Module):
         # Epistemic (model uncertainty) = variance of the mean = beta / (v * (alpha - 1))
         epistemic = beta / (v * (alpha - 1.0))
         
-        # Only normalize mean if requested
-        if normalize:
+        # Only normalize mean if requested — and never for bounded sigmoid
+        # channels (scalar or pairwise multi-channel): they're independent
+        # scores, not a direction, and L2-normalizing would destroy them.
+        if normalize and not self.bounded_channels:
             gamma = self.safe_normalize(gamma)
         
         return gamma, aleatoric, epistemic, (v, alpha, beta)
@@ -185,7 +193,11 @@ class EvidentialFeatureField(nn.Module):
 
         # Forward pass 
         gamma, _, _, (v, alpha, beta) = self.forward(batch_points, normalize=False)
-        gt_norm = self.safe_normalize(batch_gt_features)
+        # Bounded sigmoid channels are independent scores, not a direction —
+        # L2-normalizing a (1+K)-channel pairwise target would destroy it
+        # (safe_normalize only self-guards the dim==1 case).
+        gt_norm = (batch_gt_features if self.bounded_channels
+                   else self.safe_normalize(batch_gt_features))
         
         # --- Evidential NLL Loss (Student-t Marginal Likelihood) ---
         # Squared error (N, D)
