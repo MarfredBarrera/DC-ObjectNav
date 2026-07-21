@@ -571,6 +571,23 @@ def run(cfg: Config, save_enabled: bool = True,
     traj_log_path = os.path.join(cfg.output_dir, "traj_log.jsonl")
     open(traj_log_path, 'w').close()  # truncate / create fresh
 
+    # Auditability: stash the distractor vocabulary the pairwise/contrastive
+    # field actually used on the FIRST traj_log line (a `meta` record, no
+    # `step` — consumers skip it) so a completed run records its distractors
+    # without a disk cache. With greedy LLM decoding this is reproducible; the
+    # log makes it inspectable across model-version changes. Empty when the
+    # field isn't running distractors (plain sigmoid mode).
+    _distractors = list(getattr(perception.semantics, 'distractors', []) or [])
+    print(f"[main] field distractors ({len(_distractors)}, "
+          f"{'llm' if cfg.llm_distractors else 'static'}): {_distractors}")
+    with open(traj_log_path, 'a') as _f:
+        _f.write(json.dumps({
+            'meta': 'distractors',
+            'query': perception.target_query,
+            'source': 'llm' if cfg.llm_distractors else 'static',
+            'distractors': _distractors,
+        }) + '\n')
+
     # 5. Main loop
     print(f"[main] running for {cfg.iterations} iterations "
           f"(replan every {REPLAN_INTERVAL}, refresh every {cfg.hash_buffer_refresh_interval})")
