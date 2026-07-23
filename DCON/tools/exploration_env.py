@@ -95,7 +95,7 @@ def make_cfg(scene_filepath):
 # --------------------------------------------------------
 # Initialization
 # --------------------------------------------------------
-scene = "/workspace/DCON/gibson_scenes/Ruckersville.glb"
+scene = "/workspace/DCON/benchmarks/gibson_scenes/Ruckersville.glb"
 cfg = make_cfg(scene)
 
 try:

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from src.config import Config
+from src.perception.distractor_gen import build_distractor_vocabulary
 from src.perception.semantics import CLIPSegSemantics
 from src.perception.featurefield import EvidentialFeatureField
 from src.perception.grid import UncertaintyGrid, OccupancyGrid, SimilarityGrid
@@ -78,13 +79,20 @@ class PerceptionStack:
         # tradeoff: target_query never changes mid-run, and CLIPSeg's per-
         # pixel signal is much cleaner, especially before the target has been
         # well-observed. See CLIPSegSemantics docstring.
+        # Distractor vocabulary: the generic `background_terms` bank plus the
+        # object confusers (a per-target LLM set when `llm_distractors` is on,
+        # else the static `distractor_objects`). Assembled once here, before
+        # the field/buffer claim GPU memory (the LLM path frees itself first).
+        # `filter_distractors` inside CLIPSegSemantics still strips any phrase
+        # sharing a content word with the query as a safety net.
+        distractors = None
+        if cfg.clipseg_contrastive or cfg.clipseg_pairwise:
+            distractors = build_distractor_vocabulary(cfg.target_query, cfg)
         self.semantics = CLIPSegSemantics(
             query=cfg.target_query,
             device=self.device,
             model_name=cfg.clipseg_model_name,
-            distractors=(cfg.distractor_objects
-                         if (cfg.clipseg_contrastive or cfg.clipseg_pairwise)
-                         else None),
+            distractors=distractors,
             softmax_temp=cfg.clipseg_softmax_temp,
             pairwise=cfg.clipseg_pairwise,
         )
@@ -263,7 +271,7 @@ class PerceptionStack:
             self.occupancy_grid.save(step)
 
         # Similarity
-        self.similarity_grid.compute_similarity_map(occupancy_grid=self.occupancy_grid)
+        self.similarity_grid.compute_similarity_map()
         if save_enabled:
             self.similarity_grid.save(step)
 

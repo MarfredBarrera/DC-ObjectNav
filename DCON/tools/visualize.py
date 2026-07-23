@@ -72,7 +72,12 @@ def load_traj_log(path):
         for line in f:
             line = line.strip()
             if line:
-                entries.append(json.loads(line))
+                rec = json.loads(line)
+                # Skip the leading metadata record (e.g. the distractor
+                # vocabulary) main.py stashes as a `meta` line with no `step`.
+                if 'step' not in rec:
+                    continue
+                entries.append(rec)
     return sorted(entries, key=lambda e: e['step'])
 
 

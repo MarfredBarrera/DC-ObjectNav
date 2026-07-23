@@ -1,3 +1,185 @@
+# Handoff: DD-PPO EXPLOIT navigation (2026-07-22/23, in progress)
+
+**Uncommitted.** This work package replaces the previous handoff's newest
+item (#4, eval CLI rework) as the front of the stack — it's a different
+subsystem (EXPLOIT locomotion, not detection) and doesn't touch the
+CLIPSeg/field-verify work below at all. That work is unaffected and its
+section (further down this file) is historical reference only now.
+
+## What this is
+
+EXPLOIT (the final-approach control mode once a detection has latched) used
+to run a deterministic A* + waypoint controller over the BEV occupancy grid.
+Per user direction, it was replaced entirely with **DD-PPO** (Wijmans et al.
+2020) — the actual pretrained Habitat PointNav RL policy
+(`ddppo_weights/gibson-2plus-se-resneXt101-lstm1024.pth`: depth-only,
+SE-ResNeXt101 backbone, 2-layer LSTM, discrete 4-action space), since point
+navigation is exactly the sub-problem it was built to solve and it sidesteps
+the BEV-vs-navmesh collision mismatches A* kept running into on Gibson.
+
+- **New file**: `src/planning/ddppo_policy.py` — a from-scratch,
+  dependency-free reimplementation of
+  `habitat_baselines.rl.ddppo.policy.resnet_policy.PointNavResNetPolicy`,
+  vendored to match the checkpoint's exact `state_dict` (module names,
+  including the upstream `tgt_embeding` typo). `DDPPONavigator` is the
+  stateful wrapper (`act()` per replan; owns LSTM hidden state / prev-action
+  / not-done mask across the whole latch).
+- **main.py**: EXPLOIT branch now calls `ddppo_nav.act(depth, ..., pos,
+  rotation, goal_world)` instead of A*; `exploit_astar_action` is still
+  defined (dead code, kept for reference/recovery) but no longer called.
+  EXPLOIT is always discrete-stepped via `sim_iface.step_discrete`
+  regardless of the global `cfg.discrete_actions` flag (that flag now only
+  governs SEARCH).
+- **Verified bit-exact against upstream** (fetched actual habitat-lab v0.1.7
+  source, not reverse-engineered from shapes): the PointGoal polar transform
+  (`compute_pointgoal_polar` — quaternion rotation, `cartesian_to_polar`
+  sign/argument order), the `[rho, cos(-phi), sin(-phi)]` goal embedding,
+  the visual encoder's exact op order (permute → avg_pool2d(2) → running
+  norm (identity here) → backbone → compression), and the
+  `prev_action_embedding` start-token/+1 offset convention. None of these
+  were the bug.
+
+## Bugs found and fixed this session (roughly in the order hit)
+
+1. **Goal-precision mismatch** — DD-PPO's own STOP is trained against a
+   strict ~0.2m threshold on an exact ground-truth PointGoal; our goal is a
+   single detection-box projection, rarely that precise. Fixed: DD-PPO
+   drives locomotion only, our own `cfg.stop_distance_m` Euclidean check
+   (bumped to 0.9m earlier) is the sole arrival trigger. (DD-PPO's own stop
+   is still checked as a secondary path — harmless, rarely fires.)
+2. **Deterministic-action 2-cycle lock** — greedy argmax action selection
+   let the previous-action embedding feed back into the LSTM and lock into
+   an inescapable turn_left/turn_right alternation forever. Fixed:
+   `deterministic=False` (sample, don't argmax) in `DDPPONavigator.act`,
+   matching Habitat's own reference eval wrapper
+   (`habitat_baselines/agents/ppo_agents.py`).
+3. **`discrete_turn_deg` was 30°, DD-PPO trained at Habitat PointNav's
+   default 10°** — a 3x turn-magnitude mismatch vs. what the recurrent
+   policy's implicit heading-correction assumes per action. Fixed: `10.0`
+   in both `config.py` and `config.yaml`. (This field is currently shared
+   with SEARCH's optional discrete-action tracking controller, which wants
+   the ObjectNav-challenge 30° convention instead — a latent conflict, not
+   yet an active bug since `discrete_actions` defaults off for SEARCH. Split
+   into two config fields if SEARCH discrete mode is ever turned on
+   alongside EXPLOIT DD-PPO.)
+4. **Free-space goal snapping — tried, then fully REVERTED.** Reasoning at
+   the time: DD-PPO trains on always-reachable PointGoals, so a detection
+   goal embedded in an obstacle (on the object's surface) seemed
+   out-of-distribution; snapped it to the nearest observed-free cell via
+   `nearest_free_cell` (recomputed each replan, then cached-by-cell-change
+   to reduce churn). **This was wrong and actively harmful**: the snap
+   target depends on the *evolving occupancy map*, which keeps growing as
+   the agent turns to look around — so even "cached by agent cell" still
+   let the fed goal silently drift mid-chase, violating PointNav's core
+   fixed-target-per-episode assumption. Confirmed by reproduction: caused a
+   NaN-gradient feature-field regression in Corozal and reintroduced a
+   permanent turn-lock in Collierville that hadn't been there before.
+   **Current state: DD-PPO is fed the raw, fixed `goal_world` directly, same
+   as the arrival check uses** — an obstacle-embedded goal is not actually a
+   problem for a depth-based policy; it just approaches until physically
+   blocked, same as a real PointGoal behind furniture.
+5. **`sensor_height` — reverted to 1.0, then restored to 1.25 per explicit
+   user direction** (Habitat's PointNav default camera POSITION is
+   `[0, 1.25, 0]`, matching DD-PPO's training height; ours was 1.0). An
+   earlier attempt at 1.25 combined with the (buggy) goal-snapping above
+   produced the NaN-gradient regression; with the goal-snap removed, 1.25
+   has not reproduced that regression in subsequent testing (still
+   confirming — see Current Status).
+6. **Depth resize: bilinear → nearest-exact.** Our sim renders at
+   512x512 (for MaskCLIP/detector needs) but DD-PPO trained on native
+   256x256 — this resize step has no upstream equivalent at all. Bilinear
+   blends near/far depth across real object edges (doorframes, furniture
+   silhouettes) into fabricated intermediate depths, which looks like a
+   phantom slanted obstacle to a depth-only collision-avoidance policy.
+   Switched `F.interpolate(..., mode="nearest-exact")` in
+   `DDPPONavigator.act`.
+7. **Depth-sensor-miss normalization — the likely primary root cause of the
+   persistent turn-only stalls.** Added debug instrumentation (pointgoal
+   rho/phi logging + depth dump on a 15-replan same-position stall — see
+   `ddppo_debug_last_pos`/`ddppo_debug_stall_count` in `main.py`, currently
+   left in as active debug scaffolding, **remove once this is confirmed
+   fixed**) and found every observed stall showed a solid contiguous block
+   of *exactly* `0.0` depth pixels (hundreds to thousands of pixels,
+   centered in frame) — a sensor miss (no ray intersection), almost
+   certainly a hole in the scanned Gibson mesh (matches this session's
+   earlier, separate observation that "the Gibson dataset has lots of holes
+   in it"). Our normalization treated `0.0` as "closest possible obstacle"
+   (correct reading would be "unknown/no return", i.e. far/clear) — exactly
+   backwards, and exactly the kind of input that would make a depth-trained
+   policy perceive a solid wall filling a third of the frame where there's
+   actually nothing, and never resolve a confident forward path. Fixed in
+   `ddppo_policy.py`: depth `<= min_depth_m` (i.e. `0.0`) is remapped to
+   `max_depth_m` (far/clear) before normalizing, matching how the rest of
+   the codebase already excludes `depth <= min_sensor_dist` as invalid
+   rather than "near".
+
+## Current status (as of this handoff)
+
+Re-testing the single previously-broken episode
+(`toilet__Collierville__ep0`, the exact episode + position where the
+stall/depth-hole was diagnosed) with fix #7 applied, `--video` on so the
+stall can be visually cross-checked against `nav_history.mp4`, and
+`--agent_config config/agent_configs/detector_pairwise_field_maxj.yaml` —
+**use this agent_config on every future DD-PPO run**: `config.yaml`'s base
+`detector_cascade: true` (a leftover from a different, unrelated detector
+sweep — see the CLIPSeg work further down this file) is NOT what this
+project's canonical detector setup is; the maxj pairwise-CLIPSeg-field arm
+is. Earlier DD-PPO debug runs in this session accidentally used the cascade
+detector by omission, which is both slower (~2x latency/replan) and not
+representative of how the full validation run should score.
+
+Not yet confirmed: whether fix #7 actually resolves the stalls end-to-end,
+or whether it's a partial fix. Once confirmed on this one episode:
+
+## Next steps (in order)
+
+1. Confirm fix #7 (and cumulatively #1–7) resolves `toilet__Collierville__ep0`
+   without a multi-hundred-replan turn lock; inspect `nav_history.mp4` if
+   still ambiguous from logs alone.
+2. **Remove the debug instrumentation** (`ddppo_debug_last_pos`,
+   `ddppo_debug_stall_count`, the `[ddppo-debug]` prints and depth-dump
+   block in `main.py`'s EXPLOIT branch) once confirmed — it's diagnostic
+   scaffolding, not intended to ship.
+3. Re-run the original 8-episode mini validation batch (`output/
+   exploit_validation_ddppo`, ids: `chair__Collierville__ep12`,
+   `chair__Collierville__ep3`, `chair__Corozal__ep15`,
+   `couch__Corozal__ep11`, `toilet__Collierville__ep0`,
+   `toilet__Corozal__ep3`, `tv__Collierville__ep11`,
+   `tv__Collierville__ep25`) with all fixes in place and the correct
+   `--agent_config`, `--rerun`. Compare SR/SPL against the pre-DD-PPO A*
+   baseline and the earlier (broken) 0.50 SR / 0.128 SPL DD-PPO attempt.
+4. If the 8-episode batch looks healthy: launch the full 250-episode Gibson
+   run per the original instruction ("if it is effective, launch a full 250
+   episode run").
+5. If stalls persist even after fix #7: the video + debug prints are now in
+   place to keep diagnosing — check whether the remaining stalls still
+   correlate with a depth-miss block (a different mesh hole, or a
+   genuinely-open area DD-PPO still refuses to enter), and whether it's
+   scene-specific (Corozal was already established as harder than
+   Collierville across every arm tested this session, independent of
+   DD-PPO).
+6. Decide whether DD-PPO nets out ahead of the A* controller it replaced —
+   this hasn't been re-validated end-to-end since the original A* work
+   (see the mermaid-flowchart artifact from earlier this session:
+   https://claude.ai/code/artifact/f0e2409d-1821-4825-8323-1c8d66183d4c,
+   predates the DD-PPO pivot).
+
+## Repo reorg (separate, smaller item, same session)
+
+Moved all Gibson + HM3D-OVON asset directories under `benchmarks/` for
+cleanliness: `gibson_scenes/` → `benchmarks/gibson_scenes/` (git-tracked,
+done via `git mv`, history preserved), `episodes/` →
+`benchmarks/episodes/`, `scene_datasets/` → `benchmarks/scene_datasets/`
+(both gitignored, plain `mv`). All references updated
+(`config/evaluation_configs/benchmarks.yaml`, `scenarios_Goffs.yaml`,
+`tools/exploration_env.py`, `eval_scene.py`/`eval_core.py`/`evaluate.py`
+defaults, `CLAUDE.md`). Verified: `.gitignore`'s unanchored patterns already
+cover the new paths (no edit needed); dataset loads + scene resolution
+confirmed end-to-end post-move. This is done, not part of the DD-PPO
+open items above.
+
+---
+
 # Handoff: CLIPSeg feature field + field-verified detection
 
 Three stacked, **uncommitted** work packages (working tree dirty — `git status` from
@@ -222,7 +404,7 @@ calibration is the cheapest win; the FP gate addresses the largest bucket;
 recall needs a different lever.
 
 All eval runs use: `python benchmarks/eval_scene.py run --dataset
-episodes/gibson/v1.1_sub10/val --scenes-root gibson_scenes --gpu 3
+benchmarks/episodes/gibson/v1.1_sub10/val --scenes-root benchmarks/gibson_scenes --gpu 3
 --agent-config config/evaluation_configs/detector_fieldverify_<point>.yaml
 [--max-per-combo 2] --out output/<name>` — continuous actions (no `--discrete`),
 matching the jul3/jul4 baselines. Success = self-stop ≤ 1.0 m geodesic
@@ -284,3 +466,4 @@ spatial structure in `bev_similarity_*.npy`, cold regions uniformly low.
 - `output/scratch_fieldverify/` holds this campaign's scratch scripts/logs
   (gitignored via `output/`); clean up when the campaign concludes. Don't
   `git add -A` blindly — this repo has been bitten by scratch files before.
+

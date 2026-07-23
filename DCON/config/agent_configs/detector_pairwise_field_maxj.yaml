@@ -1,13 +1,23 @@
-# Pairwise-logit field arm — max-Youden-J operating point (τ_margin = 0.0).
+# Pairwise-logit CLIPSeg field — THE canonical verification arm (τ_margin = 0.0).
 #
-# Same detector arm as the contrastive winner (τ0.47 sink-gated LLMDet) but the
-# CLIPSeg field regresses one sigmoid channel per term ([query] + filtered
-# distractors) and field-verify accepts a box only when the worst-case MARGIN
-# (query presence - hardest distractor presence, pooled over the top-frac
-# in-box cells) clears 0.0 — the tuning-free anchor: on the 50-episode calib
-# set this is the max-Youden-J point (TP-ret 40.9% / FP-rej 92.9%), and unlike
-# the contrastive scalar-margin (FP mean +0.085) the pairwise FP mean is
-# negative (-0.119) so 0.0 needs no per-scene calibration.
+# This is the chosen CLIPSeg verification method. A τ0.47 sink-gated LLMDet box
+# is accepted only when the pairwise field's worst-case MARGIN
+#     margin = presence(query) - max_i presence(distractor_i)
+# pooled over the top-frac in-box cells and read on the multi-view-converged
+# channels clears 0.0. This is the standard CLIP relevancy score: the query
+# similarity contrasted against a bank of competing classes (see
+# src/perception/distractor_gen.py), which assembles
+#   - a generic BACKGROUND bank (cfg.background_terms: a wall, the floor, ...),
+#     the negative prompts that turn "target-like?" into a relevancy score and
+#     absorb the structurally-high background level, and
+#   - structurally-similar OBJECT confusers (cfg.distractor_objects here; the
+#     detector_pairwise_field_llm arm swaps in a per-target LLM set) — the
+#     look-alikes that drive the dominant FP mode.
+#
+# τ = 0.0 is the tuning-free anchor (max-Youden-J on the calib set, and the
+# pairwise FP-margin mean is negative so 0.0 needs no per-scene calibration).
+# It is calibrated against THIS distractor bank — a materially different bank
+# (or turning on llm_distractors) warrants re-sweeping the margin threshold.
 detection:
   llmdet_threshold: 0.47
   detector_cascade: false

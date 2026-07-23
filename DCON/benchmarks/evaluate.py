@@ -14,7 +14,7 @@ Episodes file format (see config/evaluation_configs/episodes.yaml):
 
     success_radius_m: 1.0          # optional; default 1.0
     episodes:
-      - scene: gibson_scenes/Denmark.glb   # abs or repo-relative
+      - scene: benchmarks/gibson_scenes/Denmark.glb   # abs or repo-relative
         query: "a pillow"
         start: [0.0, -3.0, 2.5]            # spawn xyz (snapped to navmesh)
         goals: [[3.2, -3.0, -1.1]]         # >=1 real target instance xyz

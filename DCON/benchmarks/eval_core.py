@@ -152,7 +152,7 @@ def _dataset_files(path):
 def _scene_glb_index(scenes_root):
     """Map .glb basename -> absolute path for every scene under `scenes_root`
     (recursive walk, built once per dataset load). Handles both the flat
-    Gibson layout (gibson_scenes/Collierville.glb) and HM3D's nested one
+    Gibson layout (benchmarks/gibson_scenes/Collierville.glb) and HM3D's nested one
     (hm3d/val/00800-TEEsavR23oF/TEEsavR23oF.basis.glb — the layout the
     HM3D-OVON episodes reference). Duplicate basenames keep the first hit in
     walk order (deterministic: os.walk with sorted children)."""
@@ -236,7 +236,7 @@ def _semexp_goal_lookup(split_dir):
     return lookup
 
 
-def load_objectnav_dataset(path, scenes_root="gibson_scenes",
+def load_objectnav_dataset(path, scenes_root="benchmarks/gibson_scenes",
                            categories=None, scenes=None, max_per_combo=None,
                            success_radius_m=1.0, query_template="a {category}",
                            use_viewpoints=False):

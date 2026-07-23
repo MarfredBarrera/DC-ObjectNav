@@ -15,8 +15,8 @@
 gibson:
   # Gibson-val (SemExp v1.1_sub10, 250 eps over 5 scenes). Success = self-stop
   # <= 1.0 m geodesic of the SemExp rect goals (the VLFM/SemExp convention).
-  dataset: episodes/gibson/v1.1_sub10/val
-  scenes_root: gibson_scenes
+  dataset: benchmarks/episodes/gibson/v1.1_sub10/val
+  scenes_root: benchmarks/gibson_scenes
 
 ovon:
   # HM3D-OVON val_seen (open-vocabulary). Protocol specifies the Stretch
@@ -24,18 +24,18 @@ ovon:
   # non-viewpoints reading (object positions, radius 1.0 m); set
   # `viewpoints: true` in an experiment for the official stricter cross-check.
   # ~3k episodes — cap with max_per_combo in the experiment.
-  dataset: episodes/hm3d_ovon/hm3d/val_seen
-  scenes_root: scene_datasets/hm3d
+  dataset: benchmarks/episodes/hm3d_ovon/hm3d/val_seen
+  scenes_root: benchmarks/scene_datasets/hm3d
   agent_config: agent_ovon_stretch
 
 ovon_unseen:
-  dataset: episodes/hm3d_ovon/hm3d/val_unseen
-  scenes_root: scene_datasets/hm3d
+  dataset: benchmarks/episodes/hm3d_ovon/hm3d/val_unseen
+  scenes_root: benchmarks/scene_datasets/hm3d
   agent_config: agent_ovon_stretch
 
 ovon_synonyms:
-  dataset: episodes/hm3d_ovon/hm3d/val_seen_synonyms
-  scenes_root: scene_datasets/hm3d
+  dataset: benchmarks/episodes/hm3d_ovon/hm3d/val_seen_synonyms
+  scenes_root: benchmarks/scene_datasets/hm3d
   agent_config: agent_ovon_stretch
 
 goffs:

@@ -218,7 +218,7 @@ def resolve_settings(args):
 
     args.scenarios = pick("scenarios")
     args.dataset = pick("dataset")
-    args.scenes_root = pick("scenes_root", "gibson_scenes")
+    args.scenes_root = pick("scenes_root", "benchmarks/gibson_scenes")
     args.categories = pick("categories")
     args.scenes = pick("scenes")
     args.max_per_combo = pick("max_per_combo")

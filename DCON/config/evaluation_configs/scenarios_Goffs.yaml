@@ -13,7 +13,7 @@
 # positions measured in the scene (read agent/object xyz from a manual run or
 # the habitat viewer).
 
-scene: gibson_scenes/Goffs.glb
+scene: benchmarks/gibson_scenes/Goffs.glb
 success_radius_m: 1.0
 
 # Number of (stochastic) runs per (target, start) combo. >1 gives a variance

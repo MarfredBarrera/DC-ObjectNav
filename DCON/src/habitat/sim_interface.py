@@ -79,20 +79,34 @@ class SimInterface:
         agent_state.rotation = utils.quat_from_magnum(new_rot)
         self.agent.set_state(agent_state)
 
-    def step_discrete(self, action: str) -> None:
+    def step_discrete(self, action: str, native: bool = False) -> None:
         """Execute one Habitat ObjectNav discrete primitive kinematically.
 
         action ∈ {"move_forward", "turn_left", "turn_right"}. Magnitudes come
-        from cfg.discrete_forward_m / cfg.discrete_turn_deg. Turn names are in
-        the MPPI grid-heading convention — "turn_left" increases grid θ — and
-        are mapped onto Habitat's yaw via cfg.mppi_w_sign (the same sign the
-        continuous `step` applies to ω), so a turn rotates the agent the same
-        physical way the planner intended. Forward translation reuses the
-        NavMesh `try_step` so collisions slide exactly as in continuous mode.
+        from cfg.discrete_forward_m / cfg.discrete_turn_deg. Forward translation
+        reuses the NavMesh `try_step` so collisions slide exactly as in
+        continuous mode.
+
+        Two callers, two turn-sign conventions:
+          - `native=False` (default, the MPPI tracking controller
+            `discrete_action_from_plan`): turn names are in the MPPI grid-
+            heading convention — "turn_left" increases grid θ — and are mapped
+            onto Habitat's yaw via cfg.mppi_w_sign (the same sign the
+            continuous `step` applies to ω), so a turn rotates the agent the
+            same physical way the planner intended.
+          - `native=True` (DD-PPO's EXPLOIT actions): DD-PPO's action strings
+            are Habitat's own native action space already — not routed through
+            any grid-θ abstraction — so mppi_w_sign must NOT be applied; that
+            config knob only exists to correct the grid<->habitat handedness
+            mismatch for the MPPI path. Applying it here inverted DD-PPO's
+            turns: confirmed empirically — after commanding "turn_left" with
+            w_sign applied, the bit-exact-verified bearing-to-goal (phi) grew
+            by +discrete_turn_deg every step instead of shrinking, i.e. the
+            agent turned away from the goal and could only ever spin in place.
         """
         forward_m = float(self.cfg.discrete_forward_m)
         turn_rad = math.radians(float(self.cfg.discrete_turn_deg))
-        w_sign = float(self.cfg.mppi_w_sign)
+        sign = 1.0 if native else float(self.cfg.mppi_w_sign)
 
         agent_state = self.agent.get_state()
         pos = mn.Vector3(agent_state.position)
@@ -103,8 +117,7 @@ class SimInterface:
             new_pos = self.sim.pathfinder.try_step(pos, pos + forward_world * forward_m)
             agent_state.position = np.array(new_pos)
         elif action in ("turn_left", "turn_right"):
-            # grid θ increases for "turn_left"; w_sign maps that onto Habitat yaw.
-            yaw = w_sign * (turn_rad if action == "turn_left" else -turn_rad)
+            yaw = sign * (turn_rad if action == "turn_left" else -turn_rad)
             dq = mn.Quaternion.rotation(mn.Rad(yaw), mn.Vector3(0.0, 1.0, 0.0))
             agent_state.rotation = utils.quat_from_magnum(rot * dq)
         else:

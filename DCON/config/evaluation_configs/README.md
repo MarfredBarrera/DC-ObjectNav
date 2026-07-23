@@ -44,5 +44,5 @@ run instead).
 - **`episodes.yaml`** — hand-annotated flat episode list for the older
   `benchmarks/evaluate.py`.
 
-Benchmark episode datasets themselves live under `episodes/` (and HM3D scenes
-under `scene_datasets/`), referenced by `benchmarks.yaml`.
+Benchmark episode datasets themselves live under `benchmarks/episodes/` (and
+HM3D scenes under `benchmarks/scene_datasets/`), referenced by `benchmarks.yaml`.

@@ -102,7 +102,7 @@ class SimilarityGrid(VoxelGrid):
         self.feature_field = feature_field
         self.voxels = None # 3D Similarity Map (Y, Z, X)
 
-    def compute_similarity_map(self, batch_size=100000, occupancy_grid=None):
+    def compute_similarity_map(self, batch_size=100000):
         if not self.initialized: return None
 
         # Full grid points

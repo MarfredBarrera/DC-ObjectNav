@@ -1,8 +1,111 @@
+import heapq
 import torch
 import numpy as np
 from scipy import ndimage
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
+
+_SQRT2 = float(np.sqrt(2.0))
+
+
+def nearest_free_cell(occ_map, goal_zx, seed_zx):
+    """Nearest observed-FREE cell (occ==1) to `goal_zx` reachable from `seed_zx`.
+
+    Used by EXPLOIT-mode A* to snap the detector-projected goal — which usually
+    lands on the target object's surface (an occupied cell) and may sit beyond
+    the observed-free frontier — onto the closest cell the agent can actually
+    stand on and reach *through observed-free space*. The candidate set is the
+    8-connected FREE component containing `seed_zx` (the agent), so the returned
+    cell is guaranteed connected to the agent by a free-cell path; as the agent
+    advances and observes more floor, this creeps toward the object each replan.
+
+    The seed itself may be occupied/unseen (agent dilated into a wall, or on an
+    unmapped sliver) — then it attaches to the free component of the nearest
+    free cell. Returns (z, x), or None if no free cell is reachable at all.
+    """
+    occ = np.asarray(occ_map)
+    H, W = occ.shape
+    free = occ == 1
+    labels, _ = ndimage.label(free, structure=np.ones((3, 3), dtype=bool))
+    sz = min(max(int(round(float(seed_zx[0]))), 0), H - 1)
+    sx = min(max(int(round(float(seed_zx[1]))), 0), W - 1)
+    seed_label = labels[sz, sx]
+    if seed_label == 0:
+        fz, fx = np.where(free)
+        if fz.size == 0:
+            return None
+        j = int(np.argmin((fz - sz) ** 2 + (fx - sx) ** 2))
+        seed_label = labels[fz[j], fx[j]]
+    cz, cx = np.where(labels == seed_label)
+    gz = min(max(int(round(float(goal_zx[0]))), 0), H - 1)
+    gx = min(max(int(round(float(goal_zx[1]))), 0), W - 1)
+    j = int(np.argmin((cz - gz) ** 2 + (cx - gx) ** 2))
+    return (int(cz[j]), int(cx[j]))
+
+
+def astar_free(occ_map, start_zx, goal_zx):
+    """8-connected A* from `start_zx` to `goal_zx` through observed-FREE cells.
+
+    Only cells with occ==1 are traversable — occupied (>=2) AND unseen (0) cells
+    are impassable, so the path never routes through unexplored space. Diagonal
+    steps cost √2. No anti-corner-cut restriction: `reachable_min`'s connectivity
+    (used by the MPPI goal-distance field) already treats the grid as plain
+    8-connected with no corner rule, and adding one here caused a confirmed
+    real failure — a diagonal-adjacent single occupied cell disconnected a
+    region `reachable_min`/plain 8-connectivity considered fine, permanently
+    sealing an otherwise-open approach and wedging the agent. At this grid's
+    resolution (~0.05-0.10m) a cell reading "occupied" is a coarse
+    approximation of the true continuous geometry, not a guarantee of zero
+    clearance at its corner, so disallowing the cut bought unrealistic caution
+    at the cost of real deadlocks. The start cell is always allowed to be
+    stepped out of (the agent may be standing on an occupied/unmapped cell).
+    Returns the path as a list of (z, x) cells start→goal inclusive, or None if
+    the goal is not reachable through free space.
+    """
+    occ = np.asarray(occ_map)
+    H, W = occ.shape
+    sz = min(max(int(round(float(start_zx[0]))), 0), H - 1)
+    sx = min(max(int(round(float(start_zx[1]))), 0), W - 1)
+    gz = min(max(int(round(float(goal_zx[0]))), 0), H - 1)
+    gx = min(max(int(round(float(goal_zx[1]))), 0), W - 1)
+    if (sz, sx) == (gz, gx):
+        return [(sz, sx)]
+    free = occ == 1
+    if not free[gz, gx]:
+        return None
+
+    def heur(z, x):
+        dz, dx = abs(z - gz), abs(x - gx)
+        return (_SQRT2 - 1.0) * min(dz, dx) + max(dz, dx)  # octile
+
+    neighbors = ((-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+                 (-1, -1, _SQRT2), (-1, 1, _SQRT2), (1, -1, _SQRT2), (1, 1, _SQRT2))
+    open_heap = [(heur(sz, sx), 0.0, sz, sx)]
+    g_cost = {(sz, sx): 0.0}
+    came = {}
+    while open_heap:
+        _, gc, z, x = heapq.heappop(open_heap)
+        if (z, x) == (gz, gx):
+            path = [(z, x)]
+            while (z, x) in came:
+                z, x = came[(z, x)]
+                path.append((z, x))
+            path.reverse()
+            return path
+        if gc > g_cost.get((z, x), float('inf')):
+            continue
+        for dz, dx, step in neighbors:
+            nz, nx = z + dz, x + dx
+            if not (0 <= nz < H and 0 <= nx < W):
+                continue
+            if not free[nz, nx]:
+                continue
+            ng = gc + step
+            if ng < g_cost.get((nz, nx), float('inf')):
+                g_cost[(nz, nx)] = ng
+                came[(nz, nx)] = (z, x)
+                heapq.heappush(open_heap, (ng + heur(nz, nx), ng, nz, nx))
+    return None
 
 
 def reachable_min(field, occ_map, seed_zx):
