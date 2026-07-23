@@ -47,7 +47,7 @@ class Config:
                      'mppi_occupied_cell_cost', 'mppi_unseen_cell_cost',
                      'discrete_actions', 'discrete_forward_m',
                      'discrete_turn_deg', 'discrete_lookahead_m',
-                     'max_agent_steps'],
+                     'max_agent_steps', 'ddppo_checkpoint_path'],
         'detection': ['detected_persistence',
                       'stop_distance_m', 'exploit_redetect_interval',
                       'detected_min_box_frac', 'detected_max_box_frac',
@@ -58,7 +58,10 @@ class Config:
                       'detector_cascade', 'locate_anything_model_name',
                       'locate_anything_max_new_tokens', 'cascade_min_iou',
                       'clipseg_model_name', 'clipseg_threshold',
-                      'distractor_objects', 'clipseg_contrastive',
+                      'background_terms', 'distractor_objects',
+                      'llm_distractors', 'llm_distractor_model',
+                      'llm_distractor_count',
+                      'clipseg_contrastive',
                       'clipseg_softmax_temp', 'clipseg_pairwise',
                       'field_verify', 'field_verify_threshold',
                       'field_verify_presence_floor',
@@ -78,11 +81,11 @@ class Config:
         self.output_dir = "/workspace/DCON/output/current_scene"
 
         # Habitat Settings
-        self.scene_path = "/workspace/DCON/gibson_scenes/Anaheim.glb"
+        self.scene_path = "/workspace/DCON/benchmarks/gibson_scenes/Anaheim.glb"
         self.img_width = 720
         self.img_height = 720
         self.fov = 90
-        self.sensor_height = 1.0
+        self.sensor_height = 1.25
         self.min_sensor_dist = 0.00
         self.max_sensor_dist = 10.0
         # Navmesh agent radius (m). Habitat's `pathfinder.try_step` (used to
@@ -237,9 +240,15 @@ class Config:
         # forwards both count, matching the Habitat ObjectNav challenge.
         self.discrete_actions = False
         self.discrete_forward_m = 0.25
-        self.discrete_turn_deg = 30.0
+        self.discrete_turn_deg = 10.0
         self.discrete_lookahead_m = 0.5
         self.max_agent_steps = 500
+
+        # EXPLOIT control: pretrained DD-PPO PointNav policy (depth-only,
+        # SE-ResNeXt101 + 2-layer LSTM1024), replacing the A* + waypoint
+        # controller — see src/planning/ddppo_policy.py and its use in
+        # main.py's EXPLOIT branch.
+        self.ddppo_checkpoint_path = "ddppo_weights/gibson-2plus-se-resneXt101-lstm1024.pth"
 
         # Visualization
         self.viz_interval = 500
@@ -313,33 +322,64 @@ class Config:
         self.llmdet_num_sinks = 48
         self.llmdet_sink_init = "special"
 
-        # Contrastive CLIPSeg field target (`clipseg_contrastive`), for
-        # look-alike FP suppression (bench vs chair, bed vs couch — the FP
-        # class the sinks and the field gate are both structurally blind to,
-        # because the look-alike scores genuinely high for the query with no
-        # competing hypothesis). When on, the per-pixel field training target
-        # becomes sigmoid(target logit) x softmax over [target] +
-        # `distractor_objects` at temperature `clipseg_softmax_temp` (see
-        # CLIPSegSemantics), so the map answers "more couch than bed?"
-        # instead of "couch-like?" and kills the look-alike that survives
-        # single frames but not competing hypotheses. Wall/floor phrases act
-        # as background classes in the softmax. NOTE: contrastive scores run
-        # lower on ambiguous objects, so `field_verify_threshold` needs
-        # re-calibration when this is on.
+        # The distractor vocabulary is the bank of COMPETING relevancy classes
+        # for the pairwise CLIPSeg field (`clipseg_pairwise`, the chosen
+        # verification method) and the older contrastive target
+        # (`clipseg_contrastive`). It has two parts, assembled by
+        # src.perception.distractor_gen.build_distractor_vocabulary:
+        #
+        #   1. `background_terms` — generic scene-background phrases (wall,
+        #      floor, ceiling, window, ...). These are the negative/background
+        #      prompts of the standard CLIP relevancy formulation: contrasting
+        #      the query against a background bank is what turns a raw
+        #      "target-like?" similarity into a relevancy score, and it absorbs
+        #      the structurally-high background level that would otherwise tax
+        #      every box's margin. Query-independent, always included.
+        #   2. object confusers — objects a detector visually MISTAKES for the
+        #      target that are structurally similar but DISTINCT-MATERIAL (an
+        #      armchair/bench vs a chair, a trash can vs a potted plant, a
+        #      framed picture vs a tv). These are the dominant FP mode and the
+        #      whole point of a competing-class gate: a single-frame look-alike
+        #      box fails the margin because the confuser channel out-scores the
+        #      query. Same-material siblings (a bathtub/sink for a toilet) are
+        #      deliberately EXCLUDED — a real target scores high on them too, so
+        #      they collapse the margin and kill recall (empirically toilet SR
+        #      82%->64%). Either the static `distractor_objects` list below (one
+        #      list for every query) or, when `llm_distractors` is on, a
+        #      per-target LLM-generated set that applies the same exclusion.
+        #
+        # Adding competitors lowers true-target margins, so
+        # `field_verify_threshold` is calibrated against this vocabulary (see
+        # detector_pairwise_field_maxj.yaml); a materially different bank
+        # warrants a re-sweep.
+        #
         # Phrases sharing a content word with the query are dropped per query
         # (semantics.filter_distractors) so the target never competes with
         # itself; synonyms are NOT caught (query "a sofa" keeps "a couch").
-        # Keep the list moderate — every phrase costs one CLIPSeg decoder
-        # pass per frame. (A sibling LLMDet distractor-phrase gate was
-        # implemented and removed 2026-07-12 — the sink suffix crushes
-        # inter-phrase competition, so it can't coexist with the sinks; see
-        # the note in LLMDetDetector's docstring before resurrecting it.)
+        # Keep the combined bank moderate — every phrase costs one CLIPSeg
+        # decoder pass per frame (one extra channel in the batched forward).
+        self.background_terms = [
+            "a wall", "the floor", "the ceiling", "a window",
+            "a door", "a picture",
+        ]
         self.distractor_objects = [
             "a chair", "a couch", "a bed", "a potted plant", "a toilet",
-            "a tv", "a table", "a cabinet", "a bench", "a sink",
-            "a bathtub", "a window", "a door", "a picture", "a pillow",
-            "a rug", "a wall", "the floor",
+            "a tv", "a table", "a cabinet", "a bench", "a trash can",
         ]
+        # Per-target LLM distractor vocabulary (src/perception/distractor_gen.py).
+        # The static `distractor_objects` above is one list for every query; a
+        # per-target set is sharper (the distinct-material confusers for a
+        # toilet — an armchair, a trash can, a cabinet — differ from those for a
+        # tv, and it drops the porcelain siblings). When `llm_distractors` is
+        # on, a local Qwen instruct model generates the object-confuser set once
+        # at run start (visually-similar, distinct-material look-alikes across
+        # categories), the `background_terms` bank is prepended,
+        # and the LLM is freed before the feature field trains. Off => use the
+        # static list. `distractor_objects` stays the always-available fallback
+        # (LLM load/parse failure) — do not delete it.
+        self.llm_distractors = False
+        self.llm_distractor_model = "Qwen/Qwen2.5-7B-Instruct"
+        self.llm_distractor_count = 10
         self.clipseg_contrastive = False
         self.clipseg_softmax_temp = 1.0
 

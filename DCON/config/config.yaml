@@ -5,14 +5,23 @@ paths:
   output_dir: "/workspace/DCON/output/current_scene"
 
 habitat:
-  scene_path: "/workspace/DCON/gibson_scenes/Goffs.glb"
+  scene_path: "/workspace/DCON/benchmarks/gibson_scenes/Goffs.glb"
   img_width: 512
   img_height: 512
   fov: 90
-  sensor_height: 1.0
+  # Habitat's PointNav default camera POSITION is [0, 1.25, 0] (DD-PPO's
+  # training height); matched since EXPLOIT's DD-PPO policy consumes this
+  # depth sensor directly.
+  sensor_height: 1.25
   # Navmesh agent radius (m): walls are inset by this much, so smaller =
   # agent squeezes through narrower gaps. Recomputed on load (the prebaked
   # Gibson navmesh is baked at 0.1). <=0 keeps the prebaked navmesh.
+  # 0.02 (not DD-PPO's training-time 0.1) to route around Gibson-specific
+  # navmesh/mesh-hole narrow-gap issues — the DD-PPO turn-only stall this
+  # was widened to test for turned out to be the turn-sign bug in
+  # SimInterface.step_discrete, not a collision-radius mismatch; 0.1 was
+  # left in afterward and is suspected of sealing a doorway needed to
+  # reach the goal in tv__Collierville__ep25.
   agent_radius: 0.02
   agent_height: 1.5
 
@@ -82,9 +91,17 @@ planning:
   # SR/SPL comparison with VLFM and Goal-Oriented Semantic Exploration.
   discrete_actions: false
   discrete_forward_m: 0.25       # MOVE_FORWARD displacement (challenge default)
-  discrete_turn_deg: 30.0        # TURN_LEFT/RIGHT magnitude (challenge default)
+  # TURN_LEFT/RIGHT magnitude. EXPLOIT's DD-PPO policy is exclusively
+  # discrete-stepped (see main.py) and was trained with Habitat's PointNav
+  # TURN_ANGLE=10 deg (not the 30 deg ObjectNav-challenge convention) — the
+  # LSTM's implicit alignment behavior assumes 10 deg/action, so a 30 deg
+  # value here causes ~3x turn overshoot every action. Kept at 10 while
+  # EXPLOIT is DD-PPO-driven; only revisit toward 30 if `discrete_actions`
+  # is ever turned on for SEARCH too (they currently share this one field).
+  discrete_turn_deg: 10.0
+
   discrete_lookahead_m: 0.5      # pure-pursuit lookahead along the MPPI path
-  max_agent_steps: 500           # per-episode primitive budget (timeout = failure)
+  max_agent_steps: 500           # unused: no per-episode primitive timeout is enforced
 
 detection:
   detected_persistence: 1       # consecutive usable-band detections to latch

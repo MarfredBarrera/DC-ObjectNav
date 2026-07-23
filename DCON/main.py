@@ -43,7 +43,17 @@ from src.perception.obj_detection import make_detector
 from src.perception.perception_stack import PerceptionStack
 from src.perception.utils import unprojection
 from src.planning.mppi import MPPIPlanner
+from src.planning.utils import nearest_free_cell, astar_free
+from src.planning.ddppo_policy import load_ddppo_policy, DDPPONavigator
 from tools.visualize import render_navigation
+
+# Habitat's fixed DD-PPO training convention (habitat/config/default.py):
+# SIMULATOR.DEPTH_SENSOR.{MIN_DEPTH,MAX_DEPTH} = 0.0, 10.0. Independent of our
+# own cfg.min_sensor_dist/max_sensor_dist (which happen to match, but
+# shouldn't be relied on to stay in sync with a pretrained checkpoint's
+# training-time normalization).
+DDPPO_MIN_DEPTH_M = 0.0
+DDPPO_MAX_DEPTH_M = 10.0
 
 
 REPLAN_INTERVAL = 100
@@ -90,6 +100,49 @@ def discrete_action_from_plan(opt_path, heading, cfg):
         # grid θ increases for "turn_left" (matches SimInterface.step_discrete).
         return "turn_left" if dtheta > 0 else "turn_right"
     return "move_forward"
+
+
+def continuous_action_from_plan(opt_path, heading, cfg):
+    """Convert a grid path into one continuous [v_mps, w_rps] command via
+    simple waypoint navigation: turn to face the next waypoint, then drive
+    STRAIGHT AT FULL SPEED — no proportional braking curve.
+
+    Point-to-point navigation to a single waypoint is a solved problem; a
+    braking law that decelerates smoothly on approach only buys an asymptotic
+    convergence tail (speed shrinks with remaining distance, so the last few
+    centimeters can take arbitrarily many replans to close) for no benefit,
+    once arrival is judged by a fixed real-world radius around the goal cell
+    (see `exploit_astar_action`) rather than exact grid-cell equality. Bang-bang
+    on the speed axis — full speed once aligned, zero while turning — reaches
+    that fixed radius in a bounded number of replans instead.
+
+    Same pure-pursuit lookahead as `discrete_action_from_plan`: walk along the
+    path to the first waypoint >= `cfg.discrete_lookahead_m` ahead (or the
+    final waypoint if the path is shorter), take the bearing to it in the grid
+    frame (atan2(Δz, Δx)), and turn toward it (grid θ mapped onto Habitat yaw
+    via `cfg.mppi_w_sign`, matching MPPI's convention). Returns [v_mps, w_rps],
+    or None for a degenerate path.
+    """
+    if not opt_path or len(opt_path) < 2:
+        return None
+    sz, sx = float(opt_path[0][0]), float(opt_path[0][1])
+    lookahead_cells = max(1.0, cfg.discrete_lookahead_m / cfg.voxel_resolution)
+    target = None
+    for cz, cx in opt_path[1:]:
+        if np.hypot(cz - sz, cx - sx) >= lookahead_cells:
+            target = (float(cz), float(cx))
+            break
+    if target is None:
+        target = (float(opt_path[-1][0]), float(opt_path[-1][1]))
+    tz, tx = target
+    if tz == sz and tx == sx:
+        return None
+    desired = float(np.arctan2(tz - sz, tx - sx))
+    dtheta = (desired - heading + np.pi) % (2 * np.pi) - np.pi
+    w_grid = float(np.clip(dtheta / cfg.mppi_dt, -cfg.mppi_max_w_rps, cfg.mppi_max_w_rps))
+    turn_thresh = np.radians(cfg.discrete_turn_deg / 2.0)
+    v = 0.0 if abs(dtheta) > turn_thresh else cfg.mppi_max_v_mps
+    return [v, cfg.mppi_w_sign * w_grid]
 
 
 def world_to_grid(x_world: float, z_world: float, ref_grid, res: float):
@@ -416,6 +469,75 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     return action_queue.popleft(), opt_path, goal, box_goal
 
 
+def exploit_astar_action(perception, sim_iface, cfg, goal_projected, dilate_radius):
+    """A* navigation to the latched goal during EXPLOIT (MPPI is bypassed).
+
+    Simplification of the EXPLOIT control: once the detection has latched, drop
+    the stochastic MPPI optimizer entirely and drive a deterministic A* path to
+    the target. The detector-projected goal cell (`goal_projected`, cached from
+    the sighting that latched) is snapped to the nearest observed-FREE cell
+    reachable from the agent (`nearest_free_cell`), and A* plans a path through
+    observed-free cells only (`astar_free`) — never through unseen or occupied
+    space.
+
+    Agent-width clearance: `dilate_radius` (cells) grows every obstacle by the
+    agent's actual footprint before planning, so the path never threads a gap
+    narrower than the agent itself — see `exploit_dilate_radius` at the call
+    site (main loop) for how it's sized (no forced minimum; 0 cells for an
+    agent much smaller than one voxel). Planning runs on this single dilated
+    map only — no raw-occupancy fallback. If it yields no path, that's treated
+    as "no route yet" (spin to observe more floor) rather than silently
+    replanning with less clearance than the agent needs.
+
+    Returns (action, opt_path, goal_cell, reached):
+      action    : a continuous [v, w] / discrete primitive tracking the path,
+                  an in-place rotate when no free path exists yet (spin to
+                  observe more floor), or None once arrived (STOP).
+      opt_path  : the A* grid path (list of (z, x)) for logging, or None.
+      goal_cell : the snapped free goal cell, or None if none is reachable yet.
+      reached   : True only once the agent's own cell IS the free goal cell —
+                  the agent must stand in the nearest free cell to the target,
+                  no arrival tolerance. Grid-index equality was brittle when
+                  paired with the earlier braking controller (which only
+                  asymptotically closed the last few centimeters, so it could
+                  hover just outside the cell forever); it is not brittle here,
+                  because `continuous_action_from_plan` drives at constant full
+                  speed with no deceleration, so it enters the target cell
+                  within a bounded number of replans instead of approaching it
+                  asymptotically.
+    """
+    def _spin():
+        if cfg.discrete_actions:
+            return "turn_right"
+        return [0.0, -cfg.mppi_w_sign * cfg.mppi_max_w_rps]
+
+    sg = perception.similarity_grid
+    pos = sim_iface.agent_position
+    heading = get_agent_heading(sim_iface.agent)
+    start_cell = world_to_grid(pos[0], pos[2], sg, cfg.voxel_resolution)
+
+    bev_occ = _to_numpy(perception.occupancy_grid.get_2d_map_dilated(radius=dilate_radius))
+    goal_cell = nearest_free_cell(bev_occ, goal_projected, start_cell)
+    if goal_cell is None:
+        # No reachable observed-free cell yet — rotate in place to map floor.
+        return _spin(), None, None, False
+
+    if (int(start_cell[0]), int(start_cell[1])) == goal_cell:
+        return None, [goal_cell], goal_cell, True
+
+    path = astar_free(bev_occ, start_cell, goal_cell)
+    if not path:
+        return _spin(), None, goal_cell, False
+
+    if cfg.discrete_actions:
+        action = discrete_action_from_plan(path, heading, cfg)
+    else:
+        action = continuous_action_from_plan(path, heading, cfg)
+    if action is None:
+        return _spin(), path, goal_cell, False
+    return action, path, goal_cell, False
+
+
 def nearest_goal_point(goal, p):
     """World xyz of the point of `goal` closest (in the x-z plane) to point `p`.
 
@@ -508,6 +630,21 @@ def run(cfg: Config, save_enabled: bool = True,
     mppi = MPPIPlanner(cfg, device=cfg.device)
     detector = make_detector(cfg)
     action_queue: deque = deque()
+
+    # EXPLOIT control: the pretrained DD-PPO PointNav policy (Wijmans et al.,
+    # 2020) drives navigation to the latched goal instead of the deterministic
+    # A* + waypoint controller. Point-goal navigation is exactly the
+    # sub-problem this depth-only, recurrent (LSTM) policy was trained on ~2.5B
+    # frames to solve; it learns collision-avoidance implicitly from raw depth
+    # each step rather than from an explicit occupancy grid, sidestepping the
+    # whole class of BEV-vs-Habitat-collision mismatches the A* controller had
+    # to work around. `ddppo_nav` owns the policy's LSTM hidden state / prev-
+    # action / not-done mask across replans; `ddppo_active` tracks whether that
+    # state has been reset for the CURRENT latch (reset once, the moment
+    # `detected` first flips True — see the main loop).
+    ddppo_policy = load_ddppo_policy(cfg.ddppo_checkpoint_path, device=cfg.device)
+    ddppo_nav = DDPPONavigator(ddppo_policy, device=cfg.device)
+    ddppo_active = False
 
     # Planner state. `detected` latches True (and never releases) once
     # cfg.detected_persistence consecutive persistent detections accrue; while
@@ -605,9 +742,8 @@ def run(cfg: Config, save_enabled: bool = True,
     path_length = 0.0
     prev_pos = np.asarray(start_nav, dtype=np.float64).copy()
     agent_stopped = False
-    # Discrete-mode primitive budget: every MOVE_FORWARD / TURN counts as one
-    # ObjectNav step; exhausting `cfg.max_agent_steps` without self-stopping is a
-    # timeout (failure), matching VLFM / SemExp / the Habitat challenge.
+    # Discrete-primitive counter (MOVE_FORWARD/TURN), shown in the per-step log
+    # for telemetry only — no budget is enforced here.
     agent_steps = 0
 
     # Graceful early stop. Two ways to request it; both let the loop break at
@@ -702,25 +838,99 @@ def run(cfg: Config, save_enabled: bool = True,
             #               f"(reached, no detection) — clearing cache")
             #         last_box_goal = None
 
-            action, opt_traj, goal_cell, box_goal = plan_one_action(
-                perception, sim_iface, mppi, cfg, action_queue,
-                det_score=conf_score, detected=detected,
-                det_box=det_box, depth=depth_cur, c2w=c2w_cur,
-                last_box_goal=last_box_goal,
-                det_investigate=det_investigate,
-            )
-            # Cache the goal of the most recent investigated detection.
-            # `box_goal` is non-None only for an investigated box (Layer 1 gates
-            # on `det_investigate`), so this tracks the latest sighting worth
-            # steering toward — including too-far ones — in SEARCH mode; in
-            # EXPLOIT the detector is throttled off so box_goal stays None and
-            # the cache freezes on the latched object. Fallback paths (cached /
-            # global argmax) leave box_goal=None.
-            if box_goal is not None:
-                last_box_goal = box_goal
-                print(f"  cached new goal {box_goal} (det_score={det_score:.3f})")
-            mode = 'EXPLOIT' if detected else 'SEARCH'
-            w_conf = float(getattr(mppi, 'last_w_conf', 0.0))
+            # Control split by mode:
+            #   EXPLOIT (latched) → drop MPPI entirely and drive a deterministic
+            #     A* path to the target through observed-free cells only
+            #     (exploit_astar_action). The A* remaining-path length is the
+            #     sole stop signal — the agent ends only when it reaches the
+            #     free goal cell nearest the detector-projected target.
+            #   SEARCH → the MPPI planner, exactly as before.
+            stop_now = False
+            if detected:
+                # Refresh the cached goal from THIS frame's detection when the
+                # detector actually ran (the latching frame + any redetect
+                # tick); otherwise it stays frozen on the latched object.
+                if det_box is not None and det_investigate:
+                    cand = bev_cell_from_box_center(
+                        perception, cfg, sim_iface.intrinsics, det_box,
+                        depth_cur, c2w_cur)
+                    if cand is not None:
+                        last_box_goal = cand
+                # Keep occupancy fresh (observe() already ran this replan) —
+                # still consumed by SEARCH-mode IG/exploration even though
+                # EXPLOIT's own navigation (DD-PPO) no longer reads it.
+                perception.update_occupancy(depth_cur, c2w_cur, sim_iface.intrinsics)
+                goal_src = last_box_goal
+                if goal_src is None:
+                    # Degenerate (should not happen post-latch): fall back to the
+                    # global similarity argmax over observed cells.
+                    bev_sim = _to_numpy(perception.similarity_grid.get_2d_map())
+                    bev_occ = _to_numpy(perception.occupancy_grid.get_2d_map())
+                    if bev_sim is not None and bev_occ is not None:
+                        sim_obs = bev_sim.astype(np.float32).copy()
+                        sim_obs[bev_occ == 0] = -np.inf
+                        if np.any(np.isfinite(sim_obs)):
+                            fi = int(np.argmax(sim_obs))
+                            goal_src = (fi // sim_obs.shape[1], fi % sim_obs.shape[1])
+                if goal_src is None:
+                    action, opt_traj, goal_cell = None, None, None
+                else:
+                    goal_cell = (int(goal_src[0]), int(goal_src[1]))
+                    sg = perception.similarity_grid
+                    goal_world = [
+                        sg.min_x + (goal_cell[1] + 0.5) * cfg.voxel_resolution,
+                        pos[1],
+                        sg.min_z + (goal_cell[0] + 0.5) * cfg.voxel_resolution,
+                    ]
+                    if not ddppo_active:
+                        ddppo_nav.reset()
+                        ddppo_active = True
+                    opt_traj = None
+                    # `goal_world` is the raw box-center projection (see
+                    # bev_cell_from_box_center) — no free-space snapping, so
+                    # it's often on the object's own surface. DD-PPO's own
+                    # trained STOP (~0.2m threshold against an exact PointGoal)
+                    # is unreliable against that: two full-budget episodes
+                    # (chair__Collierville__ep3, tv__Collierville__ep11) never
+                    # fired it at all despite 50-60m of wandering. Our own
+                    # coarser `cfg.stop_distance_m` check is the actual
+                    # arrival signal; DD-PPO drives locomotion only.
+                    dist_to_goal_m = float(np.hypot(pos[0] - goal_world[0], pos[2] - goal_world[2]))
+                    if dist_to_goal_m <= cfg.stop_distance_m:
+                        action = None
+                        stop_now = True
+                        print(f"step {step}: TARGET REACHED "
+                              f"(within {cfg.stop_distance_m:.2f}m of goal, "
+                              f"dist={dist_to_goal_m:.2f}m)")
+                    else:
+                        ddppo_action = ddppo_nav.act(
+                            _to_numpy(depth_cur), DDPPO_MIN_DEPTH_M, DDPPO_MAX_DEPTH_M,
+                            pos, sim_iface.agent.get_state().rotation, goal_world)
+                        # DD-PPO's own "stop" is disregarded (see above) — if
+                        # it fires before our distance check does, just idle
+                        # this replan and let the next one re-check distance.
+                        action = None if ddppo_action == "stop" else ddppo_action
+                mode = 'EXPLOIT'
+                w_conf = 1.0
+                action_queue.clear()
+            else:
+                action, opt_traj, goal_cell, box_goal = plan_one_action(
+                    perception, sim_iface, mppi, cfg, action_queue,
+                    det_score=conf_score, detected=detected,
+                    det_box=det_box, depth=depth_cur, c2w=c2w_cur,
+                    last_box_goal=last_box_goal,
+                    det_investigate=det_investigate,
+                )
+                # Cache the goal of the most recent investigated detection.
+                # `box_goal` is non-None only for an investigated box (Layer 1
+                # gates on `det_investigate`), tracking the latest sighting worth
+                # steering toward — including too-far ones. Fallback paths
+                # (cached / global argmax) leave box_goal=None.
+                if box_goal is not None:
+                    last_box_goal = box_goal
+                    print(f"  cached new goal {box_goal} (det_score={det_score:.3f})")
+                mode = 'SEARCH'
+                w_conf = float(getattr(mppi, 'last_w_conf', 0.0))
             if goal_cell is not None:
                 sg = perception.similarity_grid
                 goal_x_m = sg.min_x + goal_cell[1] * cfg.voxel_resolution
@@ -729,8 +939,15 @@ def run(cfg: Config, save_enabled: bool = True,
             else:
                 goal_str = "—"
             if action is not None:
-                if cfg.discrete_actions:
-                    sim_iface.step_discrete(action)
+                # EXPLOIT is always discrete-stepped: DD-PPO's action space is
+                # the fixed Habitat primitive set (STOP/MOVE_FORWARD/TURN_LEFT/
+                # TURN_RIGHT), independent of cfg.discrete_actions (which only
+                # governs SEARCH's continuous-vs-discrete MPPI tracking).
+                if mode == 'EXPLOIT' or cfg.discrete_actions:
+                    # native=True for EXPLOIT: DD-PPO's turn_left/turn_right are
+                    # Habitat's own native action space, not the MPPI tracking
+                    # controller's grid-θ convention (see step_discrete).
+                    sim_iface.step_discrete(action, native=(mode == 'EXPLOIT'))
                     agent_steps += 1
                     action_str = f"{action} ({agent_steps}/{cfg.max_agent_steps})"
                 else:
@@ -752,34 +969,15 @@ def run(cfg: Config, save_enabled: bool = True,
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
                       f"mode: {mode}")
 
-            # Termination check: measure distance to whatever goal the planner
-            # just aimed at (the max-conf goal — current frame if it beat the
-            # cache, else the cached cell). Stop after the traj_log write
-            # below so the final replan is captured for visualization.
-            stop_now = False
-            if detected and goal_cell is not None:
-                # Obstacle-aware distance from the planner's goal distance
-                # field (matches the geodesic success metric: can't fire
-                # through a wall). Straight-line fallback only if the planner
-                # didn't run this replan.
-                dist_m = mppi.last_goal_dist_m
-                if dist_m is None:
-                    gz, gx = int(goal_cell[0]), int(goal_cell[1])
-                    sz, sx = world_to_grid(
-                        pos[0], pos[2], perception.similarity_grid, cfg.voxel_resolution,
-                    )
-                    dist_m = float(np.hypot(gz - sz, gx - sx)) * cfg.voxel_resolution
-                if dist_m <= cfg.stop_distance_m:
-                    print(f"step {step}: TARGET REACHED "
-                          f"(dist={dist_m:.2f}m <= {cfg.stop_distance_m:.2f}m)")
-                    stop_now = True
-
+            # `stop_now` was set above (EXPLOIT A* arrival is the sole stop
+            # signal; SEARCH never self-stops). The traj_log write below runs
+            # first so the final replan is captured for visualization.
             with open(traj_log_path, 'a') as _f:
                 _f.write(json.dumps({
                     'step': step,
                     'pos': [float(pos[0]), float(pos[2])],
                     'heading': float(heading),
-                    'action': (action if cfg.discrete_actions
+                    'action': (action if (mode == 'EXPLOIT' or cfg.discrete_actions)
                                else ([float(action[0]), float(action[1])]
                                      if action is not None else [0.0, 0.0])),
                     'opt_traj': [[int(p[0]), int(p[1])] for p in opt_traj] if opt_traj else [],
@@ -808,14 +1006,6 @@ def run(cfg: Config, save_enabled: bool = True,
                     agent_steps += 1  # the STOP primitive counts too
                 else:
                     sim_iface.step([0.0, 0.0], dt=cfg.mppi_dt)
-                break
-
-            # Discrete-mode primitive budget: exhausting it without self-stopping
-            # is a timeout (failure), so the agent never runs past the challenge's
-            # action budget even though training continues for `cfg.iterations`.
-            if cfg.discrete_actions and agent_steps >= cfg.max_agent_steps:
-                print(f"step {step}: STEP BUDGET EXHAUSTED "
-                      f"({agent_steps}/{cfg.max_agent_steps}) — timeout (failure)")
                 break
 
         # C. refresh buffer + maps (slowest cadence — bottleneck)

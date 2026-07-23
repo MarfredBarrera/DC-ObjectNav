@@ -43,7 +43,10 @@ DCON/
 │   ├── evaluate.py            # Flat multi-episode SR/SPL eval over episodes.yaml (calls main.run())
 │   ├── eval_scene.py          # Per-scene sweep CLI: run / review / report stages (thin over eval_core)
 │   ├── eval_core.py           # Eval logic (torch-free): scenarios, verdicts, aggregation, BEV evidence
-│   └── make_eval_subset.py    # Materializes a standardized ObjectNav-val subset for cross-system eval
+│   ├── make_eval_subset.py    # Materializes a standardized ObjectNav-val subset for cross-system eval
+│   ├── gibson_scenes/         # Gibson scene assets (.glb) — git-tracked
+│   ├── episodes/              # Gibson-val + HM3D-OVON episode datasets (gitignored)
+│   └── scene_datasets/        # HM3D scene assets for OVON (gitignored; download separately)
 ├── tools/
 │   ├── visualize.py           # Renders nav_history.mp4 from traj_log.jsonl + saved maps
 │   └── exploration_env.py     # Exploration policy definitions
@@ -58,8 +61,7 @@ DCON/
 │   ├── episodes.yaml                           # Hand-annotated episodes for benchmarks/evaluate.py (scene, query, start, goals)
 │   └── scenarios_*.yaml                        # Per-scene sweep specs for benchmarks/eval_scene.py (targets × starts, rect goals)
 ├── output/                    # Results (scenes, maps, models, traj_log.jsonl; eval runs/, verdicts.yaml)
-├── figs/                      # Generated figures and videos
-└── gibson_scenes/             # Scene assets (.glb)
+└── figs/                      # Generated figures and videos
 ```
 
 ## Core Architecture & Data Flow
