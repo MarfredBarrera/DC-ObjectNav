@@ -31,6 +31,23 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+# Habitat's fixed DD-PPO training convention (habitat/config/default.py):
+# SIMULATOR.DEPTH_SENSOR.{MIN_DEPTH,MAX_DEPTH} = 0.0, 10.0. Checkpoint-coupled
+# training constants — independent of cfg.min_sensor_dist/max_sensor_dist
+# (which happen to match, but shouldn't be relied on to stay in sync with a
+# pretrained checkpoint's training-time normalization).
+DDPPO_MIN_DEPTH_M = 0.0
+DDPPO_MAX_DEPTH_M = 10.0
+
+# Habitat PointNav's default action magnitudes, i.e. what this checkpoint's
+# recurrent policy implicitly assumes each primitive does (FORWARD_STEP_SIZE
+# = 0.25 m, TURN_ANGLE = 10°). Deliberately NOT cfg.discrete_forward_m /
+# cfg.discrete_turn_deg — those carry the ObjectNav-challenge convention
+# (25 cm / 30°) for the SEARCH tracking controller; a 3× turn-magnitude
+# mismatch against training was a confirmed DD-PPO failure mode.
+DDPPO_FORWARD_M = 0.25
+DDPPO_TURN_DEG = 10.0
+
 
 # ─────────────────────── vendored: resnet.py (backbone) ───────────────────────
 
@@ -177,7 +194,7 @@ class LSTMStateEncoder(nn.Module):
         return (h, c)
 
     def forward(self, x, hidden_states, masks):
-        # hidden_states: [1, num_recurrent_layers, hidden]:contentReference[oaicite:0]{index=0} -> permute to [num_recurrent_layers, 1, hidden]
+        # hidden_states: [1, num_recurrent_layers, hidden] -> permute to [num_recurrent_layers, 1, hidden]
         hidden_states = hidden_states.permute(1, 0, 2)
         hidden_states = torch.where(masks.view(1, -1, 1), hidden_states, hidden_states.new_zeros(()))
         x, hidden_states = self.rnn(x.unsqueeze(0), self.unpack_hidden(hidden_states))
@@ -189,18 +206,13 @@ class LSTMStateEncoder(nn.Module):
 
 # ────────────────── vendored: utils/common.py (action head) ──────────────────
 
-class CustomFixedCategorical(torch.distributions.Categorical):
-    def mode(self):
-        return self.probs.argmax(dim=-1, keepdim=True)
-
-
 class CategoricalNet(nn.Module):
     def __init__(self, num_inputs, num_outputs):
         super().__init__()
         self.linear = nn.Linear(num_inputs, num_outputs)
 
     def forward(self, x):
-        return CustomFixedCategorical(logits=self.linear(x))
+        return torch.distributions.Categorical(logits=self.linear(x))
 
 
 class CriticHead(nn.Module):
@@ -298,10 +310,15 @@ class PointNavResNetPolicy(nn.Module):
         self.critic = CriticHead(hidden_size)  # unused at inference; kept so state_dict loads cleanly
 
     @torch.no_grad()
-    def act(self, depth, pointgoal, rnn_hidden_states, prev_actions, masks, deterministic=True):
+    def act(self, depth, pointgoal, rnn_hidden_states, prev_actions, masks):
         features, rnn_hidden_states = self.net(depth, pointgoal, prev_actions, masks, rnn_hidden_states)
         distribution = self.action_distribution(features)
-        action = distribution.mode() if deterministic else distribution.sample()
+        # Always sample, never argmax: greedy selection locked into a stable
+        # turn_left/turn_right 2-cycle (the previous-action embedding feeds
+        # back into the LSTM, so a deterministic policy can "correct" its own
+        # last turn forever). Matches Habitat's reference eval wrapper
+        # (habitat_baselines/agents/ppo_agents.py: deterministic=False).
+        action = distribution.sample().unsqueeze(-1)
         return action, rnn_hidden_states
 
 
@@ -326,7 +343,17 @@ def compute_pointgoal_polar(agent_position, agent_rotation, goal_position) -> Tu
 
 # ────────────────────────────── loading + wrapper ──────────────────────────────
 
+# Process-level memo: the policy is eval-only and stateless (all per-episode
+# state lives in DDPPONavigator), so eval sweeps that call main.run() once per
+# episode in-process reuse one load instead of re-reading the ~190 MB
+# checkpoint from disk 250×.
+_POLICY_CACHE = {}
+
+
 def load_ddppo_policy(checkpoint_path: str, device: str = "cuda") -> PointNavResNetPolicy:
+    key = (checkpoint_path, device)
+    if key in _POLICY_CACHE:
+        return _POLICY_CACHE[key]
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     args = ckpt["model_args"]
     if args.backbone != "se_resneXt101" or args.rnn_type != "LSTM":
@@ -341,6 +368,7 @@ def load_ddppo_policy(checkpoint_path: str, device: str = "cuda") -> PointNavRes
     policy.load_state_dict(state_dict)
     policy.to(device)
     policy.eval()
+    _POLICY_CACHE[key] = policy
     return policy
 
 
@@ -369,21 +397,12 @@ class DDPPONavigator:
         self.not_done_masks = torch.zeros(1, 1, device=self.device, dtype=torch.bool)
         self.prev_actions = torch.zeros(1, 1, dtype=torch.long, device=self.device)
 
-    def act(self, depth_raw, min_depth_m, max_depth_m, agent_position, agent_rotation,
-           goal_position, deterministic: bool = False) -> str:
+    def act(self, depth_raw, agent_position, agent_rotation, goal_position) -> str:
         """`depth_raw` is a [H, W] (or [H, W, 1]) depth tensor/array in
         METERS at any resolution; resized + clipped/normalized to Habitat's
-        training convention (256x256, [min_depth_m, max_depth_m] -> [0, 1])
-        here. Returns one of ACTION_NAMES; also advances internal state.
-
-        `deterministic=False` (sample from the categorical, not argmax)
-        matches Habitat's own reference evaluation wrapper
-        (habitat_baselines/agents/ppo_agents.py: `actor_critic.act(...,
-        deterministic=False)`) — confirmed load-bearing in practice: greedy
-        argmax got stuck in a stable turn_left/turn_right 2-cycle (the
-        previous-action embedding feeds back into the LSTM, so a
-        deterministic policy can lock into "correcting" its own last turn
-        forever with zero randomness to escape it).
+        training convention (256x256, [DDPPO_MIN_DEPTH_M, DDPPO_MAX_DEPTH_M]
+        -> [0, 1]) here. Returns one of ACTION_NAMES; also advances internal
+        state. Action selection always samples (see PointNavResNetPolicy.act).
         """
         depth = torch.as_tensor(depth_raw, dtype=torch.float32, device=self.device)
         if depth.dim() == 2:
@@ -408,16 +427,16 @@ class DDPPONavigator:
         # Treat a miss as far/clear (matches how the rest of this codebase
         # already excludes depth <= min_sensor_dist as invalid rather than
         # "near").
-        depth = torch.where(depth <= min_depth_m, torch.full_like(depth, max_depth_m), depth)
-        depth = ((depth - min_depth_m) / (max_depth_m - min_depth_m)).clamp(0.0, 1.0)
+        depth.masked_fill_(depth <= DDPPO_MIN_DEPTH_M, DDPPO_MAX_DEPTH_M)
+        depth = ((depth - DDPPO_MIN_DEPTH_M)
+                 / (DDPPO_MAX_DEPTH_M - DDPPO_MIN_DEPTH_M)).clamp(0.0, 1.0)
         depth = depth.permute(0, 2, 3, 1)  # [1, H, W, 1]
 
         rho, phi = compute_pointgoal_polar(agent_position, agent_rotation, goal_position)
         pointgoal = torch.tensor([[rho, phi]], dtype=torch.float32, device=self.device)
 
         action, self.hidden_states = self.policy.act(
-            depth, pointgoal, self.hidden_states, self.prev_actions, self.not_done_masks,
-            deterministic=deterministic)
+            depth, pointgoal, self.hidden_states, self.prev_actions, self.not_done_masks)
 
         self.not_done_masks.fill_(True)
         self.prev_actions.copy_(action)

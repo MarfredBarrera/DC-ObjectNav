@@ -5,9 +5,9 @@ A minimal `benchmarks/eval_scene.py` invocation needs two named configs plus
 
 ```bash
 # inside the container, from /workspace/DCON
-python benchmarks/eval_scene.py run    --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml --gpu 3 [--video]
-python benchmarks/eval_scene.py review --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml
-python benchmarks/eval_scene.py report --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml
+python benchmarks/eval_scene.py run    --benchmark gibson --agent_config config/agent_configs/detector_pairwise_field_maxj.yaml --gpu 3 [--video]
+python benchmarks/eval_scene.py review --benchmark gibson --agent_config config/agent_configs/detector_pairwise_field_maxj.yaml
+python benchmarks/eval_scene.py report --benchmark gibson --agent_config config/agent_configs/detector_pairwise_field_maxj.yaml
 # re-score any existing output dir with no configs at all:
 python benchmarks/eval_scene.py report --out output/gibson_val_CLIPSEG_jul12
 ```
@@ -41,8 +41,6 @@ run instead).
 - **`scenarios_<Scene>.yaml`** — hand-written per-scene sweeps (targets ×
   starts with ground-truth rect goals), referenced by a benchmark's
   `scenarios:` key.
-- **`episodes.yaml`** — hand-annotated flat episode list for the older
-  `benchmarks/evaluate.py`.
 
 Benchmark episode datasets themselves live under `benchmarks/episodes/` (and
 HM3D scenes under `benchmarks/scene_datasets/`), referenced by `benchmarks.yaml`.

@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **DC-ObjectNav** is a robotics navigation system for direction-cognizant object navigation. It combines:
 - **3D Scene Understanding**: Learned feature fields with uncertainty quantification
-- **Semantic Grounding**: MaskCLIP for dense similarity maps + LLMDet (attention-sink-gated) for target detection
-- **Motion Planning**: MPPI stochastic planning (with DIAL-MPC-style annealing)
+- **Semantic Grounding**: a pairwise CLIPSeg relevance field (query + distractor channels) + LLMDet (attention-sink-gated) for target detection, with field-verified box acceptance
+- **Motion Planning**: MPPI stochastic planning (with DIAL-MPC-style annealing) for SEARCH; the pretrained DD-PPO PointNav policy for the EXPLOIT final approach
 - **Simulation Environment**: Habitat-sim integration for indoor scene simulation
 
 The system processes RGB-D observations from a robot, builds world-space 3D maps online, and plans trajectories to reach a text-queried target object — all in a single live loop.
@@ -22,17 +22,14 @@ DCON/
 │   │   ├── perception_stack.py # Main perception interface (observe, train, update maps)
 │   │   ├── featurefield.py    # EvidentialFeatureField: 3D feature field (hash-grid + MLP, NIG uncertainty)
 │   │   ├── grid.py            # Uncertainty, Occupancy, and Similarity grids
-│   │   ├── semantics.py       # MaskCLIP semantic feature extraction wrapper
+│   │   ├── semantics.py       # CLIPSegSemantics: per-pixel relevance channels (query + distractors)
+│   │   ├── distractor_gen.py  # Distractor vocabulary (background terms + object confusers)
 │   │   ├── obj_detection.py   # LLMDet detector (MM-Grounding-DINO + attention sinks)
 │   │   └── utils.py           # Unprojection and coordinate utilities
 │   ├── planning/              # Motion planning
-│   │   ├── mppi.py            # MPPI stochastic trajectory optimization (DIAL annealing)
-│   │   └── utils.py           # FOV-raycast information-gain (compute_batch_fov_ig)
-│   ├── mask_clip/             # MaskCLIP semantic segmentation
-│   │   ├── MaskCLIP.py        # Main MaskCLIP interface
-│   │   ├── model.py           # Dense feature extraction from CLIP
-│   │   ├── clip.py            # CLIP model loading
-│   │   └── test_*.py          # Test scripts (require sample images in images/)
+│   │   ├── mppi.py            # MPPI stochastic trajectory optimization (DIAL annealing) — SEARCH
+│   │   ├── ddppo_policy.py    # Vendored DD-PPO PointNav policy + DDPPONavigator — EXPLOIT
+│   │   └── utils.py           # FOV-raycast information-gain, goal_distance_field, reachable_min
 │   ├── habitat/               # Habitat-sim integration
 │   │   ├── habitat_utils.py   # Scene init, pathfinding, geodesic_distance
 │   │   └── sim_interface.py   # Robot control interface
@@ -40,7 +37,6 @@ DCON/
 │
 ├── main.py                    # Primary entry: live perception + planning + execution loop (run())
 ├── benchmarks/
-│   ├── evaluate.py            # Flat multi-episode SR/SPL eval over episodes.yaml (calls main.run())
 │   ├── eval_scene.py          # Per-scene sweep CLI: run / review / report stages (thin over eval_core)
 │   ├── eval_core.py           # Eval logic (torch-free): scenarios, verdicts, aggregation, BEV evidence
 │   ├── make_eval_subset.py    # Materializes a standardized ObjectNav-val subset for cross-system eval
@@ -49,16 +45,17 @@ DCON/
 │   └── scene_datasets/        # HM3D scene assets for OVON (gitignored; download separately)
 ├── tools/
 │   ├── visualize.py           # Renders nav_history.mp4 from traj_log.jsonl + saved maps
+│   ├── analyze_runs.py        # Eval analysis: progress, common-set SR/SPL comparison, failure attribution
 │   └── exploration_env.py     # Exploration policy definitions
 │
-├── config/config.yaml         # Active config (YAML overrides Python defaults)
+├── ddppo_weights/             # DD-PPO PointNav checkpoint (gitignored; cfg.ddppo_checkpoint_path)
+├── config/config.yaml         # Active config (YAML overrides Python defaults; carries the canonical detection arm)
 ├── config/agent_configs/                       # Config overlays — see evaluation_configs/README.md
-│   ├── agent_*.yaml                            # Agent/sensor profiles overlaid on the base config (eval_scene.py run --agent_config)
-│   └── detector_*.yaml                         # Detection-stack overlays (τ, field-verify gate, contrastive map)
+│   ├── agent_ovon_stretch.yaml                 # OVON Stretch embodiment profile (eval_scene.py --agent_config)
+│   └── detector_pairwise_field_maxj.yaml       # THE canonical detection arm (τ0.47 LLMDet + pairwise field margin ≥ 0.0)
 ├── config/evaluation_configs/                  # Eval configs — see its README.md
 │   ├── benchmarks.yaml                         # Named episode sources (eval_scene.py --benchmark: gibson, ovon, ... — dataset/scenarios + embodiment)
 │   ├── experiments/*.yaml                      # Optional presets (eval_scene.py --experiment: non-detector overlays, action mode, caps, scoring, out)
-│   ├── episodes.yaml                           # Hand-annotated episodes for benchmarks/evaluate.py (scene, query, start, goals)
 │   └── scenarios_*.yaml                        # Per-scene sweep specs for benchmarks/eval_scene.py (targets × starts, rect goals)
 ├── output/                    # Results (scenes, maps, models, traj_log.jsonl; eval runs/, verdicts.yaml)
 └── figs/                      # Generated figures and videos
@@ -86,21 +83,23 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
 
 **Data Flow per observation**:
 1. `observe(sim_iface)` — Pull RGB-D frame + camera pose from Habitat.
-2. `update_replay_buffer()` — Unproject to world-space points, extract CLIP features via MaskCLIP, sub-sample to `hash_per_frame_cache_size`, then fold *the previous frame* into the flat `_HistoryBuffer` and hold the new frame out as `_latest_frame`.
+2. `update_replay_buffer()` — Unproject to world-space points, extract per-pixel CLIPSeg relevance channels (query + distractors), sub-sample to `hash_per_frame_cache_size`, then fold *the previous frame* into the flat `_HistoryBuffer` and hold the new frame out as `_latest_frame`.
 3. `update_occupancy()` — Voxelize depth into the occupancy grid (independent of the feature-field buffer).
 4. `make_super_batch()` — Stage one big GPU tensor for training: ~20% drawn from `_latest_frame`, ~80% sampled uniformly from `_HistoryBuffer` via one `randint` + gather (no concat over many chunks).
 5. `train_step(super_pts, super_feats)` — Sample a mini-batch from the staged super-batch and run one gradient step on the feature field.
 6. `update_maps()` — Forward-pass the trained field through every BEV voxel; save epistemic uncertainty, aleatoric uncertainty, occupancy, and target-similarity maps.
 
 **Key concepts**:
-- **Feature Field** (`EvidentialFeatureField`): a single hash-grid + MLP mapping 3D position → CLIP feature vector, trained with an evidential (Normal-Inverse-Gamma) head. The NIG marginal yields **both** aleatoric and epistemic uncertainty in one forward pass — no ensemble (the previous multi-model ensemble, whose only role was empirical epistemic from prediction variance, was replaced by this).
+- **Feature Field** (`EvidentialFeatureField`): a single hash-grid + MLP mapping 3D position → the CLIPSeg relevance vector (one sigmoid channel per prompt: query + distractors; `hash_feature_dim` is overridden to 1+K at PerceptionStack init), trained with an evidential (Normal-Inverse-Gamma) head. The NIG marginal yields **both** aleatoric and epistemic uncertainty in one forward pass — no ensemble (the previous multi-model ensemble, whose only role was empirical epistemic from prediction variance, was replaced by this).
 - **`_HistoryBuffer`**: Flat pre-allocated CPU ring of `(history_buffer_capacity, 3)` points and `(history_buffer_capacity, hash_feature_dim)` features. New points always enter; once full, each new point overwrites a uniformly random existing slot. Bounded memory (~412 MB CPU at 200k × 512-dim), continuous fresh-data dominance, O(batch) sampling with no `torch.cat` over many small chunks.
 - **`_latest_frame`**: The most-recent frame is held out of the history buffer so it contributes a guaranteed 20% of every super-batch (recent-frame oversample). Keeps fresh observations weighted regardless of buffer state.
 - **Query-Specific Maps**: Similarity grids are computed w.r.t. a text query (e.g., `cfg.target_query = "a pillow"`).
 
-### Planning (`src/planning/mppi.py`)
+### Planning: SEARCH (`src/planning/mppi.py`) and EXPLOIT (`src/planning/ddppo_policy.py`)
 
-**MPPI with DIAL-style annealing**. Receding-horizon stochastic optimizer.
+**Control is split by mode.** SEARCH (pre-latch) runs the MPPI planner below. Once a detection **latches**, EXPLOIT hands locomotion to the pretrained **DD-PPO PointNav policy** (Wijmans et al. 2020; depth-only SE-ResNeXt101 + 2-layer LSTM, vendored dependency-free in `ddppo_policy.py` to bit-exactly match the `gibson-2plus-se-resneXt101-lstm1024` checkpoint): each replan, `DDPPONavigator.act(depth, pos, rotation, goal_world)` emits ONE native Habitat primitive, executed via `SimInterface.step_discrete` with the checkpoint's own training magnitudes (`DDPPO_FORWARD_M`=0.25 m / `DDPPO_TURN_DEG`=10° — deliberately NOT `cfg.discrete_*`). The goal is the raw cached detection-box projection (no free-space snapping — an obstacle-embedded goal is fine for a depth policy; a snapped goal drifting with the evolving occupancy map was a confirmed failure). The sole stop signal is the Euclidean `cfg.stop_distance_m` check against that goal; DD-PPO's own trained STOP is disregarded (trained against ~0.2 m exact PointGoals — never fires reliably on detection-projected goals). Action selection **samples** (never argmax — greedy locks into a turn_left/turn_right 2-cycle via the prev-action embedding). Depth input: resized 512→256 with `nearest-exact` (bilinear fabricates phantom edge depths), and sensor-miss `0.0` pixels are remapped to far/clear (a mesh-hole reading as a point-blank wall was the root cause of persistent turn-only stalls). The LSTM state resets once per latch (`ddppo_nav.reset()` when `detected` first flips).
+
+**MPPI with DIAL-style annealing** (SEARCH). Receding-horizon stochastic optimizer. (Its EXPLOIT-specific cost behaviors below — arrival freeze, unseen-cell penalty — are retained in `mppi.py` but inactive in the live loop now that latching hands control to DD-PPO.)
 
 - Unicycle dynamics (turn-first integration), control vector `[v_cells_per_step, w_rad_per_step]`.
 - Cost terms (combined as a score; lower cost = higher score):
@@ -112,7 +111,7 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
 - **Warm-start**: previously committed control sequence is shifted left by one step at the start of each replan.
 - **Sample 0 pinned to zero noise** so the unmutated warm-start is always evaluated.
 
-**Continuous→discrete action mode** (`cfg.discrete_actions`, default off): MPPI stays continuous, but a low-level **tracking controller** ([`discrete_action_from_plan`](DCON/main.py)) converts each replan's optimized path into ONE Habitat ObjectNav primitive — MOVE_FORWARD (`discrete_forward_m`=0.25 m), TURN_LEFT/RIGHT (`discrete_turn_deg`=30°), or STOP — executed via [`SimInterface.step_discrete`](DCON/src/habitat/sim_interface.py). Pure-pursuit: it takes the bearing to the first waypoint ≥ `discrete_lookahead_m` ahead and turns toward it when the heading error exceeds half a turn, else steps forward; receding-horizon replans correct drift. Turn direction is mapped onto Habitat yaw via `mppi_w_sign` (same sign the continuous `step` uses). Each primitive counts against `max_agent_steps` (=500) — exhausting it without self-stopping is a timeout/failure. This makes SR/SPL directly comparable to VLFM / Goal-Oriented Semantic Exploration in the discrete ObjectNav challenge. `traj_log.jsonl` logs the primitive name as `action` in this mode (nothing downstream consumes it; `tools/visualize.py` reads only `heading`).
+**Continuous→discrete action mode** (`cfg.discrete_actions`, default off; governs SEARCH only — EXPLOIT is always discrete-stepped by DD-PPO regardless): MPPI stays continuous, but a low-level **tracking controller** ([`discrete_action_from_plan`](DCON/main.py)) converts each replan's optimized path into ONE Habitat ObjectNav primitive — MOVE_FORWARD (`discrete_forward_m`=0.25 m), TURN_LEFT/RIGHT (`discrete_turn_deg`=30°, the challenge convention), or STOP — executed via [`SimInterface.step_discrete`](DCON/src/habitat/sim_interface.py). Pure-pursuit: it takes the bearing to the first waypoint ≥ `discrete_lookahead_m` ahead and turns toward it when the heading error exceeds half a turn, else steps forward; receding-horizon replans correct drift. `step_discrete` takes NATIVE Habitat turn semantics unconditionally; the tracking controller maps its grid-θ turn direction onto Habitat yaw via `mppi_w_sign` at the source (applying a sign inside step_discrete inverted DD-PPO's native turns — a confirmed spin-in-place bug). Each primitive counts against `max_agent_steps` (=500) — exhausting it without self-stopping is a timeout/failure. This makes SR/SPL directly comparable to VLFM / Goal-Oriented Semantic Exploration in the discrete ObjectNav challenge. `traj_log.jsonl` logs the primitive name as `action` in this mode (nothing downstream consumes it; `tools/visualize.py` reads only `heading`).
 
 **Goal selection** ([main.py:plan_one_action](DCON/main.py)): each replan a detection is first **classified** by distance + size, then the goal cell is chosen by a three-layer priority.
 
@@ -132,24 +131,17 @@ So the agent steers toward a distant sighting and only commits to it once it has
 
 **Latching / goal weight (MPPI `w_conf`)**: `detected` latches once `detected_persistence` consecutive *persistent* (usable-band) detections accrue — there is no separate latch score threshold; the detector's own floor (`llmdet_threshold`) bounds every surviving box's score — a non-persistent frame resets the streak; never unlatches. `EXPLOIT` pins `w_conf=1.0` so the agent commits hard; `SEARCH` passes the per-frame detection score (zeroed for *too-close* detections so they don't pull the goal weight) and MPPI's hysteresis (`exploit_conf = max(incoming, prev * conf_decay)`) ratchets up on sightings and decays after misses.
 
-### Semantics (`src/mask_clip/`)
+### Semantics (`src/perception/semantics.py` + `distractor_gen.py`)
 
-**MaskCLIP**: Dense semantic feature extraction.
-- Loads OpenAI CLIP (ViT-B/16 by default).
-- **Text path**: query string → 512-D text embedding.
-- **Image path**: image → dense per-patch CLIP features (spatial 512-D map).
-- Per-pixel similarity: `patch_features @ text_features.T`, normalized to [0, 1].
-- **Frozen**: weights never update. The feature fields learn *where* in 3D to render these embeddings.
+**CLIPSegSemantics**: dense per-pixel relevance for a FIXED text query (frozen CIDAS/clipseg-rd64-refined; the query is fixed at construction — `cfg.target_query` never changes mid-run). In **pairwise mode** (`cfg.clipseg_pairwise`, the canonical setup) it emits one sigmoid channel per prompt — the query plus the distractor bank from `build_distractor_vocabulary(cfg)` (`cfg.background_terms` generic-background prompts + `cfg.distractor_objects` structurally-similar/distinct-material object confusers, deduped; phrases sharing a content word with the query are stripped by `filter_distractors`). All K logit maps come from one batched forward pass; text-conditional embeddings are cached at construction. The feature field regresses the full channel vector; the query-vs-distractor **contrast happens at verify time** on the multi-view-converged field, not per frame.
+
+**Field-verified detection** (`cfg.field_verify`, main.py `detect_classify_latch`): a detector box must also pass the field — its valid-depth pixels are unprojected, the field is read there, the top-`field_verify_top_frac` in-box cells (selected by the query channel) are pooled, and the box counts only if the worst-case margin `presence(query) − max_i presence(distractor_i)` clears `field_verify_threshold` (canonically **0.0**, the tuning-free max-Youden-J point — calibrated against the static distractor bank; a materially different bank warrants a re-sweep). This is what suppresses the geometric-look-alike FPs that survive LLMDet's sinks.
 
 ### Object Detection (`src/perception/obj_detection.py`)
 
-All detectors share `detect(image, query) → (score, box)`; `make_detector(cfg)` picks one.
+**`LLMDetDetector`** (`make_detector(cfg)`; `detect(image, query) → (score, box)`) — LLMDet (MM-Grounding-DINO + LLM-supervised backbone) via HuggingFace, with the **training-free attention sinks** of Ruis et al. (ICLR 2026) for background false-positive mitigation. MUST load `iSEE-Laboratory/llmdet_{tiny,base,large}` (`model_type="mm-grounding-dino"`, native in transformers ≥4.52); the `fushh7/*_hf` weights declare plain `grounding-dino` and load with a broken, non-discriminative contrastive head — do NOT use them. Sinks reuse `[unused*]` vocab slots (init proved **inert** — the BERT text encoder recontextualizes them); a box survives only if its query phrase out-scores every sink. Config: `llmdet_model_name`, `llmdet_threshold` (= τ), `llmdet_use_sinks`, `llmdet_num_sinks` (48), `llmdet_sink_init`.
 
-**`LLMDetDetector`** (default) — LLMDet (MM-Grounding-DINO + LLM-supervised backbone) via HuggingFace, with the **training-free attention sinks** of Ruis et al. (ICLR 2026) for background false-positive mitigation. MUST load `iSEE-Laboratory/llmdet_{tiny,base,large}` (`model_type="mm-grounding-dino"`, native in transformers ≥4.52); the `fushh7/*_hf` weights declare plain `grounding-dino` and load with a broken, non-discriminative contrastive head — do NOT use them. Sinks reuse `[unused*]` vocab slots (init proved **inert** — the BERT text encoder recontextualizes them); a box survives only if its query phrase out-scores every sink. `detect_all` returns every sink-gated box ≥ τ (the cascade uses it); `detect` returns the top one. Config: `llmdet_model_name`, `llmdet_threshold` (= τ), `llmdet_use_sinks`, `llmdet_num_sinks` (48), `llmdet_sink_init`.
-
-**`CascadeDetector`** (`cfg.detector_cascade=True`) — two-stage **propose→verify** to cut the geometric-look-alike false positives LLMDet's sinks are structurally blind to (a genuine look-alike produces a real high query score, so no sink out-scores it). `LocateAnythingDetector` (NVIDIA LocateAnything-3B, a generative Qwen-VL-style grounding model — architecturally unlike DINO, so its FPs are largely *uncorrelated*) **proposes** a box; LLMDet **verifies** — a frame counts as a detection only when a sink-gated LLMDet box ≥ τ overlaps the proposal with `IoU ≥ cfg.cascade_min_iou`. The returned `(score, box)` is the *verifier's*, so τ, the latch, and goal projection are unchanged — only *which frames register* changes, so `w_conf` updates only on cross-verified sightings. The proposer runs first and the verifier only when it fires, bounding cost by the proposal rate; still ~2× SEARCH detector latency and some recall loss (a TP only one model catches is dropped). `cascade_min_iou ≤ 0` drops the spatial check. LocateAnything-3B is a ~7 GB HF download (`trust_remote_code`; remote code auto-patched for Python 3.9). Config: `detector_cascade`, `locate_anything_model_name`, `locate_anything_max_new_tokens`, `cascade_min_iou`.
-
-The YOLO-Worldv2 / COCO-YOLOv8 / VLFM-hybrid backends were removed earlier — recover from git history if ever needed.
+The YOLO-Worldv2 / COCO-YOLOv8 / VLFM-hybrid backends, the LocateAnything→LLMDet verification cascade, the CLIPSegDetector verifier candidate, the contrastive (sigmoid×softmax-share) CLIPSeg target, and the per-target LLM distractor generator were all removed — recover from git history if ever needed. Look-alike FP suppression lives in the pairwise field-verify gate above.
 
 **LLMDet threshold (τ) calibration** — `llmdet_threshold` is the per-box query-score floor; raising it trades true-positive recall for background-FP rejection. From a 60-frame sweep (87 COCO-YOLO-oracle TPs, 600 out-of-domain FPs) on the **large** model. TP-ret = true-positive retention at the τ that achieves the target background FP-rejection:
 
@@ -169,7 +161,7 @@ Three complementary BEV representations:
 |-----------|---------|-------|-------------------|
 | **UncertaintyGrid** | Epistemic + aleatoric | Evidential (NIG) field forward-pass | 2 scalars; observed-FREE voxels zeroed when `mask_free_epistemic` (field never trains on air → free-air uncertainty is phantom noise; BEV reduction switches to max-over-Y) |
 | **OccupancyGrid** | Free / occupied / unseen | Depth voxelization (incremental) | trinary value |
-| **SimilarityGrid** | Target relevance | Mean CLIP feature ⋅ text-query embedding | 1 scalar |
+| **SimilarityGrid** | Target relevance | Field forward-pass; pairwise: clamped worst-case margin (query − max distractor channel) | 1 scalar |
 
 **Coordinates**: World space with `scene_bounds = ((xmin,ymin,zmin),(xmax,ymax,zmax))`; BEV cells index `(z, x)`; `y` is ignored for planning.
 
@@ -182,17 +174,11 @@ Three complementary BEV representations:
 cd DCON
 python main.py --gpu 0 --query "a pillow"
 ```
-Seeds the maps from one observation (no spin/cold-train), then runs the three-cadence main loop. Outputs to `output/current_scene/`: always `traj_log.jsonl` + `grid_extent.json`; `save_enabled` (default) adds the final occupancy BEV `.npy`; `save_video` (the `--no-visualize` inverse) adds the full per-step BEV map + RGB history and renders `nav_history.mp4`. No feature-field checkpoint is written. `main.run(cfg, start_pos=..., start_rotation=..., goals=..., success_radius_m=..., save_enabled=..., save_video=...)` is also importable and returns a per-episode metrics dict (`success`, `spl`, `l_geodesic`, `final_geodesic`, `path_length`, `agent_stopped`, `final_pos`, `start_nav`, `success_radius_m`, `steps`; used by `benchmarks/evaluate.py` and `benchmarks/eval_scene.py`).
+Seeds the maps from one observation (no spin/cold-train), then runs the three-cadence main loop. Outputs to `output/current_scene/`: always `traj_log.jsonl` + `grid_extent.json`; `save_enabled` (default) adds the final occupancy BEV `.npy`; `save_video` (the `--no-visualize` inverse) adds the full per-step BEV map + RGB history and renders `nav_history.mp4`. No feature-field checkpoint is written. `main.run(cfg, start_pos=..., start_rotation=..., goals=..., success_radius_m=..., save_enabled=..., save_video=...)` is also importable and returns a per-episode metrics dict (`success`, `spl`, `l_geodesic`, `final_geodesic`, `path_length`, `agent_stopped`, `final_pos`, `start_nav`, `success_radius_m`, `steps`; used by `benchmarks/eval_scene.py`).
 
-**Goals** (for both evaluators) may be **points** (`[x, y, z]`) or **axis-aligned rectangles** (`{rect: [x_min, z_min, x_max, z_max], y: <height>}`, e.g. a table footprint). Success/geodesic score against the **nearest point** of the goal ([`nearest_goal_point`](DCON/main.py) clamps the agent's x,z into the rectangle). Success is **geodesic** distance (navmesh shortest path via `geodesic_distance`) — matching the Habitat ObjectNav challenge; there is no straight-line success mode. `final_pos` is recorded so runs can be re-inspected/re-scored offline.
+**Goals** (for the evaluator) may be **points** (`[x, y, z]`) or **axis-aligned rectangles** (`{rect: [x_min, z_min, x_max, z_max], y: <height>}`, e.g. a table footprint). Success/geodesic score against the **nearest point** of the goal ([`nearest_goal_point`](DCON/main.py) clamps the agent's x,z into the rectangle). Success is **geodesic** distance (navmesh shortest path via `geodesic_distance`) — matching the Habitat ObjectNav challenge; there is no straight-line success mode. `final_pos` is recorded so runs can be re-inspected/re-scored offline.
 
-**2. Flat multi-episode evaluation (SR / SPL)**
-```bash
-python benchmarks/evaluate.py --episodes config/evaluation_configs/episodes.yaml --gpu 0 --out output/eval_run1
-```
-Runs each hand-annotated episode (scene, query, start pos, goals) through `main.run()` in-process and aggregates **Success Rate** and **SPL**. Success = the agent self-stops within `success_radius_m` geodesic of a goal; SPL weights each success by `geodesic(start, nearest_goal) / max(geodesic, path_traveled)`. Writes `<out>/results.json`.
-
-**3. Sweep with human adjudication (`benchmarks/eval_scene.py`)**
+**2. Sweep with human adjudication (`benchmarks/eval_scene.py`)**
 
 A minimal eval needs two named configs (see `config/evaluation_configs/README.md`); the CLI carries only the per-invocation ones:
 - **`--benchmark <name>`** — WHICH EPISODES: a named entry in `config/evaluation_configs/benchmarks.yaml` (`gibson`, `ovon`, `ovon_unseen`, `ovon_synonyms`, `goffs`): the episode source (`dataset:` split or `scenarios:` sweep), `scenes_root`, and any protocol embodiment overlay (OVON's Stretch camera) + scoring defaults.
@@ -202,13 +188,13 @@ A minimal eval needs two named configs (see `config/evaluation_configs/README.md
 
 Precedence per key: CLI > experiment > benchmark > default; overlays stack (benchmark embodiment → experiment → CLI `--agent_config`) so the most specific wins per config key. `--out` defaults to `output/<benchmark>_<agent_config>` (or `output/<benchmark>_<experiment>` when `--experiment` is given).
 ```bash
-python benchmarks/eval_scene.py run    --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml --gpu 3   # execute + save evidence
-python benchmarks/eval_scene.py review --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml           # (re)build verdicts.yaml + BEV evidence
+python benchmarks/eval_scene.py run    --benchmark gibson --agent_config config/agent_configs/detector_pairwise_field_maxj.yaml --gpu 3   # execute + save evidence
+python benchmarks/eval_scene.py review --benchmark gibson --agent_config config/agent_configs/detector_pairwise_field_maxj.yaml           # (re)build verdicts.yaml + BEV evidence
 # ...inspect the out dir's ep/<id>/ (nav_history.mp4, bev_final.png), edit verdicts.yaml...
-python benchmarks/eval_scene.py report --benchmark gibson --agent_config config/agent_configs/detector_distractors_field.yaml           # aggregate SR/SPL
-python benchmarks/eval_scene.py report --out output/<any_existing_dir>                                                                  # re-score records on disk, no configs
+python benchmarks/eval_scene.py report --benchmark gibson --agent_config config/agent_configs/detector_pairwise_field_maxj.yaml           # aggregate SR/SPL
+python benchmarks/eval_scene.py report --out output/<any_existing_dir>                                                                    # re-score records on disk, no configs
 ```
-`config/agent_configs/` holds the detector arms, e.g. `detector_distractors_field` (contrastive CLIPSeg field on top of the fieldverify sweep winner) and `detector_fieldverify_thr050` (τ0.47 LLMDet + field gate 0.50, the sweep winner). `--experiment` presets are for bundling caps/scoring, e.g. a `*_smoke` variant capped at 2 eps per category×scene — freeze one under `experiments/` once it's worth re-running by name.
+`config/agent_configs/` holds `detector_pairwise_field_maxj.yaml` — THE canonical detection arm (τ0.47 sink-gated LLMDet + pairwise-field margin gate at 0.0; also baked into base `config.yaml`) — and the OVON embodiment profile. Superseded sweep arms (fieldverify thresholds, contrastive, LLM distractors) were deleted; git history has them. `--experiment` presets are for bundling caps/scoring, e.g. a `*_smoke` variant capped at 2 eps per category×scene — freeze one under `experiments/` once it's worth re-running by name.
 A benchmark's episode source is either `scenarios:` (a hand-written per-scene sweep of **targets × start positions**; `runs_per_combo` repeats each; run id `{target}__{start}[__r{k}]`) **or** `dataset:` (standard benchmark episodes; below). Either way the pipeline separates **evidence** from **judgment**:
 - **`run`** executes each combo (skips completed unless `--rerun`), saving a raw record to `runs/<id>.json` + an evidence bundle in `ep/<id>/`. Evidence is **minimal by default** — `traj_log.jsonl`, `grid_extent.json`, the FINAL occupancy BEV `.npy`, and `bev_final.png` (goals/start/final marked) — a few tens of KB per run. `--video` adds the full per-step BEV map + RGB history and renders `nav_history.mp4` (megabytes/run). `--no-evidence` keeps only `traj_log` + `grid_extent`. The feature-field checkpoint is never saved (nothing consumes it). Bakes in no verdict — auto-success is only a suggestion.
 - **`review`** (re)generates a single **`verdicts.yaml`** (one entry per run, `status: auto|success|fail|exclude`, pre-filled with the auto-suggestion + evidence inline as comments). Preserves your edits on re-run. This is the authoritative human judgment (replaces the older exclude/override files).
@@ -218,13 +204,20 @@ Key behaviors: `run` **requires an episode source** — `--benchmark`, or an `--
 
 **Standard ObjectNav benchmark episodes (`dataset:` benchmarks)** — evaluate on the same episode datasets VLFM / Goal-Oriented Semantic Exploration report on (Gibson/SemExp, HM3D, MP3D, HM3D-OVON), while the custom `scenarios:` path stays available. [`eval_core.load_objectnav_dataset`](DCON/benchmarks/eval_core.py) parses the habitat-lab ObjectNav-v1 schema (`content/<scene>.json.gz`; goal instances inline or in `goals_by_category`) into the same run specs the scenarios path produces — `review`/`report`/`verdicts.yaml` work unchanged. Per episode it carries: the local scene `.glb` (found by a recursive basename-matched walk of the benchmark's `scenes_root`, so both flat Gibson layouts and HM3D's nested `00xxx-X/X.basis.glb` resolve; episodes with no local scene are skipped with a warning), the episode's `start_rotation` (honored at spawn), the query `"a {category}"`, all goal-instance positions (success = geodesic to the nearest ≤ `radius`, default 1.0 m — the "stop within 1 m of the object" protocol), and a per-floor **BEV height band** derived from the start Y (`BEV_BAND_ABOVE_FLOOR` = floor+0.2..floor+1.5 — benchmark scenes are multi-floor, so the static config band is overridden per run). Run id `{category}__{scene}__ep{episode_id}`; the per-combo rollup then groups by (category × scene). Episode subsetting (`categories:`, `scenes:`, `max_per_combo:`) and the action space (`discrete: true` for challenge-comparable 25 cm / 30° primitives, 500-step budget) are experiment-yaml keys. Note the datasets + scene assets themselves must be downloaded separately; only Gibson `.glb`s are in the repo (the Gibson-val benchmark scenes are Collierville, Corozal, Darden, Markleeville, Wiconisco — the first two are present).
 
-**HM3D-OVON** (open-vocabulary ObjectNav; episodes at HF `nyokoyama/hm3d_ovon`, splits `val_seen` / `val_seen_synonyms` / `val_unseen`; scenes = HM3D val v0.2, Matterport ToS) loads through the same `dataset:` path — same ObjectNav-v1 schema, `goals_by_category` keyed `<scene>.basis.glb_<category>`. The `ovon`/`ovon_unseen`/`ovon_synonyms` benchmarks bake in the protocol's **Stretch embodiment** via the `agent_ovon_stretch` overlay (360×640 portrait, 42° HFOV, camera at 1.31 m, agent 1.41 m × r0.17 m; applied through `Config.apply_yaml` — only the keys present override, and per-run fields (scene, query, BEV band) are applied after so the overlay can't clobber them). The narrow portrait camera meaningfully shrinks per-frame coverage for the detector / MaskCLIP / IG raycast (all consume the same `cfg.fov`/`img_*` via `SimInterface.intrinsics`, so they stay consistent automatically). OVON ships ~3k episodes per split — subsample with the experiment's `max_per_combo:`. **Scoring**: the **primary reported SR/SPL number is the non-viewpoints reading** — goals are the object positions, radius 1.0 (the SemExp/VLFM "within 1 m of the object" convention). This is the number to headline; it's what's comparable to VLFM/SemExp and doesn't penalize a system (ours) that has no explicit visibility/standoff-seeking behavior. Set `viewpoints: true` in the experiment for the official protocol as a secondary, stricter cross-check — goals become every goal instance's `view_points` agent positions (habitat's `DistanceToGoal` VIEW_POINTS measure) and the default radius switches to 0.1 (the official `success_distance`; verified to match the episodes' precomputed `info.geodesic_distance` to <1 mm). Our agent's self-stop (`cfg.stop_distance_m`, also MPPI's arrival radius — see `mppi.py`) checks proximity to the detected object's surface with no visibility requirement, so it systematically under-performs the 0.1 m viewpoint radius even on runs that reach the correct object (e.g. a 2026-07 OVON smoke episode stopped 0.12 m from the nearest viewpoint — 2 cm over). Episodes lacking `view_points` fall back to positions with a warning.
+**HM3D-OVON** (open-vocabulary ObjectNav; episodes at HF `nyokoyama/hm3d_ovon`, splits `val_seen` / `val_seen_synonyms` / `val_unseen`; scenes = HM3D val v0.2, Matterport ToS) loads through the same `dataset:` path — same ObjectNav-v1 schema, `goals_by_category` keyed `<scene>.basis.glb_<category>`. The `ovon`/`ovon_unseen`/`ovon_synonyms` benchmarks bake in the protocol's **Stretch embodiment** via the `agent_ovon_stretch` overlay (360×640 portrait, 42° HFOV, camera at 1.31 m, agent 1.41 m × r0.17 m; applied through `Config.apply_yaml` — only the keys present override, and per-run fields (scene, query, BEV band) are applied after so the overlay can't clobber them). The narrow portrait camera meaningfully shrinks per-frame coverage for the detector / CLIPSeg / IG raycast (all consume the same `cfg.fov`/`img_*` via `SimInterface.intrinsics`, so they stay consistent automatically). OVON ships ~3k episodes per split — subsample with the experiment's `max_per_combo:`. **Scoring**: the **primary reported SR/SPL number is the non-viewpoints reading** — goals are the object positions, radius 1.0 (the SemExp/VLFM "within 1 m of the object" convention). This is the number to headline; it's what's comparable to VLFM/SemExp and doesn't penalize a system (ours) that has no explicit visibility/standoff-seeking behavior. Set `viewpoints: true` in the experiment for the official protocol as a secondary, stricter cross-check — goals become every goal instance's `view_points` agent positions (habitat's `DistanceToGoal` VIEW_POINTS measure) and the default radius switches to 0.1 (the official `success_distance`; verified to match the episodes' precomputed `info.geodesic_distance` to <1 mm). Our agent's self-stop (`cfg.stop_distance_m`, also MPPI's arrival radius — see `mppi.py`) checks proximity to the detected object's surface with no visibility requirement, so it systematically under-performs the 0.1 m viewpoint radius even on runs that reach the correct object (e.g. a 2026-07 OVON smoke episode stopped 0.12 m from the nearest viewpoint — 2 cm over). Episodes lacking `view_points` fall back to positions with a warning.
 
-**4. Trajectory video**
+**3. Trajectory video**
 ```bash
 python tools/visualize.py --config config/config.yaml --output ./figs/nav_history.mp4 --fps 5
 ```
 `tools/visualize.py` reads `traj_log.jsonl` + saved BEV maps and renders the navigation video.
+
+**4. Run analysis (`tools/analyze_runs.py`, torch-free)**
+```bash
+python tools/analyze_runs.py output/gibson_pairwise_maxj                                              # mid-run progress + SR/SPL + failure attribution
+python tools/analyze_runs.py maxj=output/gibson_pairwise_maxj jul4=output/saved_data/objectnav_val_total_jul4   # compare arms on the COMMON episode set
+```
+Reads only what `eval_scene.py run` leaves on disk (`runs/*.json`, `ep/<id>/traj_log.jsonl` + `grid_extent.json`, `verdicts.yaml`). With ≥2 dirs: common-set SR/SPL plus per-category and per-scene tables. Failure attribution per arm: **FP** (latched onto the wrong object — final EXPLOIT goal > `--near-thresh` (1.0 m) from every true goal), **NEVER** (never latched — recall bucket), **NEAR** (latched near the target but failed — navigation bucket, tail-classified as frozen / orbiting / approach / jitter). Verdicts respected (success/fail override, exclude drops).
 
 ### Configuration
 
@@ -232,25 +225,14 @@ All hyperparameters live in [src/config.py](DCON/src/config.py). YAML in [config
 
 Key settings:
 - **Perception**: `target_query`, `iterations`, `device`.
-- **Habitat**: `scene_path`, `img_width`, `img_height`, `fov`, `sensor_height`.
-- **MaskCLIP**: `maskclip_model_name` ("ViT-B/16"), `maskclip_input_size` (448).
-- **Hash-grid training**: `hash_train_batch_size`, `hash_buffer_refresh_interval`, `hash_per_frame_cache_size`, `history_buffer_capacity`, `hash_feature_dim`.
+- **Habitat**: `scene_path`, `img_width`, `img_height`, `fov`, `sensor_height` (1.25 — DD-PPO's training camera height).
+- **Hash-grid training**: `hash_train_batch_size`, `hash_buffer_refresh_interval`, `hash_per_frame_cache_size`, `history_buffer_capacity`, `hash_feature_dim` (overridden to 1+K channels in pairwise mode).
 - **MPPI** (`planning:` YAML): `mppi_dt`, `mppi_max_v_mps`, `mppi_max_w_rps`, `mppi_horizon`, `mppi_num_iters`, `mppi_anneal_beta_action`, `mppi_anneal_beta_traj`, `mppi_w_goal`, `mppi_w_ig`, `mppi_lambda`, `mppi_collision_substeps`, `mppi_occupied_cell_cost` (goal-distance-field wall-crossing penalty), `mppi_unseen_cell_cost` (EXPLOIT-only unseen-cell penalty in the same field), and the confidence-hysteresis knobs (`mppi_conf_*`).
-- **Discrete actions** (`planning:` YAML): `discrete_actions` (off = continuous velocity; on = Habitat ObjectNav primitives via the tracking controller), `discrete_forward_m` (0.25), `discrete_turn_deg` (30), `discrete_lookahead_m` (0.5), `max_agent_steps` (500 primitive budget).
-- **Detection**: `detected_persistence`, `stop_distance_m`, `exploit_redetect_interval` (replans between detector runs once latched; `<=0` = never re-detect after latching). Detection-classification gates (each disables at `<=0`): `detected_min_box_frac` / `detected_max_box_frac` (box area as a fraction of the image) and `detected_min_dist_m` / `detected_max_dist_m` (agent→object distance, m) — *too close* (near OR fills the frame) is ignored, *too far* (distant OR tiny) investigates but doesn't latch, *usable band* latches.
+- **Discrete actions** (`planning:` YAML; SEARCH only): `discrete_actions` (off = continuous velocity; on = Habitat ObjectNav primitives via the tracking controller), `discrete_forward_m` (0.25), `discrete_turn_deg` (30, challenge convention — DD-PPO EXPLOIT uses its own `DDPPO_FORWARD_M`/`DDPPO_TURN_DEG` = 25 cm/10° constants in ddppo_policy.py), `discrete_lookahead_m` (0.5), `max_agent_steps` (500 primitive budget). `ddppo_checkpoint_path` points at the pretrained PointNav weights.
+- **Detection**: `detected_persistence`, `stop_distance_m` (also EXPLOIT's arrival check), `exploit_redetect_interval` (replans between detector runs once latched; `<=0` = never re-detect after latching). Detection-classification gates (each disables at `<=0`): `detected_min_box_frac` / `detected_max_box_frac` (box area as a fraction of the image) and `detected_min_dist_m` / `detected_max_dist_m` (agent→object distance, m) — *too close* (near OR fills the frame) is ignored, *too far* (distant OR tiny) investigates but doesn't latch, *usable band* latches.
 - **LLMDet**: `llmdet_model_name`, `llmdet_threshold`, `llmdet_use_sinks`, `llmdet_num_sinks`, `llmdet_sink_init` (see the LLMDet section above).
-- **Detection cascade**: `detector_cascade` (LocateAnything→LLMDet propose→verify; cuts look-alike FPs at ~2× SEARCH detector latency), `cascade_min_iou`, `locate_anything_model_name`, `locate_anything_max_new_tokens` (see the Object Detection section above).
+- **Pairwise field verification**: `clipseg_pairwise`, `clipseg_model_name`, `background_terms` + `distractor_objects` (the competing-class bank), `field_verify`, `field_verify_threshold` (margin gate, canonically 0.0), `field_verify_top_frac` / `field_verify_min_points` / `field_verify_pool`, `field_verify_presence_floor` (separate "is anything here" conjunct).
 - **Uncertainty masking** (`grid:` YAML section): `mask_free_epistemic` (zero epistemic/aleatoric at observed-FREE voxels — the field never trains on air, so free-air uncertainty is phantom noise over traversed rooms; also switches the uncertainty BEV reduction from bottom-k-mean to max-over-Y).
-
-## Testing
-
-MaskCLIP smoke tests:
-```bash
-cd DCON/src/mask_clip
-python test_masking.py     # Dense feature extraction
-python test_mask_class.py  # MaskCLIP class API
-```
-Both require sample images in `images/`; they generate heatmap + overlay visualizations.
 
 ## Common Development Tasks
 
@@ -269,9 +251,9 @@ Both require sample images in `images/`; they generate heatmap + overlay visuali
 - **Collision robustness**: `mppi_collision_substeps` (thin-wall tunneling checks).
 
 ### Debugging Semantic Grounding
-- Visualize MaskCLIP heatmaps: `src/mask_clip/test_mask_class.py`.
 - Check similarity BEV map: load saved `bev_similarity_*.npy` with `np.load()` + `plt.imshow()`.
 - Tweak query: `cfg.target_query` (favors "a [object]" phrasing for better CLIP grounding).
+- Inspect the distractor bank a run actually used: `<out>/run_meta.json` (query + deduped/filtered phrases).
 
 ### Adding Visualization
 - `src/visualization/visualizer.py` (matplotlib-based).
@@ -289,7 +271,7 @@ The RGB panel draws the accepted detector bbox (red) from the most-recent plan s
 
 1. **Coordinate Systems**: World space (Habitat / simulator) vs. BEV voxel indices (in grids); unprojection maps camera→world via depth + camera pose.
 2. **Evidential Uncertainty**: a single `EvidentialFeatureField` yields aleatoric + epistemic uncertainty from its Normal-Inverse-Gamma head in one forward pass — no ensemble.
-3. **Frozen Semantics**: MaskCLIP weights are static; the feature field learns *where* in 3D to render those embeddings.
+3. **Frozen Semantics**: CLIPSeg weights are static; the feature field learns *where* in 3D to render its per-prompt relevance channels.
 4. **Streaming Data**: Perception is online. The `_HistoryBuffer` keeps a bounded-memory snapshot of past observations; the `_latest_frame` oversample guarantees fresh data participates in every gradient step.
 5. **BEV Representation**: Plans operate in top-down (z, x) space; y is ignored for planning.
 6. **Receding Horizon**: MPPI computes an H-step plan, but only the first action of `U_opt` is executed before the next replan. `last_U` carries the rest forward as a warm-start.
@@ -298,8 +280,8 @@ The RGB panel draws the accepted detector bbox (red) from the most-recent plan s
 
 - **PyTorch** (CUDA 11.8+)
 - **Habitat-sim**: physics simulator, scene loading, agent control
-- **CLIP** (OpenAI): frozen vision-language model
-- **Transformers** (HuggingFace): the detectors — downloads `iSEE-Laboratory/llmdet_{tiny,base,large}` (MM-Grounding-DINO, native in transformers ≥4.52) on first use, plus `nvidia/LocateAnything-3B` (~7 GB, `trust_remote_code`) when `detector_cascade` is on.
+- **Transformers** (HuggingFace): downloads `iSEE-Laboratory/llmdet_{tiny,base,large}` (MM-Grounding-DINO, native in transformers ≥4.52) and `CIDAS/clipseg-rd64-refined` on first use.
+- **DD-PPO checkpoint**: `ddppo_weights/gibson-2plus-se-resneXt101-lstm1024.pth` (gitignored; `cfg.ddppo_checkpoint_path`) — loaded once per process (memoized).
 - **NumPy, Matplotlib, PIL, imageio, OpenCV**: data processing and visualization
 - See `requirements.txt` for pinned versions
 
@@ -312,7 +294,8 @@ CPU memory: ~500 MB for the `_HistoryBuffer` at default capacity (200k × 512-di
 - **Out-of-memory (CPU)**: reduce `history_buffer_capacity` (linear in feature-dim × capacity).
 - **NaN losses**: check input normalization (esp. CLIP embeddings); verify depth values are in `[min_sensor_dist, max_sensor_dist]`.
 - **Planner picks bad goals**: inspect the saved `bev_similarity_*.npy` peak; tweak `cfg.target_query` phrasing.
-- **Agent wedged / dwelling in corners**: every sampled rollout collides so `best_U=None` and the loop idles that replan (the survival-time weighting steers subsequent iterations out of the pocket). Check occupancy dilation (too aggressive seals narrow gaps) and `agent_radius` (the navmesh insets walls by it, so gaps the BEV considers open can be sealed in the navmesh).
+- **Agent wedged / dwelling in corners** (SEARCH): every sampled rollout collides so `best_U=None` and the loop idles that replan (the survival-time weighting steers subsequent iterations out of the pocket). Check `agent_radius` (the navmesh insets walls by it, so gaps the BEV considers open can be sealed in the navmesh).
+- **EXPLOIT turn-only stall** (DD-PPO spins without advancing): historically caused by (a) the turn-sign inversion in step_discrete (fixed — native semantics now), (b) 30° turns vs the 10° training convention (fixed — DDPPO_TURN_DEG), or (c) depth sensor-miss `0.0` blocks read as point-blank walls through Gibson mesh holes (fixed — misses remapped to far). If it recurs, dump the depth frame first.
 - **Trajectory video looks wrong**: check `grid_extent.json` matches the scene bounds and that `traj_log.jsonl` was written cleanly (one JSON per line).
 - **Never latches into EXPLOIT** (stuck exploring): the detection never reaches the *usable band*. Check the classification gates — widen `detected_max_dist_m` (object farther than the threshold only investigates, never latches), lower `detected_min_box_frac`, or raise `detected_max_box_frac`. Latching also needs `detected_persistence` consecutive usable-band frames (the score floor is the detector's own `llmdet_threshold`).
 - **Latches too eagerly / on the wrong thing**: tighten the band — lower `detected_max_dist_m` so it must get closer, raise `detected_min_box_frac` so tiny far blobs only investigate, or raise `detected_persistence`.

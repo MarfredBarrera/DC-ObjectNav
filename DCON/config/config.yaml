@@ -25,10 +25,8 @@ habitat:
   agent_radius: 0.02
   agent_height: 1.5
 
-# Semantics Settings (MaskCLIP)
+# Semantics Settings
 semantics:
-  maskclip_model_name: "ViT-B/16"
-  maskclip_input_size: 448
   target_query: "a pillow"
 
 # Training Settings
@@ -91,14 +89,12 @@ planning:
   # SR/SPL comparison with VLFM and Goal-Oriented Semantic Exploration.
   discrete_actions: false
   discrete_forward_m: 0.25       # MOVE_FORWARD displacement (challenge default)
-  # TURN_LEFT/RIGHT magnitude. EXPLOIT's DD-PPO policy is exclusively
-  # discrete-stepped (see main.py) and was trained with Habitat's PointNav
-  # TURN_ANGLE=10 deg (not the 30 deg ObjectNav-challenge convention) — the
-  # LSTM's implicit alignment behavior assumes 10 deg/action, so a 30 deg
-  # value here causes ~3x turn overshoot every action. Kept at 10 while
-  # EXPLOIT is DD-PPO-driven; only revisit toward 30 if `discrete_actions`
-  # is ever turned on for SEARCH too (they currently share this one field).
-  discrete_turn_deg: 10.0
+  # TURN_LEFT/RIGHT magnitude for the SEARCH tracking controller (challenge
+  # convention). DD-PPO's EXPLOIT stepping does NOT read this — it uses its
+  # own checkpoint-coupled 10 deg (DDPPO_TURN_DEG in ddppo_policy.py; the
+  # policy was trained at Habitat PointNav's TURN_ANGLE=10 and a 30 deg step
+  # caused ~3x turn overshoot every action).
+  discrete_turn_deg: 30.0
 
   discrete_lookahead_m: 0.5      # pure-pursuit lookahead along the MPPI path
   max_agent_steps: 500           # unused: no per-episode primitive timeout is enforced
@@ -108,8 +104,12 @@ detection:
   stop_distance_m: 0.75          # terminate within this distance of sim peak
   llmdet_threshold: 0.47         # LLMDet per-box score floor (tau); ~99% background-FP rejection w/ sinks
 
-  # Two-stage detection: LocateAnything-3B proposes, LLMDet (sink-gated) verifies.
-  # A frame counts only when both fire on the same region (IoU >= cascade_min_iou),
-  # cutting geometric-look-alike false positives at ~2x SEARCH detector latency.
-  detector_cascade: true
-  cascade_min_iou: 0.1
+  # Canonical verification arm (= detector_pairwise_field_maxj): the pairwise
+  # CLIPSeg field gates each sink-gated LLMDet box by the worst-case margin
+  # (query presence - hardest distractor presence, pooled over the top-frac
+  # in-box cells) clearing 0.0 — the tuning-free max-Youden-J point.
+  clipseg_pairwise: true
+  field_verify: true
+  field_verify_threshold: 0.0
+  field_verify_presence_floor: 0.0
+  field_verify_top_frac: 0.10

@@ -17,3 +17,8 @@ gibson_scenes/
 versioned_data/
 episodes/
 scene_datasets/
+
+# Python bytecode
+__pycache__/
+*.pyc
+ddppo_weights/

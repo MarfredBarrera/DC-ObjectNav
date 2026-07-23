@@ -1,3 +1,46 @@
+# Handoff: codebase cleanup sweep (2026-07-23, done)
+
+Committed in two commits: a **checkpoint commit** (`Checkpoint before cleanup
+sweep`) snapshotting the full pre-cleanup working state — everything deleted
+below is recoverable from it — followed by the cleanup itself. Canonical
+system going forward: **pairwise CLIPSeg field, maxj operating point
+(τ_margin = 0.0) + τ0.47 sink-gated LLMDet + DD-PPO EXPLOIT**; the canonical
+detection arm is now also baked into base `config/config.yaml` (which had a
+leftover `detector_cascade: true`).
+
+Deleted (per user sign-off): the A* EXPLOIT cluster (`exploit_astar_action`,
+`nearest_free_cell`, `astar_free`, `get_2d_map_dilated`); the
+LocateAnything→LLMDet cascade + `CLIPSegDetector` + their config fields;
+the whole `src/mask_clip/` package + `MaskCLIPSemantics` + `maskclip_*`
+config; the contrastive (sigmoid×softmax-share) CLIPSeg mode +
+`clipseg_softmax_temp`; the per-target LLM distractor generator
+(`distractor_gen.py` is now just background + static confusers, no Qwen, no
+fallback); `benchmarks/evaluate.py`; `tools/rgb_probe_calibration.py` +
+`tools/calibrate_field_verify.py`; all superseded sweep agent-configs (only
+`detector_pairwise_field_maxj` + `agent_ovon_stretch` remain); 74 tracked
+`.pyc` files (now gitignored). ~50 untracked scratch analysis scripts/logs
+were archived to `~/dcon_scratch_2026-07-23.tar.gz` and removed; their
+capabilities were consolidated into **`tools/analyze_runs.py`** (progress,
+common-set SR/SPL comparison, per-category/scene tables, FP / never-latched /
+near-target failure attribution with tail classification) — verified against
+the maxj-vs-jul4 250-episode data.
+
+Refactors in the same sweep: `step_discrete` is now always NATIVE Habitat
+semantics with per-call magnitudes (the MPPI tracking controller applies
+`mppi_w_sign` at the source; DD-PPO passes `DDPPO_FORWARD_M`/`DDPPO_TURN_DEG`
+= 25 cm/10° from `ddppo_policy.py`); `discrete_turn_deg` is back to the 30°
+challenge convention (the 10°-vs-30° latent conflict below is resolved);
+the DD-PPO checkpoint load is memoized per process; the distractor-vocab
+metadata moved from a `meta` line in `traj_log.jsonl` to a `run_meta.json`
+sidecar (visualize.py's skip-guard reverted); dead `deterministic`/argmax
+path removed from the policy (sampling is mandatory — argmax was the
+confirmed 2-cycle lock). CLAUDE.md rewritten to match. NOTE: the DD-PPO
+handoff below predates this sweep — its next-step #2 (debug scaffolding
+removal) was already done, and file references to deleted code are
+historical.
+
+---
+
 # Handoff: DD-PPO EXPLOIT navigation (2026-07-22/23, in progress)
 
 **Uncommitted.** This work package replaces the previous handoff's newest

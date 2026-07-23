@@ -80,21 +80,16 @@ class PerceptionStack:
         # pixel signal is much cleaner, especially before the target has been
         # well-observed. See CLIPSegSemantics docstring.
         # Distractor vocabulary: the generic `background_terms` bank plus the
-        # object confusers (a per-target LLM set when `llm_distractors` is on,
-        # else the static `distractor_objects`). Assembled once here, before
-        # the field/buffer claim GPU memory (the LLM path frees itself first).
+        # static `distractor_objects` confusers, assembled once here.
         # `filter_distractors` inside CLIPSegSemantics still strips any phrase
         # sharing a content word with the query as a safety net.
-        distractors = None
-        if cfg.clipseg_contrastive or cfg.clipseg_pairwise:
-            distractors = build_distractor_vocabulary(cfg.target_query, cfg)
+        distractors = (build_distractor_vocabulary(cfg)
+                       if cfg.clipseg_pairwise else None)
         self.semantics = CLIPSegSemantics(
             query=cfg.target_query,
             device=self.device,
             model_name=cfg.clipseg_model_name,
             distractors=distractors,
-            softmax_temp=cfg.clipseg_softmax_temp,
-            pairwise=cfg.clipseg_pairwise,
         )
         # Pairwise mode: the field regresses one sigmoid channel per term
         # ([query] + the per-query filtered distractors), so the feature dim

@@ -10,21 +10,18 @@
 #   - a generic BACKGROUND bank (cfg.background_terms: a wall, the floor, ...),
 #     the negative prompts that turn "target-like?" into a relevancy score and
 #     absorb the structurally-high background level, and
-#   - structurally-similar OBJECT confusers (cfg.distractor_objects here; the
-#     detector_pairwise_field_llm arm swaps in a per-target LLM set) — the
+#   - structurally-similar OBJECT confusers (cfg.distractor_objects) — the
 #     look-alikes that drive the dominant FP mode.
 #
 # τ = 0.0 is the tuning-free anchor (max-Youden-J on the calib set, and the
 # pairwise FP-margin mean is negative so 0.0 needs no per-scene calibration).
 # It is calibrated against THIS distractor bank — a materially different bank
-# (or turning on llm_distractors) warrants re-sweeping the margin threshold.
+# warrants re-sweeping the margin threshold.
 detection:
   llmdet_threshold: 0.47
-  detector_cascade: false
   field_verify: true
   field_verify_threshold: 0.0
   field_verify_presence_floor: 0.0
   field_verify_top_frac: 0.10
   clipseg_pairwise: true
-  clipseg_contrastive: false
   field_verify_save_frames: false

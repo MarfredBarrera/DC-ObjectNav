@@ -43,18 +43,10 @@ from src.perception.obj_detection import make_detector
 from src.perception.perception_stack import PerceptionStack
 from src.perception.utils import unprojection
 from src.planning.mppi import MPPIPlanner
-from src.planning.utils import nearest_free_cell, astar_free
-from src.planning.ddppo_policy import load_ddppo_policy, DDPPONavigator
+from src.planning.ddppo_policy import (
+    load_ddppo_policy, DDPPONavigator, DDPPO_FORWARD_M, DDPPO_TURN_DEG,
+)
 from tools.visualize import render_navigation
-
-# Habitat's fixed DD-PPO training convention (habitat/config/default.py):
-# SIMULATOR.DEPTH_SENSOR.{MIN_DEPTH,MAX_DEPTH} = 0.0, 10.0. Independent of our
-# own cfg.min_sensor_dist/max_sensor_dist (which happen to match, but
-# shouldn't be relied on to stay in sync with a pretrained checkpoint's
-# training-time normalization).
-DDPPO_MIN_DEPTH_M = 0.0
-DDPPO_MAX_DEPTH_M = 10.0
-
 
 REPLAN_INTERVAL = 100
 
@@ -97,8 +89,13 @@ def discrete_action_from_plan(opt_path, heading, cfg):
     dtheta = (desired - heading + np.pi) % (2 * np.pi) - np.pi
     turn_thresh = np.radians(cfg.discrete_turn_deg / 2.0)
     if abs(dtheta) > turn_thresh:
-        # grid θ increases for "turn_left" (matches SimInterface.step_discrete).
-        return "turn_left" if dtheta > 0 else "turn_right"
+        # dtheta > 0 means "increase grid θ". step_discrete takes NATIVE
+        # Habitat turn names, so map the grid-θ turn direction onto Habitat
+        # yaw here via mppi_w_sign (the same sign the continuous `step`
+        # applies to ω).
+        grid_left = dtheta > 0
+        native_left = grid_left if cfg.mppi_w_sign >= 0 else not grid_left
+        return "turn_left" if native_left else "turn_right"
     return "move_forward"
 
 
@@ -112,9 +109,9 @@ def continuous_action_from_plan(opt_path, heading, cfg):
     convergence tail (speed shrinks with remaining distance, so the last few
     centimeters can take arbitrarily many replans to close) for no benefit,
     once arrival is judged by a fixed real-world radius around the goal cell
-    (see `exploit_astar_action`) rather than exact grid-cell equality. Bang-bang
-    on the speed axis — full speed once aligned, zero while turning — reaches
-    that fixed radius in a bounded number of replans instead.
+    rather than exact grid-cell equality. Bang-bang on the speed axis — full
+    speed once aligned, zero while turning — reaches that fixed radius in a
+    bounded number of replans instead.
 
     Same pure-pursuit lookahead as `discrete_action_from_plan`: walk along the
     path to the first waypoint >= `cfg.discrete_lookahead_m` ahead (or the
@@ -469,75 +466,6 @@ def plan_one_action(perception, sim_iface, mppi, cfg,
     return action_queue.popleft(), opt_path, goal, box_goal
 
 
-def exploit_astar_action(perception, sim_iface, cfg, goal_projected, dilate_radius):
-    """A* navigation to the latched goal during EXPLOIT (MPPI is bypassed).
-
-    Simplification of the EXPLOIT control: once the detection has latched, drop
-    the stochastic MPPI optimizer entirely and drive a deterministic A* path to
-    the target. The detector-projected goal cell (`goal_projected`, cached from
-    the sighting that latched) is snapped to the nearest observed-FREE cell
-    reachable from the agent (`nearest_free_cell`), and A* plans a path through
-    observed-free cells only (`astar_free`) — never through unseen or occupied
-    space.
-
-    Agent-width clearance: `dilate_radius` (cells) grows every obstacle by the
-    agent's actual footprint before planning, so the path never threads a gap
-    narrower than the agent itself — see `exploit_dilate_radius` at the call
-    site (main loop) for how it's sized (no forced minimum; 0 cells for an
-    agent much smaller than one voxel). Planning runs on this single dilated
-    map only — no raw-occupancy fallback. If it yields no path, that's treated
-    as "no route yet" (spin to observe more floor) rather than silently
-    replanning with less clearance than the agent needs.
-
-    Returns (action, opt_path, goal_cell, reached):
-      action    : a continuous [v, w] / discrete primitive tracking the path,
-                  an in-place rotate when no free path exists yet (spin to
-                  observe more floor), or None once arrived (STOP).
-      opt_path  : the A* grid path (list of (z, x)) for logging, or None.
-      goal_cell : the snapped free goal cell, or None if none is reachable yet.
-      reached   : True only once the agent's own cell IS the free goal cell —
-                  the agent must stand in the nearest free cell to the target,
-                  no arrival tolerance. Grid-index equality was brittle when
-                  paired with the earlier braking controller (which only
-                  asymptotically closed the last few centimeters, so it could
-                  hover just outside the cell forever); it is not brittle here,
-                  because `continuous_action_from_plan` drives at constant full
-                  speed with no deceleration, so it enters the target cell
-                  within a bounded number of replans instead of approaching it
-                  asymptotically.
-    """
-    def _spin():
-        if cfg.discrete_actions:
-            return "turn_right"
-        return [0.0, -cfg.mppi_w_sign * cfg.mppi_max_w_rps]
-
-    sg = perception.similarity_grid
-    pos = sim_iface.agent_position
-    heading = get_agent_heading(sim_iface.agent)
-    start_cell = world_to_grid(pos[0], pos[2], sg, cfg.voxel_resolution)
-
-    bev_occ = _to_numpy(perception.occupancy_grid.get_2d_map_dilated(radius=dilate_radius))
-    goal_cell = nearest_free_cell(bev_occ, goal_projected, start_cell)
-    if goal_cell is None:
-        # No reachable observed-free cell yet — rotate in place to map floor.
-        return _spin(), None, None, False
-
-    if (int(start_cell[0]), int(start_cell[1])) == goal_cell:
-        return None, [goal_cell], goal_cell, True
-
-    path = astar_free(bev_occ, start_cell, goal_cell)
-    if not path:
-        return _spin(), None, goal_cell, False
-
-    if cfg.discrete_actions:
-        action = discrete_action_from_plan(path, heading, cfg)
-    else:
-        action = continuous_action_from_plan(path, heading, cfg)
-    if action is None:
-        return _spin(), path, goal_cell, False
-    return action, path, goal_cell, False
-
-
 def nearest_goal_point(goal, p):
     """World xyz of the point of `goal` closest (in the x-z plane) to point `p`.
 
@@ -708,22 +636,17 @@ def run(cfg: Config, save_enabled: bool = True,
     traj_log_path = os.path.join(cfg.output_dir, "traj_log.jsonl")
     open(traj_log_path, 'w').close()  # truncate / create fresh
 
-    # Auditability: stash the distractor vocabulary the pairwise/contrastive
-    # field actually used on the FIRST traj_log line (a `meta` record, no
-    # `step` — consumers skip it) so a completed run records its distractors
-    # without a disk cache. With greedy LLM decoding this is reproducible; the
-    # log makes it inspectable across model-version changes. Empty when the
-    # field isn't running distractors (plain sigmoid mode).
-    _distractors = list(getattr(perception.semantics, 'distractors', []) or [])
-    print(f"[main] field distractors ({len(_distractors)}, "
-          f"{'llm' if cfg.llm_distractors else 'static'}): {_distractors}")
-    with open(traj_log_path, 'a') as _f:
-        _f.write(json.dumps({
-            'meta': 'distractors',
+    # Auditability: record the distractor vocabulary the pairwise field
+    # actually used in a metadata sidecar (like grid_extent.json), keeping
+    # traj_log.jsonl homogeneous per-step records. Empty when the field isn't
+    # running distractors (plain sigmoid mode).
+    _distractors = list(perception.semantics.distractors)
+    print(f"[main] field distractors ({len(_distractors)}): {_distractors}")
+    with open(os.path.join(cfg.output_dir, "run_meta.json"), 'w') as _f:
+        json.dump({
             'query': perception.target_query,
-            'source': 'llm' if cfg.llm_distractors else 'static',
             'distractors': _distractors,
-        }) + '\n')
+        }, _f)
 
     # 5. Main loop
     print(f"[main] running for {cfg.iterations} iterations "
@@ -839,11 +762,11 @@ def run(cfg: Config, save_enabled: bool = True,
             #         last_box_goal = None
 
             # Control split by mode:
-            #   EXPLOIT (latched) → drop MPPI entirely and drive a deterministic
-            #     A* path to the target through observed-free cells only
-            #     (exploit_astar_action). The A* remaining-path length is the
-            #     sole stop signal — the agent ends only when it reaches the
-            #     free goal cell nearest the detector-projected target.
+            #   EXPLOIT (latched) → drop MPPI entirely and let DD-PPO drive
+            #     toward the cached detection goal one Habitat primitive per
+            #     replan. The sole stop signal is the Euclidean
+            #     cfg.stop_distance_m check against the raw goal (DD-PPO's own
+            #     trained STOP is disregarded — see the branch below).
             #   SEARCH → the MPPI planner, exactly as before.
             stop_now = False
             if detected:
@@ -862,17 +785,9 @@ def run(cfg: Config, save_enabled: bool = True,
                 perception.update_occupancy(depth_cur, c2w_cur, sim_iface.intrinsics)
                 goal_src = last_box_goal
                 if goal_src is None:
-                    # Degenerate (should not happen post-latch): fall back to the
-                    # global similarity argmax over observed cells.
-                    bev_sim = _to_numpy(perception.similarity_grid.get_2d_map())
-                    bev_occ = _to_numpy(perception.occupancy_grid.get_2d_map())
-                    if bev_sim is not None and bev_occ is not None:
-                        sim_obs = bev_sim.astype(np.float32).copy()
-                        sim_obs[bev_occ == 0] = -np.inf
-                        if np.any(np.isfinite(sim_obs)):
-                            fi = int(np.argmax(sim_obs))
-                            goal_src = (fi // sim_obs.shape[1], fi % sim_obs.shape[1])
-                if goal_src is None:
+                    # Degenerate (should not happen post-latch — latching
+                    # implies a cached box-goal): idle this replan; the next
+                    # one re-checks.
                     action, opt_traj, goal_cell = None, None, None
                 else:
                     goal_cell = (int(goal_src[0]), int(goal_src[1]))
@@ -904,8 +819,8 @@ def run(cfg: Config, save_enabled: bool = True,
                               f"dist={dist_to_goal_m:.2f}m)")
                     else:
                         ddppo_action = ddppo_nav.act(
-                            _to_numpy(depth_cur), DDPPO_MIN_DEPTH_M, DDPPO_MAX_DEPTH_M,
-                            pos, sim_iface.agent.get_state().rotation, goal_world)
+                            _to_numpy(depth_cur), pos,
+                            sim_iface.agent.get_state().rotation, goal_world)
                         # DD-PPO's own "stop" is disregarded (see above) — if
                         # it fires before our distance check does, just idle
                         # this replan and let the next one re-check distance.
@@ -944,10 +859,16 @@ def run(cfg: Config, save_enabled: bool = True,
                 # TURN_RIGHT), independent of cfg.discrete_actions (which only
                 # governs SEARCH's continuous-vs-discrete MPPI tracking).
                 if mode == 'EXPLOIT' or cfg.discrete_actions:
-                    # native=True for EXPLOIT: DD-PPO's turn_left/turn_right are
-                    # Habitat's own native action space, not the MPPI tracking
-                    # controller's grid-θ convention (see step_discrete).
-                    sim_iface.step_discrete(action, native=(mode == 'EXPLOIT'))
+                    if mode == 'EXPLOIT':
+                        # DD-PPO's actions are Habitat-native; magnitudes are
+                        # the checkpoint's training convention (25 cm / 10°),
+                        # NOT cfg.discrete_* (the ObjectNav-challenge
+                        # 25 cm / 30° used by SEARCH's tracking controller).
+                        sim_iface.step_discrete(action,
+                                                forward_m=DDPPO_FORWARD_M,
+                                                turn_deg=DDPPO_TURN_DEG)
+                    else:
+                        sim_iface.step_discrete(action)
                     agent_steps += 1
                     action_str = f"{action} ({agent_steps}/{cfg.max_agent_steps})"
                 else:
@@ -969,9 +890,10 @@ def run(cfg: Config, save_enabled: bool = True,
                       f"goal: {goal_str} | w_conf: {w_conf:.2f} | "
                       f"mode: {mode}")
 
-            # `stop_now` was set above (EXPLOIT A* arrival is the sole stop
-            # signal; SEARCH never self-stops). The traj_log write below runs
-            # first so the final replan is captured for visualization.
+            # `stop_now` was set above (EXPLOIT's stop_distance_m arrival check
+            # is the sole stop signal; SEARCH never self-stops). The traj_log
+            # write below runs first so the final replan is captured for
+            # visualization.
             with open(traj_log_path, 'a') as _f:
                 _f.write(json.dumps({
                     'step': step,

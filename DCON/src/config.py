@@ -12,7 +12,7 @@ class Config:
         'habitat': ['scene_path', 'img_width', 'img_height', 'fov',
                     'sensor_height', 'min_sensor_dist', 'max_sensor_dist',
                     'agent_radius', 'agent_height', 'max_spawn_snap_m'],
-        'semantics': ['maskclip_model_name', 'maskclip_input_size', 'target_query'],
+        'semantics': ['target_query'],
         'training': ['iterations', 'device'],
         'hashgrid': {
             'n_levels': 'hash_n_levels',
@@ -55,14 +55,9 @@ class Config:
                       'sink_special_str', 'llmdet_model_name',
                       'llmdet_threshold', 'llmdet_use_sinks',
                       'llmdet_num_sinks', 'llmdet_sink_init',
-                      'detector_cascade', 'locate_anything_model_name',
-                      'locate_anything_max_new_tokens', 'cascade_min_iou',
-                      'clipseg_model_name', 'clipseg_threshold',
+                      'clipseg_model_name',
                       'background_terms', 'distractor_objects',
-                      'llm_distractors', 'llm_distractor_model',
-                      'llm_distractor_count',
-                      'clipseg_contrastive',
-                      'clipseg_softmax_temp', 'clipseg_pairwise',
+                      'clipseg_pairwise',
                       'field_verify', 'field_verify_threshold',
                       'field_verify_presence_floor',
                       'field_verify_top_frac', 'field_verify_min_points',
@@ -106,11 +101,8 @@ class Config:
         # against the wrong floor's geometry for the full step budget.
         self.max_spawn_snap_m = 1.0
 
-        # Semantics Settings. MaskCLIP is no longer the default feature-field
-        # supervisor (see clipseg_model_name / PerceptionStack) -- kept here
-        # for comparison/recovery, not wired in by default.
-        self.maskclip_model_name = "ViT-B/16"
-        self.maskclip_input_size = 448
+        # Semantics Settings (dense supervision comes from CLIPSeg — see
+        # clipseg_model_name under Detection and CLIPSegSemantics).
         self.target_query = "green plant"
 
         # Training Settings
@@ -239,8 +231,12 @@ class Config:
         # (exhausting it without self-stopping = timeout = failure); turns and
         # forwards both count, matching the Habitat ObjectNav challenge.
         self.discrete_actions = False
+        # 25 cm / 30° is the ObjectNav-challenge convention. These govern ONLY
+        # the SEARCH tracking controller — DD-PPO's EXPLOIT stepping uses its
+        # own checkpoint-coupled magnitudes (DDPPO_FORWARD_M / DDPPO_TURN_DEG
+        # in src/planning/ddppo_policy.py, 25 cm / 10°).
         self.discrete_forward_m = 0.25
-        self.discrete_turn_deg = 10.0
+        self.discrete_turn_deg = 30.0
         self.discrete_lookahead_m = 0.5
         self.max_agent_steps = 500
 
@@ -324,8 +320,7 @@ class Config:
 
         # The distractor vocabulary is the bank of COMPETING relevancy classes
         # for the pairwise CLIPSeg field (`clipseg_pairwise`, the chosen
-        # verification method) and the older contrastive target
-        # (`clipseg_contrastive`). It has two parts, assembled by
+        # verification method). It has two parts, assembled by
         # src.perception.distractor_gen.build_distractor_vocabulary:
         #
         #   1. `background_terms` — generic scene-background phrases (wall,
@@ -344,9 +339,9 @@ class Config:
         #      query. Same-material siblings (a bathtub/sink for a toilet) are
         #      deliberately EXCLUDED — a real target scores high on them too, so
         #      they collapse the margin and kill recall (empirically toilet SR
-        #      82%->64%). Either the static `distractor_objects` list below (one
-        #      list for every query) or, when `llm_distractors` is on, a
-        #      per-target LLM-generated set that applies the same exclusion.
+        #      82%->64%). The static `distractor_objects` list below (one list
+        #      for every query; a per-target LLM-generated variant existed and
+        #      was removed — see git history).
         #
         # Adding competitors lowers true-target margins, so
         # `field_verify_threshold` is calibrated against this vocabulary (see
@@ -366,68 +361,28 @@ class Config:
             "a chair", "a couch", "a bed", "a potted plant", "a toilet",
             "a tv", "a table", "a cabinet", "a bench", "a trash can",
         ]
-        # Per-target LLM distractor vocabulary (src/perception/distractor_gen.py).
-        # The static `distractor_objects` above is one list for every query; a
-        # per-target set is sharper (the distinct-material confusers for a
-        # toilet — an armchair, a trash can, a cabinet — differ from those for a
-        # tv, and it drops the porcelain siblings). When `llm_distractors` is
-        # on, a local Qwen instruct model generates the object-confuser set once
-        # at run start (visually-similar, distinct-material look-alikes across
-        # categories), the `background_terms` bank is prepended,
-        # and the LLM is freed before the feature field trains. Off => use the
-        # static list. `distractor_objects` stays the always-available fallback
-        # (LLM load/parse failure) — do not delete it.
-        self.llm_distractors = False
-        self.llm_distractor_model = "Qwen/Qwen2.5-7B-Instruct"
-        self.llm_distractor_count = 10
-        self.clipseg_contrastive = False
-        self.clipseg_softmax_temp = 1.0
-
-        # Pairwise-logit CLIPSeg field (`clipseg_pairwise`): instead of
-        # collapsing the contrast into a scalar at supervision time
-        # (`clipseg_contrastive`'s sigmoid x softmax-share, whose share is
-        # structurally lower for sibling-crowded categories and depends on
-        # distractor count), the field regresses one sigmoid CHANNEL PER TERM
-        # ([query] + filtered `distractor_objects`; hash_feature_dim is
+        # Pairwise-logit CLIPSeg field (`clipseg_pairwise`, the canonical
+        # verification method): the field regresses one sigmoid CHANNEL PER
+        # TERM ([query] + filtered `distractor_objects`; hash_feature_dim is
         # overridden to 1+K at PerceptionStack init). Contrast happens at
         # VERIFY time on the multi-view-converged channels: field-verify pools
         # the top-frac in-box cells selected by the QUERY channel, reads every
         # channel at those same cells, and scores the box by the worst-case
-        # margin  presence_q - max_i presence_i  (margin-of-means, not the
-        # reverted 2026-07 mean-of-margins scalar target). `field_score` IS
-        # that margin in this mode — it lives in [-1, 1], so a log-only
-        # calibration gate needs field_verify_threshold <= -1.0, not 0.0.
-        # `field_verify_presence_floor` is a separate "is anything here"
-        # conjunct on the query channel (0.0 disables): margin answers
+        # margin  presence_q - max_i presence_i  (margin-of-means; the earlier
+        # contrastive sigmoid-x-softmax-share scalar target and the 2026-07
+        # mean-of-margins scalar target were both removed — git history).
+        # `field_score` IS that margin in this mode — it lives in [-1, 1], so
+        # a log-only calibration gate needs field_verify_threshold <= -1.0,
+        # not 0.0. `field_verify_presence_floor` is a separate "is anything
+        # here" conjunct on the query channel (0.0 disables): margin answers
         # "more couch than bed?", the floor answers "couch-like at all?" —
         # kept separate so the two scales stay decoupled.
-        # Mutually exclusive with clipseg_contrastive (pairwise wins).
         self.clipseg_pairwise = False
         self.field_verify_presence_floor = 0.0
 
-        # Two-stage detection (see CascadeDetector in obj_detection.py). When
-        # `detector_cascade` is True, NVIDIA LocateAnything-3B proposes a box
-        # and LLMDet verifies it: a frame counts as a detection only when a
-        # sink-gated LLMDet box (>= llmdet_threshold) overlaps the proposal with
-        # IoU >= `cascade_min_iou`. Two architecturally-different detectors
-        # agreeing on the same region removes the geometric-look-alike false
-        # positives LLMDet's sinks are structurally blind to, at ~2x SEARCH
-        # detector latency and some recall. `cascade_min_iou <= 0` drops the
-        # spatial check (both-fired only). LocateAnything-3B is a ~7GB download.
-        self.detector_cascade = False
-        self.locate_anything_model_name = "nvidia/LocateAnything-3B"
-        self.locate_anything_max_new_tokens = 128
-        self.cascade_min_iou = 0.1
-
-        # CLIPSegDetector (src/perception/obj_detection.py): a segmentation-
-        # based verifier candidate, not yet wired into the cascade. Frozen CLIP
-        # + a small trained decoder over a text prompt -> dense activation map;
-        # architecturally unlike both LLMDet and LocateAnything, so its FPs are
-        # plausibly uncorrelated. Threshold is un-calibrated (no sweep done
-        # yet, unlike llmdet_threshold's 60-frame sweep) -- treat 0.5 as a
-        # placeholder until validated.
+        # CLIPSeg model powering CLIPSegSemantics (the pairwise relevance
+        # field's per-pixel supervision signal — see semantics.py).
         self.clipseg_model_name = "CIDAS/clipseg-rd64-refined"
-        self.clipseg_threshold = 0.5
 
         # Field verification of detections (main.py detect_classify_latch):
         # when a detector box fires, unproject its valid-depth pixels to 3D,
