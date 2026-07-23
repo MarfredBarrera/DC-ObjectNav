@@ -22,7 +22,6 @@ class Config:
             'per_level_scale': 'hash_per_level_scale',
             'n_neurons': 'hash_n_neurons',
             'n_hidden_layers': 'hash_n_hidden_layers',
-            'feature_dim': 'hash_feature_dim',
             'lr': 'hash_lr',
             'train_batch_size': 'hash_train_batch_size',
             'inference_batch_size': 'hash_inference_batch_size',
@@ -119,9 +118,11 @@ class Config:
         # HashGrid MLP
         self.hash_n_neurons = 128
         self.hash_n_hidden_layers = 3
-        # Scalar CLIPSeg relevance score, not a MaskCLIP embedding (see
-        # CLIPSegSemantics / PerceptionStack) -- the field regresses a single
-        # query-conditioned score per 3D point.
+        # DERIVED, not configurable (deliberately absent from _YAML_SCHEMA):
+        # the field regresses one sigmoid channel per CLIPSeg prompt, so
+        # PerceptionStack.__init__ overwrites this with 1 + len(distractors)
+        # before the field/grids/buffer are sized. This default is only the
+        # value before that runs (query channel alone).
         self.hash_feature_dim = 1
 
         # HashGrid Training
@@ -131,7 +132,7 @@ class Config:
         self.hash_buffer_refresh_interval = 200
         self.hash_per_frame_cache_size = 8192*4
         # Flat history buffer: bounded ring of (pt, feat) rows. Memory cost is
-        # capacity * (3 + hash_feature_dim) * 4 bytes (~8MB at 500k & scalar feature_dim=1).
+        # capacity * (3 + hash_feature_dim) * 4 bytes (~40MB at 500k & 17 channels).
         self.history_buffer_capacity = 500_000
 
         # Grid

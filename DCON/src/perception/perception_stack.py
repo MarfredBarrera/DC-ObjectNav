@@ -91,17 +91,18 @@ class PerceptionStack:
             model_name=cfg.clipseg_model_name,
             distractors=distractors,
         )
-        # Pairwise mode: the field regresses one sigmoid channel per term
-        # ([query] + the per-query filtered distractors), so the feature dim
-        # is only known after filter_distractors ran. Override before the
-        # field/buffer are sized. K can hit 0 if every distractor shares a
-        # word with the query — then pairwise degenerates to the plain
-        # sigmoid field (margin falls back to presence at verify time).
-        if cfg.clipseg_pairwise:
-            cfg.hash_feature_dim = 1 + len(self.semantics.distractors)
-            print(f"[PerceptionStack] pairwise field: hash_feature_dim -> "
-                  f"{cfg.hash_feature_dim} (query + {len(self.semantics.distractors)} "
-                  f"distractor channels)")
+        # The field regresses one sigmoid channel per CLIPSeg prompt, so its
+        # feature dim is DERIVED here — never configured. It is knowable only
+        # now, after filter_distractors has dropped the phrases sharing a
+        # content word with this run's query. Plain sigmoid mode → 1 (query
+        # only); pairwise → 1 + K. K can hit 0 if every distractor shares a
+        # word with the query — then pairwise degenerates to the plain sigmoid
+        # field (margin falls back to presence at verify time). Must precede
+        # the field/grid/buffer construction below, which all size off it.
+        cfg.hash_feature_dim = 1 + len(self.semantics.distractors)
+        print(f"[PerceptionStack] field channels: hash_feature_dim = "
+              f"{cfg.hash_feature_dim} (query + "
+              f"{len(self.semantics.distractors)} distractors)")
         # Single evidential field: aleatoric + epistemic uncertainty in one
         # forward pass via the Normal-Inverse-Gamma marginal (replaces the
         # ensemble whose only role was empirical epistemic from prediction var).

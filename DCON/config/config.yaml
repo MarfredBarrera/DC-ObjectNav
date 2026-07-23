@@ -46,8 +46,9 @@ hashgrid:
   # MLP Architecture
   n_neurons: 128
   n_hidden_layers: 3
-  # Scalar CLIPSeg relevance score, not a MaskCLIP embedding.
-  feature_dim: 1
+  # NOTE: the field's output width is NOT configured here — PerceptionStack
+  # derives hash_feature_dim as 1 + len(distractors) (one sigmoid channel per
+  # CLIPSeg prompt) once filter_distractors has run against this run's query.
 
   # Training
   lr: 0.001
