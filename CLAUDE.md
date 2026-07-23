@@ -25,17 +25,25 @@ DCON/
 │   │   ├── semantics.py       # CLIPSegSemantics: per-pixel relevance channels (query + distractors)
 │   │   ├── distractor_gen.py  # Distractor vocabulary (background terms + object confusers)
 │   │   ├── obj_detection.py   # LLMDet detector (MM-Grounding-DINO + attention sinks)
+│   │   ├── detection.py       # DetectionGate: box→3D, field-verify, classify, EXPLOIT latch
 │   │   └── utils.py           # Unprojection and coordinate utilities
 │   ├── planning/              # Motion planning
 │   │   ├── mppi.py            # MPPI stochastic trajectory optimization (DIAL annealing) — SEARCH
-│   │   ├── ddppo_policy.py    # Vendored DD-PPO PointNav policy + DDPPONavigator — EXPLOIT
+│   │   ├── search.py          # plan_search_action: goal selection + MPPI replan — SEARCH
+│   │   ├── exploit.py         # ExploitController: DD-PPO approach + arrival check — EXPLOIT
+│   │   ├── ddppo_policy.py    # Vendored DD-PPO PointNav policy + DDPPONavigator
+│   │   ├── tracking.py        # Pure-pursuit path → one Habitat primitive (SEARCH discrete mode)
 │   │   └── utils.py           # FOV-raycast information-gain, goal_distance_field, reachable_min
+│   ├── episode/               # Per-episode plumbing for main.run()
+│   │   ├── recorder.py        # EpisodeRecorder: everything written to cfg.output_dir
+│   │   ├── scoring.py         # Geodesic success + SPL (nearest_goal_point, score_episode)
+│   │   └── control.py         # EarlyStop: Ctrl-C / STOP-sentinel graceful termination
 │   ├── habitat/               # Habitat-sim integration
-│   │   ├── habitat_utils.py   # Scene init, pathfinding, geodesic_distance
-│   │   └── sim_interface.py   # Robot control interface
+│   │   ├── habitat_utils.py   # Scene init, spawn (start_episode), pathfinding, geodesic_distance
+│   │   └── sim_interface.py   # Robot control interface (step, step_discrete, agent_heading)
 │   └── visualization/         # Plotting helpers (visualizer.py)
 │
-├── main.py                    # Primary entry: live perception + planning + execution loop (run())
+├── main.py                    # Primary entry: the three-cadence live loop (run())
 ├── benchmarks/
 │   ├── eval_scene.py          # Per-scene sweep CLI: run / review / report stages (thin over eval_core)
 │   ├── eval_core.py           # Eval logic (torch-free): scenarios, verdicts, aggregation, BEV evidence
@@ -65,7 +73,14 @@ DCON/
 
 ### `main.py` — the live loop
 
-The primary entry point. Three cadences in one process:
+The primary entry point, and only the loop driver: it owns the three cadences,
+the mode switch, and the per-replan log line. Each stage it calls lives in its
+own module — detection + latch in [`src/perception/detection.py`](DCON/src/perception/detection.py),
+SEARCH in [`src/planning/search.py`](DCON/src/planning/search.py), EXPLOIT in
+[`src/planning/exploit.py`](DCON/src/planning/exploit.py), evidence/scoring/early-stop
+in [`src/episode/`](DCON/src/episode/), scene setup in `habitat_utils.start_episode`.
+
+Three cadences in one process:
 
 | Cadence | Step trigger | Cost |
 |--------|--------------|------|
@@ -111,11 +126,11 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
 - **Warm-start**: previously committed control sequence is shifted left by one step at the start of each replan.
 - **Sample 0 pinned to zero noise** so the unmutated warm-start is always evaluated.
 
-**Continuous→discrete action mode** (`cfg.discrete_actions`, default off; governs SEARCH only — EXPLOIT is always discrete-stepped by DD-PPO regardless): MPPI stays continuous, but a low-level **tracking controller** ([`discrete_action_from_plan`](DCON/main.py)) converts each replan's optimized path into ONE Habitat ObjectNav primitive — MOVE_FORWARD (`discrete_forward_m`=0.25 m), TURN_LEFT/RIGHT (`discrete_turn_deg`=30°, the challenge convention), or STOP — executed via [`SimInterface.step_discrete`](DCON/src/habitat/sim_interface.py). Pure-pursuit: it takes the bearing to the first waypoint ≥ `discrete_lookahead_m` ahead and turns toward it when the heading error exceeds half a turn, else steps forward; receding-horizon replans correct drift. `step_discrete` takes NATIVE Habitat turn semantics unconditionally; the tracking controller maps its grid-θ turn direction onto Habitat yaw via `mppi_w_sign` at the source (applying a sign inside step_discrete inverted DD-PPO's native turns — a confirmed spin-in-place bug). Each primitive counts against `max_agent_steps` (=500) — exhausting it without self-stopping is a timeout/failure. This makes SR/SPL directly comparable to VLFM / Goal-Oriented Semantic Exploration in the discrete ObjectNav challenge. `traj_log.jsonl` logs the primitive name as `action` in this mode (nothing downstream consumes it; `tools/visualize.py` reads only `heading`).
+**Continuous→discrete action mode** (`cfg.discrete_actions`, default off; governs SEARCH only — EXPLOIT is always discrete-stepped by DD-PPO regardless): MPPI stays continuous, but a low-level **tracking controller** ([`discrete_action_from_plan`](DCON/src/planning/tracking.py)) converts each replan's optimized path into ONE Habitat ObjectNav primitive — MOVE_FORWARD (`discrete_forward_m`=0.25 m), TURN_LEFT/RIGHT (`discrete_turn_deg`=30°, the challenge convention), or STOP — executed via [`SimInterface.step_discrete`](DCON/src/habitat/sim_interface.py). Pure-pursuit: it takes the bearing to the first waypoint ≥ `discrete_lookahead_m` ahead and turns toward it when the heading error exceeds half a turn, else steps forward; receding-horizon replans correct drift. `step_discrete` takes NATIVE Habitat turn semantics unconditionally; the tracking controller maps its grid-θ turn direction onto Habitat yaw via `mppi_w_sign` at the source (applying a sign inside step_discrete inverted DD-PPO's native turns — a confirmed spin-in-place bug). Each primitive counts against `max_agent_steps` (=500) — exhausting it without self-stopping is a timeout/failure. This makes SR/SPL directly comparable to VLFM / Goal-Oriented Semantic Exploration in the discrete ObjectNav challenge. `traj_log.jsonl` logs the primitive name as `action` in this mode (nothing downstream consumes it; `tools/visualize.py` reads only `heading`).
 
-**Goal selection** ([main.py:plan_one_action](DCON/main.py)): each replan a detection is first **classified** by distance + size, then the goal cell is chosen by a three-layer priority.
+**Goal selection** ([`plan_search_action`](DCON/src/planning/search.py)): each replan a detection is first **classified** by distance + size, then the goal cell is chosen by a three-layer priority.
 
-**Detection classification** ([`classify_detection`](DCON/main.py)) sorts a detection into three bands using the agent→object distance (box-center depth) and the box's image-area fraction, returning two flags `(is_persistent, contributes_confidence)`:
+**Detection classification** ([`classify_detection`](DCON/src/perception/detection.py)) sorts a detection into three bands using the agent→object distance (box-center depth) and the box's image-area fraction, returning two flags `(is_persistent, contributes_confidence)`:
 - **too close** — `dist < detected_min_dist_m` OR `box_frac > detected_max_box_frac` → ignored entirely (no goal, no confidence weight, no latch); the box fills the frame and carries no usable localization.
 - **too far** — `dist > detected_max_dist_m` OR `box_frac < detected_min_box_frac` → *investigate*: sets/caches the goal and pulls the confidence weight, but is NOT persistent (won't latch).
 - **usable band** — anything else → *persistent*: investigate + contribute confidence AND count toward the latch streak.
@@ -123,11 +138,11 @@ After every replan, `traj_log.jsonl` gets a line with `step`, `pos`, `heading`, 
 So the agent steers toward a distant sighting and only commits to it once it has closed into the usable band. A missing box or unrangeable depth → ignored.
 
 **Goal-cell priority:**
-1. **Fresh detection goal** — if this replan's detection is worth investigating (`det_investigate`, i.e. not *too close*), project its box into a goal cell via [`bev_cell_from_box_center`](DCON/main.py): unproject a small patch around the box-center pixel to one world point and use that BEV cell **verbatim** (no argmax, no snapping); relies on LLMDet's tight boxes. A goal cell on the object surface is fine: in EXPLOIT, MPPI freezes each rollout at its first waypoint within the goal-arrival radius and excludes it if that cell is occupied, so winning rollouts stop on free cells near the surface rather than entering it. In SEARCH mode every investigated detection re-projects, so the cache (`last_box_goal`) tracks the **most recent** bounding box.
+1. **Fresh detection goal** — if this replan's detection is worth investigating (`det_investigate`, i.e. not *too close*), project its box into a goal cell via [`bev_cell_from_box_center`](DCON/src/perception/detection.py): unproject a small patch around the box-center pixel to one world point and use that BEV cell **verbatim** (no argmax, no snapping); relies on LLMDet's tight boxes. A goal cell on the object surface is fine: in EXPLOIT, MPPI freezes each rollout at its first waypoint within the goal-arrival radius and excludes it if that cell is occupied, so winning rollouts stop on free cells near the surface rather than entering it. In SEARCH mode every investigated detection re-projects, so the cache (`last_box_goal`) tracks the **most recent** bounding box.
 2. **Cached box-goal** — no fresh investigated detection this frame but a cached box-goal exists → reuse that fixed world cell. In EXPLOIT the detector is throttled off, so the cache freezes on the object that triggered the latch and the agent commits to it.
 3. **Global similarity argmax** — neither: pick the global argmax of observed BEV similarity (exploration default).
 
-**Detector throttle in EXPLOIT** ([main.py](DCON/main.py)): once latched the goal is pinned to the cached cell, so the detector runs only every `exploit_redetect_interval` replans (`<=0` → never re-detect after latching, reuse the cache for the rest of the run). SEARCH always detects every replan.
+**Detector throttle in EXPLOIT** ([`DetectionGate.should_run_detector`](DCON/src/perception/detection.py)): once latched the goal is pinned to the cached cell, so the detector runs only every `exploit_redetect_interval` replans (`<=0` → never re-detect after latching, reuse the cache for the rest of the run). SEARCH always detects every replan.
 
 **Latching / goal weight (MPPI `w_conf`)**: `detected` latches once `detected_persistence` consecutive *persistent* (usable-band) detections accrue — there is no separate latch score threshold; the detector's own floor (`llmdet_threshold`) bounds every surviving box's score — a non-persistent frame resets the streak; never unlatches. `EXPLOIT` pins `w_conf=1.0` so the agent commits hard; `SEARCH` passes the per-frame detection score (zeroed for *too-close* detections so they don't pull the goal weight) and MPPI's hysteresis (`exploit_conf = max(incoming, prev * conf_decay)`) ratchets up on sightings and decays after misses.
 
@@ -135,7 +150,7 @@ So the agent steers toward a distant sighting and only commits to it once it has
 
 **CLIPSegSemantics**: dense per-pixel relevance for a FIXED text query (frozen CIDAS/clipseg-rd64-refined; the query is fixed at construction — `cfg.target_query` never changes mid-run). In **pairwise mode** (`cfg.clipseg_pairwise`, the canonical setup) it emits one sigmoid channel per prompt — the query plus the distractor bank from `build_distractor_vocabulary(cfg)` (`cfg.background_terms` generic-background prompts + `cfg.distractor_objects` structurally-similar/distinct-material object confusers, deduped; phrases sharing a content word with the query are stripped by `filter_distractors`). All K logit maps come from one batched forward pass; text-conditional embeddings are cached at construction. The feature field regresses the full channel vector; the query-vs-distractor **contrast happens at verify time** on the multi-view-converged field, not per frame.
 
-**Field-verified detection** (`cfg.field_verify`, main.py `detect_classify_latch`): a detector box must also pass the field — its valid-depth pixels are unprojected, the field is read there, the top-`field_verify_top_frac` in-box cells (selected by the query channel) are pooled, and the box counts only if the worst-case margin `presence(query) − max_i presence(distractor_i)` clears `field_verify_threshold` (canonically **0.0**, the tuning-free max-Youden-J point — calibrated against the static distractor bank; a materially different bank warrants a re-sweep). This is what suppresses the geometric-look-alike FPs that survive LLMDet's sinks.
+**Field-verified detection** (`cfg.field_verify`, [`DetectionGate.step`](DCON/src/perception/detection.py)): a detector box must also pass the field — its valid-depth pixels are unprojected, the field is read there, the top-`field_verify_top_frac` in-box cells (selected by the query channel) are pooled, and the box counts only if the worst-case margin `presence(query) − max_i presence(distractor_i)` clears `field_verify_threshold` (canonically **0.0**, the tuning-free max-Youden-J point — calibrated against the static distractor bank; a materially different bank warrants a re-sweep). This is what suppresses the geometric-look-alike FPs that survive LLMDet's sinks.
 
 ### Object Detection (`src/perception/obj_detection.py`)
 
@@ -176,7 +191,7 @@ python main.py --gpu 0 --query "a pillow"
 ```
 Seeds the maps from one observation (no spin/cold-train), then runs the three-cadence main loop. Outputs to `output/current_scene/`: always `traj_log.jsonl` + `grid_extent.json`; `save_enabled` (default) adds the final occupancy BEV `.npy`; `save_video` (the `--no-visualize` inverse) adds the full per-step BEV map + RGB history and renders `nav_history.mp4`. No feature-field checkpoint is written. `main.run(cfg, start_pos=..., start_rotation=..., goals=..., success_radius_m=..., save_enabled=..., save_video=...)` is also importable and returns a per-episode metrics dict (`success`, `spl`, `l_geodesic`, `final_geodesic`, `path_length`, `agent_stopped`, `final_pos`, `start_nav`, `success_radius_m`, `steps`; used by `benchmarks/eval_scene.py`).
 
-**Goals** (for the evaluator) may be **points** (`[x, y, z]`) or **axis-aligned rectangles** (`{rect: [x_min, z_min, x_max, z_max], y: <height>}`, e.g. a table footprint). Success/geodesic score against the **nearest point** of the goal ([`nearest_goal_point`](DCON/main.py) clamps the agent's x,z into the rectangle). Success is **geodesic** distance (navmesh shortest path via `geodesic_distance`) — matching the Habitat ObjectNav challenge; there is no straight-line success mode. `final_pos` is recorded so runs can be re-inspected/re-scored offline.
+**Goals** (for the evaluator) may be **points** (`[x, y, z]`) or **axis-aligned rectangles** (`{rect: [x_min, z_min, x_max, z_max], y: <height>}`, e.g. a table footprint). Success/geodesic score against the **nearest point** of the goal ([`nearest_goal_point`](DCON/src/episode/scoring.py) clamps the agent's x,z into the rectangle). Success is **geodesic** distance (navmesh shortest path via `geodesic_distance`) — matching the Habitat ObjectNav challenge; there is no straight-line success mode. `final_pos` is recorded so runs can be re-inspected/re-scored offline.
 
 **2. Sweep with human adjudication (`benchmarks/eval_scene.py`)**
 
@@ -238,7 +253,7 @@ Key settings:
 
 ### Adding a New Planner
 1. Create `src/planning/my_planner.py` mirroring `MPPIPlanner`'s `plan` / `optimize_trajectory` signature.
-2. Wire into [main.py:plan_one_action](DCON/main.py#L73) alongside the existing MPPI call.
+2. Wire into [`plan_search_action`](DCON/src/planning/search.py) alongside the existing MPPI call.
 3. Add a config flag or argparse switch to choose between planners at runtime.
 
 ### Tweaking Perception

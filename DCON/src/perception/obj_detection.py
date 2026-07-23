@@ -2,7 +2,7 @@
 
 MM-Grounding-DINO with training-free attention sinks (Ruis et al., ICLR 2026)
 for background false-positive mitigation; box-level acceptance is then further
-gated by the pairwise CLIPSeg field (main.py detect_classify_latch). The
+gated by the pairwise CLIPSeg field (src/perception/detection.py). The
 YOLO-World / COCO-YOLO / VLFM-hybrid backends, the LocateAnything→LLMDet
 verification cascade, and the CLIPSegDetector verifier candidate were all
 removed; see git history if one needs to be resurrected.

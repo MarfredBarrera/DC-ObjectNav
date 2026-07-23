@@ -384,7 +384,7 @@ class Config:
         # field's per-pixel supervision signal — see semantics.py).
         self.clipseg_model_name = "CIDAS/clipseg-rd64-refined"
 
-        # Field verification of detections (main.py detect_classify_latch):
+        # Field verification of detections (src/perception/detection.py):
         # when a detector box fires, unproject its valid-depth pixels to 3D,
         # forward-pass the trained CLIPSeg relevance field there, pool the top
         # `field_verify_top_frac` fraction of point scores, and count the frame

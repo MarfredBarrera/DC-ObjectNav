@@ -1,3 +1,33 @@
+# Handoff: main.py decomposition (2026-07-23, done)
+
+`main.py` went 1077 → 337 lines; `run()` 554 → ~200. Pure structural
+refactor — no algorithm change, verified by differential tests on the pure
+helpers and three real smoke episodes (SEARCH, forced-latch EXPLOIT/DD-PPO,
+field-verify gate). New homes:
+
+| was in main.py | now |
+|---|---|
+| `box_center_world_xz`, `bev_cell_from_box_center`, `classify_detection`, `detect_classify_latch`, `world_to_grid` | `src/perception/detection.py` — `DetectionGate` class owns the detector, field-verify gate, latch state (`detected`/`streak`) and the redetect throttle; `step()` returns a `Detection` dataclass instead of the old 8-tuple |
+| `plan_one_action` | `src/planning/search.py::plan_search_action` |
+| the inline DD-PPO EXPLOIT branch | `src/planning/exploit.py::ExploitController` (owns the per-latch LSTM reset + arrival check) |
+| `discrete_action_from_plan` | `src/planning/tracking.py` (pure-pursuit shared with `lookahead_heading_error`) |
+| `get_agent_heading` | `SimInterface.agent_heading` property |
+| sim init + spawn + BEV-band reconciliation | `habitat_utils.start_episode` |
+| all output_dir writes | `src/episode/recorder.py::EpisodeRecorder` |
+| `nearest_goal_point`, `goal_geodesic`, the two metrics dicts | `src/episode/scoring.py::score_episode` |
+| SIGINT + STOP-sentinel handling | `src/episode/control.py::EarlyStop` (context manager) |
+
+Deleted as dead: `continuous_action_from_plan` (defined, never called — the
+MPPI-idle path builds its `[0, w]` command inline), the commented-out
+SEARCH-mode goal-disconfirmation block, and `plan_search_action`'s `detected`
+parameter (EXPLOIT never calls it, so `goal_confidence` is always `det_score`).
+`main.run()`'s signature and return dict are unchanged, so `eval_scene.py` is
+unaffected. Only cosmetic behavior change: the per-replan `goal:` log string
+now prints the goal cell's CENTER (matching what EXPLOIT navigates to) instead
+of its corner — 5 cm, stdout only, nothing downstream parses it.
+
+---
+
 # Handoff: codebase cleanup sweep (2026-07-23, done)
 
 Committed in two commits: a **checkpoint commit** (`Checkpoint before cleanup

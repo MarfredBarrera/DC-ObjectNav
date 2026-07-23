@@ -72,6 +72,47 @@ def spawn_agent_at_pos(sim, agent, pos: np.ndarray, rotation=None) -> np.ndarray
         return np.zeros(3)
 
 
+def start_episode(cfg, start_pos, start_rotation=None):
+    """Open the scene, spawn the agent, and reconcile cfg with where it landed.
+
+    Returns (sim, agent, start_nav, scene_bounds). Raises if the requested spawn
+    isn't connected to this scene's navmesh (snapped further than
+    `cfg.max_spawn_snap_m` — a disconnected floor / broken reconstruction / bad
+    annotation; not a fair episode to evaluate).
+
+    Mutates `cfg`'s BEV height band: `bev_height_min`/`bev_height_max` may have
+    been set from the *nominal* start_pos[1] by the caller (e.g. eval_scene.py's
+    per-episode floor band) before the sim existed to snap it, so the band is
+    shifted by however much snapping moved the agent vertically — otherwise a
+    small mismatch silently starves every BEV map of observed cells for the
+    whole episode. `grid_max_height` (a hard absolute-Y cap applied once at grid
+    construction, VoxelGrid.initialize_from_bounds) then grows to cover the
+    shifted band so upper-floor bands aren't clipped to an empty Y-range.
+    """
+    sim, agent = init_simulator(
+        cfg.scene_path, width=cfg.img_width, height=cfg.img_height,
+        fov_deg=cfg.fov, sensor_height=cfg.sensor_height,
+        agent_radius=cfg.agent_radius, agent_height=cfg.agent_height,
+    )
+    start_nav = spawn_agent_at_pos(sim, agent, start_pos, rotation=start_rotation)
+    snap_dist = float(np.linalg.norm(np.asarray(start_nav) - np.asarray(start_pos)))
+    if snap_dist > cfg.max_spawn_snap_m:
+        sim.close()
+        raise RuntimeError(
+            f"spawn point {list(start_pos)} snapped {snap_dist:.2f}m to "
+            f"{list(np.asarray(start_nav))} (> max_spawn_snap_m="
+            f"{cfg.max_spawn_snap_m}m) — requested spawn isn't connected to "
+            "this scene's navmesh (disconnected floor / broken reconstruction "
+            "/ bad annotation); not a fair episode to evaluate.")
+
+    dy = float(np.asarray(start_nav)[1] - start_pos[1])
+    if dy:
+        cfg.bev_height_min += dy
+        cfg.bev_height_max += dy
+    cfg.grid_max_height = max(cfg.grid_max_height, cfg.bev_height_max)
+    return sim, agent, start_nav, get_scene_bounds_from_pathfinder(sim)
+
+
 def get_camera_matrix(agent) -> np.ndarray:
     """4×4 camera-to-world matrix from the 'rgb' sensor state (Habitat/OpenGL frame)."""
     state = agent.get_state().sensor_states["rgb"]

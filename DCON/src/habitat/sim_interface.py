@@ -2,6 +2,7 @@ import math
 from typing import Tuple
 
 import numpy as np
+import quaternion  # registers numpy.quaternion dtype used by habitat-sim
 import torch
 import magnum as mn
 
@@ -140,3 +141,10 @@ class SimInterface:
     @property
     def agent_rotation(self):
         return self.agent.get_state().rotation
+
+    @property
+    def agent_heading(self) -> float:
+        """Agent yaw in MPPI's grid frame: atan2(forward_z_world, forward_x_world)."""
+        R = quaternion.as_rotation_matrix(self.agent_rotation)
+        forward_world = R @ np.array([0.0, 0.0, -1.0])  # Habitat agent forward is local -Z
+        return float(np.arctan2(forward_world[2], forward_world[0]))

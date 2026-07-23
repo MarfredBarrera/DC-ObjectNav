@@ -57,7 +57,7 @@ class CLIPSegSemantics:
     channel per prompt (row 0 = query, rows 1..K-1 the distractors); the
     field regresses the full vector and the contrast happens downstream at
     field-verify time on the multi-view-averaged channels (worst-case
-    margin-of-means, see main.py detect_classify_latch). The K logit maps
+    margin-of-means, see src/perception/detection.py). The K logit maps
     come from one batched forward pass (image repeated K times); the
     distractor conditional embeddings are precomputed like the query's.
     Phrases sharing a content word with the query are dropped

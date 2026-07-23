@@ -384,7 +384,7 @@ def load_objectnav_dataset(path, scenes_root="benchmarks/gibson_scenes",
 
 def nearest_goal_xz(goal, p):
     """(x, z) of the point of `goal` closest to point `p` in the floor plane.
-    Mirrors main.nearest_goal_point but euclidean/offline (no pathfinder)."""
+    Mirrors episode/scoring.py nearest_goal_point but euclidean/offline (no pathfinder)."""
     if isinstance(goal, dict):
         x_min, z_min, x_max, z_max = goal["rect"]
         cx = min(max(float(p[0]), x_min), x_max)

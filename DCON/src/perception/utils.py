@@ -1,6 +1,13 @@
 import torch
 
 
+def to_numpy(maybe_tensor):
+    """Detach a tensor to a numpy array; pass anything else (incl. None) through."""
+    if isinstance(maybe_tensor, torch.Tensor):
+        return maybe_tensor.detach().cpu().numpy()
+    return maybe_tensor
+
+
 def rgb_to_sh(rgb):
     """
     Converts RGB values to spherical harmonics (SH) coefficients.
