@@ -97,12 +97,23 @@ planning:
   # caused ~3x turn overshoot every action).
   discrete_turn_deg: 30.0
 
+  # Depth-sensor-miss (exact-0) handling for DD-PPO's input. "zero" is the
+  # checkpoint's training-native reading; the old "far" remap fabricated open
+  # corridors through windows and caused both full-loop nav failures.
+  ddppo_depth_miss: zero
+  # Steer DD-PPO at a waypoint this far along the route when the goal is not
+  # in line of sight (it is map-free, so it cannot route around a wall on its
+  # own). Probe SR 89.1% -> 97.7%. 0 disables.
+  exploit_waypoint_m: 1.0
+
   discrete_lookahead_m: 0.5      # pure-pursuit lookahead along the MPPI path
   max_agent_steps: 500           # unused: no per-episode primitive timeout is enforced
 
 detection:
   detected_persistence: 1       # consecutive usable-band detections to latch
-  stop_distance_m: 0.75          # terminate within this distance of sim peak
+  stop_distance_m: 0.75          # arrival: within this distance of the raw detection
+  exploit_nav_arrival_m: 0.5     # arrival: standing on the snapped (navigable) goal
+  exploit_nav_max_object_m: 1.5  # ...but only when also within this of the raw detection
   llmdet_threshold: 0.47         # LLMDet per-box score floor (tau); ~99% background-FP rejection w/ sinks
 
   # Canonical verification arm (= detector_pairwise_field_maxj): the pairwise

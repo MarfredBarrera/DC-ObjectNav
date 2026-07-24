@@ -372,6 +372,29 @@ def load_ddppo_policy(checkpoint_path: str, device: str = "cuda") -> PointNavRes
     return policy
 
 
+def _fill_from_nearest_valid(depth, min_m, max_m):
+    """Replace sensor-miss pixels with their nearest valid pixel's depth.
+
+    `depth` is [1,1,H,W] in meters; a miss is <= `min_m` (Habitat writes
+    exactly 0.0). The Euclidean distance transform's index output gives, for
+    every miss pixel, the coordinates of the closest valid one in a single
+    pass. An all-miss frame has nothing to borrow from and falls back to
+    `max_m` (clear), which at least does not fabricate an obstacle.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    d = depth[0, 0].detach().cpu().numpy()
+    miss = d <= min_m
+    if not miss.any():
+        return depth
+    if miss.all():
+        return torch.full_like(depth, max_m)
+    _, idx = distance_transform_edt(miss, return_indices=True)
+    filled = d[idx[0], idx[1]]
+    return torch.as_tensor(filled, dtype=depth.dtype,
+                           device=depth.device)[None, None]
+
+
 class DDPPONavigator:
     """Stateful driver: manages the LSTM hidden state / previous-action /
     not-done mask across replans and exposes one `act()` call per replan,
@@ -382,10 +405,12 @@ class DDPPONavigator:
     """
     ACTION_NAMES = ["stop", "move_forward", "turn_left", "turn_right"]
 
-    def __init__(self, policy: PointNavResNetPolicy, device: str = "cuda", depth_hw: int = 256):
+    def __init__(self, policy: PointNavResNetPolicy, device: str = "cuda",
+                 depth_hw: int = 256, depth_miss: str = "far"):
         self.policy = policy
         self.device = device
         self.depth_hw = depth_hw
+        self.depth_miss = depth_miss  # sensor-miss handling: "far" | "zero"
         self.hidden_states = None
         self.prev_actions = None
         self.not_done_masks = None
@@ -419,15 +444,29 @@ class DDPPONavigator:
         depth = F.interpolate(depth, size=(self.depth_hw, self.depth_hw),
                               mode="nearest-exact")
         # A depth-sensor miss (no ray intersection — a hole in the scanned
-        # Gibson mesh, a window, etc.) reads back as exactly 0.0, not a small
-        # positive distance. Normalizing that literally would tell DD-PPO
-        # "solid obstacle at point-blank range" for what is actually unknown/
-        # open space — confirmed empirically: every observed stall showed a
-        # large contiguous block of exact-zero pixels centered in frame.
-        # Treat a miss as far/clear (matches how the rest of this codebase
-        # already excludes depth <= min_sensor_dist as invalid rather than
-        # "near").
-        depth.masked_fill_(depth <= DDPPO_MIN_DEPTH_M, DDPPO_MAX_DEPTH_M)
+        # Gibson mesh, a window, etc.) reads back as exactly 0.0, and what we
+        # substitute decides what the policy believes is there. The two
+        # constant substitutions FAIL IN OPPOSITE SCENES, measured over the
+        # 128-approach probe:
+        #   "far"  — misses become max depth (clear). Fixes mesh holes that
+        #            would otherwise read as a point-blank wall, but turns a
+        #            window into a phantom 10 m corridor: the whole
+        #            tv__Collierville__g0 cohort walked into the window (0/8
+        #            in position; "zero" gets 8/8).
+        #   "zero" — keep 0, the checkpoint's training-native reading. Loses
+        #            the opposite way: toilet__Corozal__g1 falls 6/8 -> 2/8
+        #            as a real hole blocks the approach as a fake wall.
+        #   "nearest" — fill each miss from its nearest VALID pixel. Neither
+        #            constant is a measurement; the nearest real reading is,
+        #            and it resolves both cases by construction: a window
+        #            ringed by 3 m wall reads 3 m (a wall, not a corridor),
+        #            a floor hole ringed by 1 m floor reads 1 m (floor
+        #            continues, not an obstacle).
+        if self.depth_miss == "far":
+            depth.masked_fill_(depth <= DDPPO_MIN_DEPTH_M, DDPPO_MAX_DEPTH_M)
+        elif self.depth_miss == "nearest":
+            depth = _fill_from_nearest_valid(depth, DDPPO_MIN_DEPTH_M,
+                                             DDPPO_MAX_DEPTH_M)
         depth = ((depth - DDPPO_MIN_DEPTH_M)
                  / (DDPPO_MAX_DEPTH_M - DDPPO_MIN_DEPTH_M)).clamp(0.0, 1.0)
         depth = depth.permute(0, 2, 3, 1)  # [1, H, W, 1]

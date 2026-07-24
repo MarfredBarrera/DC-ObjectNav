@@ -46,9 +46,15 @@ class Config:
                      'mppi_occupied_cell_cost', 'mppi_unseen_cell_cost',
                      'discrete_actions', 'discrete_forward_m',
                      'discrete_turn_deg', 'discrete_lookahead_m',
-                     'max_agent_steps', 'ddppo_checkpoint_path'],
+                     'max_agent_steps', 'ddppo_checkpoint_path',
+                     'ddppo_depth_miss'],
         'detection': ['detected_persistence',
-                      'stop_distance_m', 'exploit_redetect_interval',
+                      'stop_distance_m', 'exploit_nav_arrival_m',
+                      'exploit_nav_max_object_m', 'exploit_use_policy_stop',
+                      'exploit_waypoint_m',
+                      'exploit_snap_tighten', 'exploit_stagnation_replans',
+                      'exploit_stagnation_eps_m', 'exploit_stagnation_gate_m',
+                      'exploit_redetect_interval',
                       'detected_min_box_frac', 'detected_max_box_frac',
                       'detected_min_dist_m', 'detected_max_dist_m',
                       'sink_special_str', 'llmdet_model_name',
@@ -246,6 +252,20 @@ class Config:
         # controller — see src/planning/ddppo_policy.py and its use in
         # main.py's EXPLOIT branch.
         self.ddppo_checkpoint_path = "ddppo_weights/gibson-2plus-se-resneXt101-lstm1024.pth"
+        # Depth-sensor-miss handling for the policy's input (see
+        # ddppo_policy.act): "zero" keeps exact-0 pixels at 0, the
+        # checkpoint's TRAINING-NATIVE reading — Gibson's training meshes
+        # hole the same way, so the policy already learned to handle it.
+        # "far" remaps them to max depth, which fabricates an open corridor
+        # wherever a window renders as a zero-block and makes the policy walk
+        # into it; that cost 9 points of probe SR (79.7 -> 89.1) and was the
+        # sole cause of BOTH full-loop navigation failures
+        # (tv__Collierville__ep11/ep25: 0/4 and 0/3 seeds under "far", 4/4
+        # and 3/3 under "zero"). "nearest" fills each miss from its closest
+        # valid pixel — ties "zero" on the probe, and is the option to reach
+        # for if a scene ever shows the opposite failure (a real hole in a
+        # surface reading as a point-blank wall).
+        self.ddppo_depth_miss = "zero"
 
         # Visualization
         self.viz_interval = 500
@@ -260,6 +280,62 @@ class Config:
         # goal (obstacle-aware field distance).
         self.detected_persistence = 1
         self.stop_distance_m = 1.5
+        # Second arrival condition, on the SNAPPED goal DD-PPO actually steers
+        # at rather than the raw detection. Without it an approach whose snap
+        # exceeds `stop_distance_m` can never terminate: the policy parks on
+        # its pointgoal, correctly, and every later step is a spin-in-place
+        # because the raw-goal test it is judged by sits metres-of-geometry
+        # away. Measured on the deterministic probe, DD-PPO reaches the snapped
+        # cell within ~0.1 m; the swept value is 0.5 m (0.3 and 0.5 tied in the
+        # factorial, and the exploit_nav_max_object_m guard below keeps the
+        # wider radius from stopping short of the true object).
+        self.exploit_nav_arrival_m = 0.5
+        # Nav-goal arrival only counts when the agent is also within this of
+        # the RAW detection. A snap is only as trustworthy as the occupancy
+        # map underneath it: on a sparse map the nearest observed-free cell
+        # can sit meters from the object, and stopping there converts a live
+        # approach into a guaranteed miss (probe: the one false nav-arrival
+        # fired at 1.99 m from the object; every legitimate one <= 1.32 m).
+        # <= 0 disables the guard.
+        self.exploit_nav_max_object_m = 1.5
+        # Steer DD-PPO at a waypoint this far ahead along the obstacle-aware
+        # route to the goal, instead of at the goal itself. <=0 aims straight
+        # at the goal (the policy's raw behaviour). DD-PPO is a local,
+        # map-free controller: given a goal in another room it drives at the
+        # bearing, hits the wall beside the doorway and circles. A waypoint on
+        # the BEV wavefront lands IN the opening, which is the kind of short,
+        # clearly-reachable pointgoal it was trained on.
+        self.exploit_waypoint_m = 1.0
+        # Let DD-PPO's own trained STOP action end the approach. Off by
+        # default: it was calibrated on ~0.2 m free-space PointGoals, and
+        # against the raw detection projection (a goal inside an object) it
+        # fired on 1 of 3 approaches that closed. Now that the policy steers
+        # at the NAVIGABLE snap its goal is a real PointGoal again, so this is
+        # worth re-measuring — see the probe's --policy-stop arm.
+        self.exploit_use_policy_stop = False
+        # Re-snap the goal every replan, adopting only strictly-closer cells.
+        # False freezes the snap at its first (often widest) value, which is
+        # the pre-existing behaviour and the ablation baseline for it.
+        self.exploit_snap_tighten = True
+        # Stagnation stop: end the approach once the policy has gone this many
+        # consecutive replans without improving its closest distance to the
+        # nav goal by more than `exploit_stagnation_eps_m`. This is the missing
+        # "has the policy converged?" signal — without it every non-arrival
+        # burns to the step cap and then drifts AWAY from its closest approach
+        # (probe: median +0.40 m between dmin and the cap). Tuned by exact
+        # offline replay of the stop stack over the v5 probe traces: 30
+        # replans fired during legitimate mid-approach plateaus (detours,
+        # repositioning) and clawed back 10 would-be arrivals; 60 with the
+        # near-gate below kept one. <=0 disables.
+        self.exploit_stagnation_replans = 60
+        self.exploit_stagnation_eps_m = 0.1
+        # Stagnation only counts as CONVERGED when the agent is already within
+        # this of its nav goal — a plateau far from the goal is "stuck", not
+        # "arrived", and stopping there both scores a guaranteed miss and
+        # forfeits any later re-detect moving the goal. Far plateaus keep
+        # driving (and keep the episode alive for redetection) instead.
+        # <=0 fires regardless of distance.
+        self.exploit_stagnation_gate_m = 1.5
 
         # Classify each detection by BOTH object distance and box size (see
         # classify_detection in main.py). Box fractions are detector box area /
