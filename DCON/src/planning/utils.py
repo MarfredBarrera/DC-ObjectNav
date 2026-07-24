@@ -43,6 +43,52 @@ def reachable_min(field, occ_map, seed_zx):
     return float(np.asarray(field)[anchor_cells].min())
 
 
+def snap_to_reachable_free(occ_map, goal_zx, agent_zx):
+    """Nearest observed-FREE cell to `goal_zx` that the agent can actually reach.
+
+    The detection goal is the box-center projection, so it lands ON the target
+    object's surface — an OCCUPIED cell by construction. DD-PPO was trained
+    exclusively on navigable PointGoals, and an in-obstacle goal puts it out of
+    distribution: for a wall-mounted target it drives into the wall, turns away,
+    and never converges (confirmed on tv__Collierville__ep5/ep9 — 500-630
+    replans, closest approach at replan 0). Snapping the goal onto standable
+    floor first puts the policy back in its training distribution.
+
+    "Reachable" is the same component test `reachable_min` uses: the free cell
+    must lie in the agent's own 8-connected non-occupied component. A plain
+    nearest-free-cell search is NOT enough and fails on exactly the case this
+    exists for — for a target on a room's outer wall the closest free cell is
+    often 1-2 cells away on the FAR side of that wall (free in the BEV, an
+    unreachable pocket in practice), which leaves the goal as unapproachable as
+    before. Restricting to the agent's component moved ep9's goal 0.80 m to
+    standable floor 0.35 m from the true target — matching, without using it,
+    what the privileged navmesh reports as the nearest navigable point (0.73 m).
+
+    Returns a (z_idx, x_idx) cell, or None only when the map holds no reachable
+    free cell at all (a degenerate early-episode map). There is deliberately no
+    distance cap and no fall-back to the raw goal: the snapped cell IS the
+    EXPLOIT goal by definition, and reverting to the un-navigable projection
+    past some threshold would silently reintroduce the out-of-distribution
+    regime this exists to remove, splitting the controller into two untested
+    behaviours. The agent's own cell is treated as traversable regardless of
+    its occupancy, as in `reachable_min`.
+    """
+    occ = np.asarray(occ_map)
+    H, W = occ.shape
+    az = min(max(int(round(float(agent_zx[0]))), 0), H - 1)
+    ax = min(max(int(round(float(agent_zx[1]))), 0), W - 1)
+    mask = occ < 2
+    mask[az, ax] = True
+    labels, _ = ndimage.label(mask, structure=np.ones((3, 3), dtype=bool))
+    candidates = np.argwhere((occ == 1) & (labels == labels[az, ax]))
+    if candidates.size == 0:
+        return None
+    d = np.hypot(candidates[:, 0] - float(goal_zx[0]),
+                 candidates[:, 1] - float(goal_zx[1]))
+    i = int(np.argmin(d))
+    return (int(candidates[i, 0]), int(candidates[i, 1]))
+
+
 def goal_distance_field(occ_map, goal_zx, occupied_cell_cost, unseen_cell_cost=1.0):
     """Obstacle-aware distance-to-go (in cells) from every BEV cell to `goal_zx`.
 

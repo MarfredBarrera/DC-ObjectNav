@@ -258,6 +258,13 @@ def run(cfg: Config, save_enabled: bool = True,
                     'field_terms': fv["terms"] if fv is not None else None,
                     'det_box': [float(v) for v in det.box] if det.box is not None else None,
                     'goal': [int(goal_cell[0]), int(goal_cell[1])] if goal_cell is not None else None,
+                    # EXPLOIT steers at the goal snapped onto navigable free
+                    # space, which is NOT `goal` above (that is the raw box
+                    # projection the arrival test uses). Logged so evidence
+                    # shows what DD-PPO actually aimed at. None in SEARCH.
+                    'nav_goal': ([int(exploit.nav_goal[0]), int(exploit.nav_goal[1])]
+                                 if mode == 'EXPLOIT' and exploit.nav_goal is not None
+                                 else None),
                     'mode': mode,
                     'w_conf': w_conf,
                 })
