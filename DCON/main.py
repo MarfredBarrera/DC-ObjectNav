@@ -25,7 +25,6 @@ os.environ['MAGNUM_LOG'] = 'quiet'
 os.environ['HABITAT_SIM_LOG'] = 'quiet'
 
 import gc
-import random
 import time
 from collections import deque
 
@@ -92,17 +91,6 @@ def run(cfg: Config, save_enabled: bool = True,
     """
     if start_pos is None:
         start_pos = [-2.0, -3.0, 6.0]
-
-    # Seed every RNG this episode draws from, before anything is constructed:
-    # MPPI's rollout noise, the feature field's init + minibatch sampling, and
-    # DD-PPO's action sampling. Without this an episode is unrepeatable (the
-    # field used to seed itself off wall-clock time), so an A/B difference
-    # can't be attributed to the change under test rather than to drift — two
-    # identical-config runs of tv__Collierville__ep5 latched objects 7 m apart.
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    torch.cuda.manual_seed_all(cfg.seed)
 
     # 1. Init simulator + the perception / planning / detection stacks.
     sim, agent, start_nav, scene_bounds = start_episode(cfg, start_pos, start_rotation)

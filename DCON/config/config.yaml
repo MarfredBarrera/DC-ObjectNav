@@ -33,10 +33,6 @@ semantics:
 training:
   iterations: 100000
   device: "cuda"
-  # Master RNG seed (torch/numpy/random + the feature field init).
-  # Fixed so an episode is reproducible and A/B differences are
-  # attributable to the change under test, not run-to-run drift.
-  seed: 0
 
 # HashGrid Configuration
 hashgrid:

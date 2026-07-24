@@ -13,7 +13,7 @@ class Config:
                     'sensor_height', 'min_sensor_dist', 'max_sensor_dist',
                     'agent_radius', 'agent_height', 'max_spawn_snap_m'],
         'semantics': ['target_query'],
-        'training': ['iterations', 'device', 'seed'],
+        'training': ['iterations', 'device'],
         'hashgrid': {
             'n_levels': 'hash_n_levels',
             'n_features_per_level': 'hash_n_features_per_level',
@@ -107,14 +107,6 @@ class Config:
         # Training Settings
         self.iterations = 10000
         self.device = "cuda"
-        # Master RNG seed, applied once per episode in main.run() to torch,
-        # numpy, python-random AND the feature field's tiny-cuda-nn init (which
-        # used to seed itself off wall-clock time, making every episode a
-        # different network and no run repeatable). Reproducibility is a
-        # prerequisite for attributing an A/B difference to the change under
-        # test rather than to run-to-run drift: two identical-config runs of
-        # tv__Collierville__ep5 latched different objects 7 m apart.
-        self.seed = 0
 
         # HashGrid Configuration
         self.hash_n_levels = 16

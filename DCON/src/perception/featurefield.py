@@ -1,4 +1,5 @@
 import os
+from time import time
 
 import torch
 import torch.nn as nn
@@ -52,9 +53,8 @@ class EvidentialFeatureField(nn.Module):
             "n_hidden_layers": config.hash_n_hidden_layers,
         }
         
-        # Seeded from config, NOT wall-clock: a time-seeded init made every
-        # episode a different network, so no run could be reproduced or A/B'd.
-        random_seed = int(config.seed)
+        # Generate a unique random seed for this instance
+        random_seed = int(time() * 1e9) % (2**32 - 1)
         
         # Calculate encoding output dimension
         self.encoding_dim = encoding_config["n_levels"] * encoding_config["n_features_per_level"]
