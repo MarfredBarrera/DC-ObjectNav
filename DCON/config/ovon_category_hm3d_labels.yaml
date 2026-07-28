@@ -1,0 +1,108 @@
+# OVON query category  ->  HM3D semantic labels that count as a genuine instance.
+#
+# Purpose: OVON makes a goal only from HM3D instances labeled *exactly* the
+# query word, but HM3D's free-text annotators split the same physical object
+# across many labels ("counter" / "kitchen counter" / "countertop" / "worktop").
+# A training-free semantic model has no prior for which label OVON kept, so
+# category-complete scoring credits reaching ANY HM3D instance whose label
+# denotes the same object.
+#
+# Curation rules:
+#   - include label VARIANTS / subtypes of the SAME physical object
+#   - EXCLUDE parts & accessories ("cabinet door", "towel bar", "tv remote",
+#     "toilet paper"), and clutter-on-object ("kitchen countertop item")
+#   - subtypes fold UP into the parent query (dining chair -> chair) but the
+#     parent does NOT fold down (chair query does not credit a stool)
+#   - # JUDGMENT marks load-bearing calls to validate against the panoramas
+#
+# Draft v1 — validate before scoring. Counts are val-set instance frequencies.
+
+bed:            [bed, bedframe, bed small]
+chair:          [chair, dining chair, desk chair, sofa chair, folding chair, rocking chair,
+                 bar chair, patio chair, computer chair, office chair, camping chair, bean bag chair]
+couch:          [couch, sofa, circular sofa, l-shaped sofa, sofa set, sofa seat, sofa chair]  # JUDGMENT: sofa==couch; folds in the sofa-* subtypes OVON lists separately
+table:          [table, coffee table, dining table, side table, end table, bedside table,
+                 display table, bed table, lamp table]                                       # exclude table lamp, table cloth
+desk:           [desk, computer desk]
+bench:          [bench, sitting bench, piano bench, shower bench, spa bench, chest bench, weight bench]
+stool:          [stool, footstool, step stool, piano stool]
+sofa chair:     [sofa chair]
+sofa seat:      [sofa seat]
+sofa set:       [sofa set]
+office chair:   [office chair, desk chair, computer chair]                                    # JUDGMENT: office-type chairs
+
+cabinet:        [cabinet, kitchen cabinet, bathroom cabinet, sink cabinet, kitchen lower cabinet,
+                 display cabinet, bedside cabinet, wash cabinet, storage cabinet, drawer cabinet,
+                 refrigerator cabinet]                                                        # exclude cabinet door
+bathroom cabinet: [bathroom cabinet, bath cabinet, wash cabinet]
+kitchen lower cabinet: [kitchen lower cabinet, kitchen cabinet lower]                         # JUDGMENT: tight; not every kitchen cabinet
+sink cabinet:   [sink cabinet, kitchen sink cabinet]                                          # tight: not generic cabinet/sink
+display cabinet: [display cabinet]
+wardrobe:       [wardrobe]
+drawer:         [drawer, drawers, chest drawer, chest of drawers]
+sideboard:      [sideboard]
+cabinet table:  [cabinet table]
+
+countertop:     [countertop, counter, kitchen counter, bathroom counter, washbasin counter, worktop]  # exclude "kitchen countertop item(s)"
+worktop:        [worktop, countertop, counter, kitchen counter]
+kitchen countertop items: [kitchen countertop items, kitchen countertop item]
+kitchen shelf:  [kitchen shelf]
+closet shelf:   [closet shelf]
+high shelf:     [high shelf]
+storage shelving: [storage shelving, shelving]
+kitchen appliance: [kitchen appliance, appliance]
+
+sink:           [sink, bath sink, kitchen sink]                                               # exclude sink cabinet, sink pipe/tap
+washbasin:      [washbasin, basin, bath sink]                                                 # JUDGMENT: washbasin==bathroom sink; excludes "washbasin counter"
+oven:           [oven, oven and stove]
+stove:          [stove, oven and stove, stovetop]
+oven and stove: [oven and stove, oven, stove, stovetop]
+cooker:         [cooker]
+washing machine: [washing machine, laundry machine, washing machine and dryer]               # exclude sewing/coffee machine, washing powder
+washer-dryer:   [washer-dryer, washing machine and dryer]
+clothes dryer:  [clothes dryer, washer-dryer, washing machine and dryer]
+heater:         [heater, water heater, sauna heater, radiator]
+monitor:        [monitor]
+tv:             [tv, led tv, wall tv]                                                         # exclude tv stand, tv remote
+
+window:         [window, exhibition window, door window]                                      # exclude window frame/curtain/shutter/glass/shade
+window shade:   [window shade, shade]
+window shutter: [window shutter, window shutters]
+
+toilet:         [toilet]                                                                      # exclude toilet paper/brush/seat
+bathtub:        [bathtub]
+bathtub platform: [bathtub platform]
+shower:         [shower, shower cabin, shower floor]                                           # JUDGMENT: shower area; excludes shower wall/dial/rail/curtain
+shower cabin:   [shower cabin]
+shower rail:    [shower rail]
+shower soap shelf: [shower soap shelf, shower shelf]
+
+towel:          [towel, bath towel, bathroom towel, hand towel]                                # exclude towel bar/ring/dispenser
+bath towel:     [bath towel, bath towels]
+bathroom towel: [bathroom towel]
+bathrobe:       [bathrobe, robe]
+blanket:        [blanket, blankets, throw blanket]                                             # JUDGMENT: no comforter/duvet/quilt labels present in val
+cloth:          [cloth]                                                                        # exclude clothes (separate category)
+clothes:        [clothes, hanging clothes, clothes on shelf]                                   # exclude clothes hanger/rack/dryer
+rack:           [rack, clothes rack, book rack, wine rack, spice rack, tool rack]              # "rack with shoes" -> shoe rack
+iron board:     [iron board, ironing board]
+
+bag:            [bag, bags, handbag, shoulder bag]                                             # exclude sleeping bag, bean bag chair
+handbag:        [handbag]
+basket:         [basket, baskets, basket of something, laundry basket]
+box:            [box, cardboard box, storage box]                                             # exclude tissue/tool box? kept generic box
+cardboard box:  [cardboard box]
+container:      [container, containers]
+plush toy:      [plush toy, cuddly toy]
+toy:            [toy, plush toy, cuddly toy]
+
+pillar:         [pillar]
+support beam:   [support beam, beam]                                                          # JUDGMENT: beam==support beam
+balustrade:     [balustrade]
+mantle:         [mantle]
+crib:           [crib]
+flag:           [flag]
+board:          [board]                                                                       # vague query; keep exact only
+note:           [note]
+case:           [case]                                                                        # exclude staircase*
+fire extinguisher: [fire extinguisher]
